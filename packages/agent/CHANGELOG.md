@@ -10,6 +10,7 @@
 ### Added
 
 - Added bounded `Session.findEntriesOnBranch()` and `findEntryOnBranch()` queries with explicit traversal, filtering, ordering, and limit options.
+- Added a lightweight Streamable HTTP MCP adapter that exposes remote server tools to `AgentHarness` without loading coding-agent behavior.
 
 ## [0.83.0] - 2026-07-29
 

@@ -59,6 +59,14 @@ export * from "./harness/tools/index.ts";
 export * from "./harness/types.ts";
 export * from "./harness/utils/shell-output.ts";
 export * from "./harness/utils/truncate.ts";
+// MCP Streamable HTTP 工具适配
+export {
+	connectMcpServer,
+	type McpAgentTool,
+	type McpServerConnection,
+	type McpServerConnectionOptions,
+	type McpToolResultDetails,
+} from "./mcp-adapter.ts";
 // 代理工具函数
 export * from "./proxy.ts";
 // 默认 Stream 配置
