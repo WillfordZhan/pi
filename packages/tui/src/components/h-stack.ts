@@ -2,13 +2,19 @@ import { compositeTuiLine } from "../tui.ts";
 import { visibleWidth } from "../utils.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
+/** 水平栈布局：子组件从左到右水平排列，支持间隙与垂直对齐。 */
 export class HStack extends Stack {
 	protected readonly layoutType = "hstack" as const;
 
+	/**
+	 * @param children 初始子组件或栈条目。
+	 * @param options 栈选项（间隙、对齐）。
+	 */
 	constructor(children: StackChild[] = [], options: StackOptions = {}) {
 		super(children, options);
 	}
 
+	/** 按给定宽度渲染：分配各子项宽度后逐行合成到同一行。 */
 	override render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const viewport = { width: safeWidth, height: Number.MAX_SAFE_INTEGER };
@@ -29,6 +35,7 @@ export class HStack extends Stack {
 		for (let index = 0; index < rendered.length; index++) {
 			const lines = rendered[index]!;
 			const childWidth = widths[index]!;
+			// 按对齐方式计算垂直偏移，实现 start/center/end 对齐。
 			let offset = 0;
 			if (this.align === "center") offset = Math.floor((height - lines.length) / 2);
 			else if (this.align === "end") offset = height - lines.length;

@@ -1,5 +1,6 @@
 import type { JsonValue, SessionSnapshot, TranscriptItem, TranscriptProgress } from "@earendil-works/pi-protocol";
 
+/** 转录状态：保存会话快照、增量进度条目、进度顺序以及工具调用的参数缓冲。 */
 export interface TranscriptState {
 	readonly snapshot: SessionSnapshot;
 	readonly progressItems: ReadonlyMap<string, TranscriptItem>;
@@ -7,6 +8,7 @@ export interface TranscriptState {
 	readonly toolCallBuffers: ReadonlyMap<string, string>;
 }
 
+/** 判断未知值是否为合法的 JSON 值（用于校验解析结果）。 */
 function isJsonValue(value: unknown): value is JsonValue {
 	if (value === null || typeof value === "boolean" || typeof value === "string") return true;
 	if (typeof value === "number") return Number.isFinite(value);
@@ -15,16 +17,18 @@ function isJsonValue(value: unknown): value is JsonValue {
 	return Object.values(value).every(isJsonValue);
 }
 
+/** 解析流式传输中的工具参数：若尚未形成完整 JSON，则保留原始前缀文本。 */
 function parsePartialToolInput(value: string): JsonValue {
 	try {
 		const parsed: unknown = JSON.parse(value);
 		if (isJsonValue(parsed)) return parsed;
 	} catch {
-		// Tool arguments are incomplete while streaming. Preserve their raw prefix until they form valid JSON.
+		// 流式传输时工具参数可能不完整；在它们构成合法 JSON 之前保留原始前缀。
 	}
 	return value;
 }
 
+/** 基于会话快照创建初始的转录状态（快照会做深拷贝）。 */
 export function createTranscriptState(snapshot: SessionSnapshot): TranscriptState {
 	return {
 		snapshot: structuredClone(snapshot),
@@ -34,11 +38,13 @@ export function createTranscriptState(snapshot: SessionSnapshot): TranscriptStat
 	};
 }
 
+/** 应用新的会话快照：若新快照比当前旧则忽略，否则用其重建转录状态。 */
 export function applyTranscriptSnapshot(state: TranscriptState, snapshot: SessionSnapshot): TranscriptState {
 	if (state.snapshot.id === snapshot.id && snapshot.revision < state.snapshot.revision) return state;
 	return createTranscriptState(snapshot);
 }
 
+/** 应用一条增量进度事件：处理条目开始/更新/完成以及文本、思考、工具参数的流式增量。 */
 export function applyTranscriptProgress(state: TranscriptState, progress: TranscriptProgress): TranscriptState {
 	if (progress.type === "item_started" || progress.type === "item_updated") {
 		return setProgressItem(state, progress.item);
@@ -74,6 +80,7 @@ export function applyTranscriptProgress(state: TranscriptState, progress: Transc
 	return setProgressItem({ ...state, toolCallBuffers }, { ...item, content });
 }
 
+/** 挑选最终展示用的转录条目：优先使用进度更新，再补充未在快照中的新增条目与排队指令。 */
 export function selectTranscript(state: TranscriptState): readonly TranscriptItem[] {
 	const transcript = state.snapshot.transcript.map((item) => state.progressItems.get(item.id) ?? item);
 	const ids = new Set(transcript.map((item) => item.id));
@@ -93,6 +100,7 @@ export function selectTranscript(state: TranscriptState): readonly TranscriptIte
 	return transcript;
 }
 
+/** 写入（或更新）一个进度条目，并记录其出现顺序。 */
 function setProgressItem(state: TranscriptState, item: TranscriptItem): TranscriptState {
 	const progressItems = new Map(state.progressItems);
 	const progressOrder = progressItems.has(item.id) ? state.progressOrder : [...state.progressOrder, item.id];

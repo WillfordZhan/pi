@@ -1,5 +1,5 @@
 /**
- * CLI argument parsing and help display
+ * CLI 参数解析与帮助信息展示。
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -8,8 +8,10 @@ import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../co
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import type { UiMode } from "../core/settings-manager.ts";
 
+/** 输出模式：文本、JSON 或 RPC。 */
 export type Mode = "text" | "json" | "rpc";
 
+/** 解析后的 CLI 参数集合。 */
 export interface Args {
 	provider?: string;
 	model?: string;
@@ -51,17 +53,20 @@ export interface Args {
 	projectTrustOverride?: boolean;
 	messages: string[];
 	fileArgs: string[];
-	/** Unknown flags (potentially extension flags) - map of flag name to value */
+	/** 未知标志（可能是扩展注册的标志）：标志名到值的映射。 */
 	unknownFlags: Map<string, boolean | string>;
 	diagnostics: Array<{ type: "warning" | "error"; message: string }>;
 }
 
+/** 合法的思考深度级别列表。 */
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
+/** 判断字符串是否为合法的思考深度级别。 */
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
 }
 
+/** 解析命令行参数数组为结构化的 Args 对象。 */
 export function parseArgs(args: string[]): Args {
 	const result: Args = {
 		messages: [],
@@ -171,7 +176,7 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--no-context-files" || arg === "-nc") {
 			result.noContextFiles = true;
 		} else if (arg === "--list-models") {
-			// Check if next arg is a search pattern (not a flag or file arg)
+			// 检查下一个参数是否为搜索模式（而不是标志或文件参数）
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
 				result.listModels = args[++i];
 			} else {
@@ -202,7 +207,7 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--offline") {
 			result.offline = true;
 		} else if (arg.startsWith("@")) {
-			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
+			result.fileArgs.push(arg.slice(1)); // 去掉 @ 前缀
 		} else if (arg.startsWith("--")) {
 			const eqIndex = arg.indexOf("=");
 			if (eqIndex !== -1) {
@@ -227,6 +232,7 @@ export function parseArgs(args: string[]): Args {
 	return result;
 }
 
+/** 向控制台打印使用帮助，可附带扩展注册的 CLI 标志说明。 */
 export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 	const extensionFlagsText =
 		extensionFlags && extensionFlags.length > 0

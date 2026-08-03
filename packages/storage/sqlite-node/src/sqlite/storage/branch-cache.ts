@@ -3,18 +3,23 @@ import type { SqliteDatabase } from "../types.ts";
 import type { SessionEntryRow } from "./session-entries.ts";
 import { invalidSession } from "./shared.ts";
 
-/** Derived root-to-tip paths. Canonical parent links remain authoritative. */
+/** 缓存的从根到叶子的路径信息。规范数据仍以会话条目表的 parent 链为准。 */
 export interface CachedBranch {
 	branchId: string;
 	leafSeq: number;
 }
 
+/** 查询分支缓存时的过滤与排序选项。 */
 export interface CachedBranchQuery {
+	/** 在该类型（如 compaction）的条目处停止。 */
 	stopAtType?: SessionEntryRow["type"];
+	/** 在该条目 ID 处停止。 */
 	stopAtId?: string;
+	/** 结果排序方向，默认最新在前。 */
 	order?: "newestFirst" | "oldestFirst";
 }
 
+/** 读取叶子条目 `leafId` 所属的缓存分支及其叶子序号。 */
 export async function readCachedBranch(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -29,6 +34,7 @@ export async function readCachedBranch(
 	return { branchId: membership.branch_id, leafSeq: membership.entry_seq };
 }
 
+/** 校验缓存分支在 [startSeq, leafSeq] 区间内是否与规范条目表一致（无缺失、父链正确且包含叶子）。 */
 export async function isCachedBranchValid(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -71,6 +77,7 @@ export async function isCachedBranchValid(
 	return result?.row_count !== 0 && result?.invalid_count === 0 && result.contains_leaf === 1;
 }
 
+/** 查找缓存分支中满足停止条件（类型或条目 ID）的最新条目的序号，用于缩短后续校验范围。 */
 export async function readNewestCachedStopSeq(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -101,6 +108,7 @@ export async function readNewestCachedStopSeq(
 	return row?.entry_seq ?? undefined;
 }
 
+/** 按缓存分支顺序读取从 `startSeq` 到分支叶子的全部条目行。 */
 export async function readCachedBranchRows(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -118,6 +126,7 @@ export async function readCachedBranchRows(
 		.all<SessionEntryRow>(sessionId, branch.branchId, startSeq, branch.leafSeq);
 }
 
+/** 按 {@link CachedBranchQuery} 的停止条件与排序方向查询缓存分支上的条目行。 */
 export async function queryCachedBranchRows(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -163,14 +172,14 @@ export async function queryCachedBranchRows(
 	return db.prepare(sql).all<SessionEntryRow>(...params);
 }
 
+/** 读取缓存分支上指定类型的所有条目行（通常用于获取 compaction 记录）。 */
 export async function readCachedEntryRowsByType(
 	db: SqliteDatabase,
 	sessionId: string,
 	branch: CachedBranch,
 	type: SessionEntryRow["type"],
 ): Promise<SessionEntryRow[]> {
-	// Drive the join from the usually sparse entry type. Ordering from branch_entries
-	// makes SQLite scan the complete cached path before filtering by type.
+	// 从通常更稀疏的条目类型表驱动连接：若从 branch_entries 排序，SQLite 会先扫描整条缓存路径再按类型过滤。
 	return db
 		.prepare(
 			`SELECT e.session_id, e.id, e.entry_seq, e.parent_id, e.type, e.timestamp, e.payload
@@ -184,6 +193,7 @@ export async function readCachedEntryRowsByType(
 		.all<SessionEntryRow>(sessionId, type, branch.branchId, branch.leafSeq);
 }
 
+/** 读取某条目在指定缓存分支中的序号，用于定位 compaction 等条目的位置。 */
 export async function readCachedEntrySeq(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -196,6 +206,7 @@ export async function readCachedEntrySeq(
 	return row?.entry_seq;
 }
 
+/** 从规范条目表沿父链重建到 `leafId` 的缓存分支，可替换旧分支。 */
 export async function rebuildCachedBranch(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -204,6 +215,7 @@ export async function rebuildCachedBranch(
 ): Promise<void> {
 	await db.exec("SAVEPOINT rebuild_branch_cache");
 	try {
+		// 找出需要替换的旧分支（显式指定或叶子当前所属分支）并删除。
 		const tip = await db
 			.prepare("SELECT branch_id FROM branch_tips WHERE session_id = ? AND tip_id = ?")
 			.get<{ branch_id: string }>(sessionId, leafId);
@@ -213,6 +225,7 @@ export async function rebuildCachedBranch(
 			await db.prepare("DELETE FROM branch_entries WHERE session_id = ? AND branch_id = ?").run(sessionId, branchId);
 		}
 
+		// 用递归 CTE 沿父链收集路径并写入新的分支缓存。
 		const branchId = uuidv7();
 		await db
 			.prepare(
@@ -239,12 +252,13 @@ export async function rebuildCachedBranch(
 			await db.exec("ROLLBACK TO SAVEPOINT rebuild_branch_cache");
 			await db.exec("RELEASE SAVEPOINT rebuild_branch_cache");
 		} catch {
-			// Preserve the original repair failure.
+			// 保留原始的修复失败错误，不覆盖为回滚错误。
 		}
 		throw error;
 	}
 }
 
+/** 在既有缓存分支末尾追加一个新条目，并把分支的叶子指针更新为新条目。 */
 async function extendBranch(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -262,6 +276,7 @@ async function extendBranch(
 	if (result.changes !== 1) throw invalidSession(`branch tip ${parentId} changed during append`);
 }
 
+/** 在分支缓存中追加一个新条目；父条目不存在时走修复逻辑，必要时分裂出新的分支。 */
 export async function appendEntryToBranchCache(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -270,6 +285,7 @@ export async function appendEntryToBranchCache(
 	parentId: string | null,
 	repairParent: (parentId: string) => Promise<void>,
 ): Promise<void> {
+	// 无父条目：新开一个分支作为根。
 	if (parentId === null) {
 		const branchId = uuidv7();
 		await db
@@ -281,6 +297,7 @@ export async function appendEntryToBranchCache(
 		return;
 	}
 
+	// 父条目是某分支的叶子：直接在该分支上追加。
 	let tip = await db
 		.prepare("SELECT branch_id FROM branch_tips WHERE session_id = ? AND tip_id = ?")
 		.get<{ branch_id: string }>(sessionId, parentId);
@@ -289,6 +306,7 @@ export async function appendEntryToBranchCache(
 		return;
 	}
 
+	// 父条目存在于某个分支中间：找到该分支，用于分裂出新分支。
 	const source = await db
 		.prepare(
 			`SELECT b.branch_id, b.entry_seq
@@ -299,6 +317,7 @@ export async function appendEntryToBranchCache(
 		)
 		.get<{ branch_id: string; entry_seq: number }>(sessionId, parentId);
 	if (!source) {
+		// 父条目不在任何缓存分支中：先修复父链，再尝试追加。
 		await repairParent(parentId);
 		tip = await db
 			.prepare("SELECT branch_id FROM branch_tips WHERE session_id = ? AND tip_id = ?")
@@ -308,6 +327,7 @@ export async function appendEntryToBranchCache(
 		return;
 	}
 
+	// 复制父条目所在分支到父条目位置的路径，作为新分支的前缀。
 	const branchId = uuidv7();
 	await db
 		.prepare(

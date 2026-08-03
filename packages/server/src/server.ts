@@ -27,30 +27,52 @@ import { LiveSessionManager } from "./sessions.ts";
 import { ServerSnapshotPublisher } from "./snapshots.ts";
 import type { PiServerOptions, PiSessionBackend } from "./types.ts";
 
+/** 默认的握手超时时长（毫秒）。 */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
+/** uint32 最大值，用于校验帧长度上限。 */
 const MAX_UINT32 = 0xffff_ffff;
+/** Node.js 定时器允许的最大延迟（毫秒）。 */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
+/** 计算令牌的 SHA-256 摘要，用于常驻内存中的安全比对（避免直接保存明文令牌）。 */
 function tokenDigest(token: string): Buffer {
 	return createHash("sha256").update(token, "utf8").digest();
 }
 
+/** 远程会话服务器：管理连接握手、会话执行、快照广播与所有传输监听器的生命周期。 */
 export class PiServer {
+	/** 服务器实例唯一 ID。 */
 	readonly id: string;
 
+	/** 已注册的传输监听器列表。 */
 	private readonly listeners: readonly PiServerListener[];
+	/** 期望令牌的 SHA-256 摘要，用于握手鉴权。 */
 	private readonly expectedTokenDigest: Buffer;
+	/** 单帧消息的最大长度限制。 */
 	private readonly maxFrameLength: number;
+	/** 握手超时时长（毫秒）。 */
 	private readonly handshakeTimeoutMs: number;
+	/** 可选的全局错误回调，用于上报非致命异常。 */
 	private readonly onError: ((error: Error) => void) | undefined;
+	/** 当前所有活跃连接的集合。 */
 	private readonly connections = new Set<ConnectionState>();
+	/** 会话管理器：负责创建/附加/执行会话命令。 */
 	private readonly sessions: LiveSessionManager;
+	/** 快照发布器：向所有就绪连接广播服务器快照。 */
 	private readonly snapshots: ServerSnapshotPublisher;
+	/** 是否正在关闭。 */
 	private closing = false;
+	/** 已开始的关闭流程（幂等去重）。 */
 	private closePromise?: Promise<void>;
+	/** 已开始的启动流程（幂等去重）。 */
 	private startPromise?: Promise<this>;
+	/** 是否已成功启动。 */
 	private started = false;
 
+	/**
+	 * @param backend 会话后端（持久化存储与运行时边界）。
+	 * @param options 服务器配置（令牌、监听器、帧长、超时等）。
+	 */
 	constructor(backend: PiSessionBackend, options: PiServerOptions) {
 		const resolved = resolveOptions(options);
 		this.listeners = options.listeners;
@@ -79,10 +101,12 @@ export class PiServer {
 		});
 	}
 
+	/** 所有监听器绑定的地址列表（仅包含有地址概念的传输层）。 */
 	get addresses(): readonly string[] {
 		return this.listeners.flatMap((listener) => (listener.address === undefined ? [] : [listener.address]));
 	}
 
+	/** 启动服务器（启动所有监听器）；重复调用会拒绝。 */
 	start(): Promise<this> {
 		if (this.started) return Promise.reject(new Error("PiServer is already started"));
 		if (this.startPromise) return Promise.reject(new Error("PiServer is already starting"));
@@ -91,6 +115,7 @@ export class PiServer {
 		return this.startPromise;
 	}
 
+	/** 依次启动所有监听器；若中途失败，则回滚已启动的监听器并关闭服务器状态。 */
 	private async startInternal(): Promise<this> {
 		const started: PiServerListener[] = [];
 		try {
@@ -110,6 +135,7 @@ export class PiServer {
 		}
 	}
 
+	/** 接收一条新连接：建立连接状态、启动握手超时，并返回数据/关闭/错误事件处理器。 */
 	accept(connection: ByteConnection): ByteConnectionHandler {
 		if (this.closing) {
 			void this.closeConnection(connection);
@@ -150,6 +176,7 @@ export class PiServer {
 		};
 	}
 
+	/** 关闭服务器：停止所有监听器并释放全部连接与会话资源（幂等）。 */
 	async close(): Promise<void> {
 		if (this.closePromise) return this.closePromise;
 		this.closing = true;
@@ -157,6 +184,7 @@ export class PiServer {
 		return this.closePromise;
 	}
 
+	/** 关闭内部实现：先等待启动流程结束，再关闭监听器与服务器状态。 */
 	private async closeInternal(): Promise<void> {
 		const starting = this.startPromise;
 		if (starting) await starting.catch(() => {});
@@ -168,6 +196,7 @@ export class PiServer {
 		}
 	}
 
+	/** 接收原始字节块：交给解码器解出消息后逐一分发；解码失败则按协议失败处理。 */
 	private receive(state: ConnectionState, chunk: Uint8Array): void {
 		if (isTerminalConnection(state)) return;
 		let messages: ClientMessage[];
@@ -183,6 +212,7 @@ export class PiServer {
 		}
 	}
 
+	/** 按协议阶段分发客户端消息：首条必须是 hello，之后在就绪阶段处理请求，握手期间的请求排队等待。 */
 	private dispatchMessage(state: ConnectionState, message: ClientMessage): void {
 		if (state.stage === "awaitingHello") {
 			if (message.type !== "hello") {
@@ -219,6 +249,7 @@ export class PiServer {
 		});
 	}
 
+	/** 完成握手：校验令牌与协议版本，回复 hello 快照并把连接推进到就绪阶段。 */
 	private async finishHandshake(state: ConnectionState, hello: ClientHello): Promise<void> {
 		if (!this.authenticate(hello)) {
 			await this.failProtocol(state, { code: "auth", message: "Authentication failed" });
@@ -254,10 +285,12 @@ export class PiServer {
 		}
 	}
 
+	/** 校验客户端令牌：对客户端令牌取摘要后与期望摘要做恒定时间比较。 */
 	private authenticate(hello: ClientHello): boolean {
 		return timingSafeEqual(tokenDigest(hello.token), this.expectedTokenDigest);
 	}
 
+	/** 执行一个会话命令，并将成功结果或协议错误封装为响应消息返回。 */
 	private async handleRequest(state: ConnectionState, envelope: RequestEnvelope): Promise<void> {
 		try {
 			const result = await this.sessions.executeCommand(state, envelope.request);
@@ -277,6 +310,7 @@ export class PiServer {
 		}
 	}
 
+	/** 底层传输关闭时调用：结束解码器并断开连接状态。 */
 	private transportClosed(connection: ConnectionState): void {
 		if (!connection.disconnected && connection.stage !== "closing") {
 			try {
@@ -288,6 +322,7 @@ export class PiServer {
 		void this.disconnect(connection);
 	}
 
+	/** 断开一个连接：标记关闭、从连接集合移除、解绑会话，并在握手完成后广播快照。 */
 	private async disconnect(connection: ConnectionState): Promise<void> {
 		if (connection.disconnected) return;
 		const handshakeComplete = connection.handshakeComplete;
@@ -299,6 +334,7 @@ export class PiServer {
 		if (!this.closing && handshakeComplete) void this.snapshots.broadcast();
 	}
 
+	/** 编码并发送一条服务器消息；编码或发送失败时上报错误并关闭连接，返回是否发送成功。 */
 	private async sendMessage(connection: ConnectionState, message: ServerMessage): Promise<boolean> {
 		if (connection.disconnected || connection.connection.closed) return false;
 		let frame: Uint8Array;
@@ -321,6 +357,7 @@ export class PiServer {
 		}
 	}
 
+	/** 协议级失败：向客户端发送 hello_error（带最终帧）后关闭连接。 */
 	private async failProtocol(connection: ConnectionState, error: ProtocolError): Promise<void> {
 		if (connection.disconnected || connection.stage === "closing" || connection.stage === "closed") return;
 		connection.stage = "closing";
@@ -336,6 +373,7 @@ export class PiServer {
 		await this.disconnect(connection);
 	}
 
+	/** 关闭服务器级状态：先关闭所有连接，再关闭会话管理器并清空连接集合。 */
 	private async closeServerState(): Promise<void> {
 		const connections = [...this.connections];
 		for (const connection of connections) {
@@ -349,6 +387,7 @@ export class PiServer {
 		this.connections.clear();
 	}
 
+	/** 关闭单条底层连接，可选附带最终字节块；关闭异常仅上报错误。 */
 	private async closeConnection(connection: ByteConnection, finalChunk?: Uint8Array): Promise<void> {
 		try {
 			await connection.close(finalChunk);
@@ -357,6 +396,7 @@ export class PiServer {
 		}
 	}
 
+	/** 将任意异常映射为协议错误：PiServerError 直接透传，其余归为内部错误。 */
 	private toProtocolError(error: unknown): ProtocolError {
 		if (error instanceof PiServerError) {
 			return error.details === undefined
@@ -370,15 +410,17 @@ export class PiServer {
 		return { code: "invalid_request", message: "Internal server error" };
 	}
 
+	/** 上报错误给 onError 回调；错误观察者的异常不能影响服务器状态。 */
 	private reportError(error: unknown): void {
 		try {
 			this.onError?.(error instanceof Error ? error : new Error(String(error)));
 		} catch {
-			// Error observers cannot affect server state.
+			// 错误观察者不得影响服务器状态。
 		}
 	}
 }
 
+/** 校验并规范化服务器选项（监听器、令牌、帧长、握手超时）。 */
 function resolveOptions(options: PiServerOptions): { maxFrameLength: number; handshakeTimeoutMs: number } {
 	if (!Array.isArray(options.listeners)) throw new TypeError("PiServer listeners must be an array");
 	if (!options.token) throw new TypeError("PiServer token must not be empty");

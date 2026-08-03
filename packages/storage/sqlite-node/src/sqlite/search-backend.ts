@@ -9,6 +9,7 @@ import type {
 	SqliteSessionRepositoryEnv,
 } from "./types.ts";
 
+/** 取路径的父目录部分（支持 / 与 \ 两种分隔符）。 */
 function getParentPath(path: string): string {
 	const normalized = path.replace(/[\\/]+$/, "");
 	const lastSlash = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
@@ -17,24 +18,28 @@ function getParentPath(path: string): string {
 	return normalized.slice(0, lastSlash);
 }
 
+/** 对新打开的数据库执行基础 PRAGMA 配置。 */
 async function configureSqliteDatabase(db: SqliteDatabase): Promise<void> {
 	await db.exec("PRAGMA journal_mode=WAL");
 	await db.exec("PRAGMA synchronous=FULL");
 	await db.exec("PRAGMA busy_timeout=5000");
 }
 
+/** 构建 SQLite 全文搜索所需的配置。 */
 export interface SqliteSessionSearchOptions {
 	env: Pick<SqliteSessionRepositoryEnv, "absolutePath" | "createDir">;
 	sqlite: SqliteDatabaseFactory;
 	databasePath: string;
 }
 
+/** 判断数据库中是否存在指定名称的表。 */
 async function tableExists(db: SqliteDatabase, name: string): Promise<boolean> {
 	return !!(await db
 		.prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
 		.get<{ found: number }>(name));
 }
 
+/** 创建 FTS5 虚拟表及同步触发器；首次创建时重建索引。 */
 async function ensureSearchSchema(db: SqliteDatabase): Promise<void> {
 	const ftsExists = await tableExists(db, "session_search_fts");
 	await db.exec(`
@@ -58,15 +63,19 @@ END;
 	if (!ftsExists) await db.exec("INSERT INTO session_search_fts(session_search_fts) VALUES('rebuild')");
 }
 
-/** SQLite FTS search over a co-located canonical session database. */
+/** 基于同库会话数据库的 SQLite FTS5 全文搜索实现。 */
 class SqliteSessionSearch implements SessionSearch<SqliteSessionMetadata> {
 	private readonly options: SqliteSessionSearchOptions;
 	private databasePath: string | undefined;
 
+	/**
+	 * @param options 搜索配置，包含文件系统环境、SQLite 工厂与数据库路径。
+	 */
 	constructor(options: SqliteSessionSearchOptions) {
 		this.options = options;
 	}
 
+	/** 解析并缓存数据库文件的绝对路径。 */
 	private async getDatabasePath(): Promise<string> {
 		if (!this.databasePath) {
 			this.databasePath = getFileSystemResultOrThrow(
@@ -77,6 +86,7 @@ class SqliteSessionSearch implements SessionSearch<SqliteSessionMetadata> {
 		return this.databasePath;
 	}
 
+	/** 打开数据库并完成 PRAGMA 配置、迁移与搜索表结构创建。 */
 	private async openDatabase(): Promise<SqliteDatabase> {
 		const path = await this.getDatabasePath();
 		const directory = getParentPath(path);
@@ -96,6 +106,7 @@ class SqliteSessionSearch implements SessionSearch<SqliteSessionMetadata> {
 		}
 	}
 
+	/** 执行全文搜索：返回按相关度排序的命中结果，空文本返回空数组。 */
 	async search(options: SessionSearchOptions): Promise<SessionSearchHit<SqliteSessionMetadata>[]> {
 		const text = options.text.trim();
 		if (!text) return [];
@@ -124,6 +135,7 @@ class SqliteSessionSearch implements SessionSearch<SqliteSessionMetadata> {
 	}
 }
 
+/** 创建基于 SQLite FTS5 的会话全文搜索实例。 */
 export function createSqliteSessionSearch(options: SqliteSessionSearchOptions): SessionSearch<SqliteSessionMetadata> {
 	return new SqliteSessionSearch(options);
 }

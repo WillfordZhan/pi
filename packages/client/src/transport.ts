@@ -1,18 +1,25 @@
+/**
+ * 传输层抽象：连接管理器通过 `ByteTransport` 与具体的字节通道解耦，
+ * 便于实现 WebSocket、Unix socket 等不同传输方式。
+ */
+
+/** 字节传输层抽象：负责按调用顺序发送字节块，并可在不再需要时被关闭。 */
 export interface ByteTransport {
-	/** Sends one byte chunk. Calls must be delivered in invocation order. */
+	/** 发送一个字节块。调用必须按调用顺序送达。 */
 	send(chunk: Uint8Array): Promise<void>;
-	/** Closes the transport. Implementations must make repeated calls harmless. */
+	/** 关闭传输层。实现必须保证重复调用是安全的（无副作用）。 */
 	close(): void;
 }
 
+/** 传输层向连接管理器报告事件的一组回调。 */
 export interface ByteTransportHandlers {
-	/** Delivers an arbitrary inbound byte chunk. */
+	/** 投递一个任意的入站字节块。 */
 	onData(chunk: Uint8Array): void;
-	/** Reports an orderly terminal close. */
+	/** 报告一次有序的终止性关闭（正常断开）。 */
 	onClose(): void;
-	/** Reports a terminal transport failure. */
+	/** 报告一次终止性的传输失败。 */
 	onError(error: Error): void;
 }
 
-/** Creates a fresh connected transport for each PiClient connection attempt. Exactly one terminal handler is expected. */
+/** 为 PiClient 每次连接尝试创建一个全新已连接的传输层；只应触发一个终止性回调。 */
 export type ByteTransportFactory = (handlers: ByteTransportHandlers) => ByteTransport | Promise<ByteTransport>;

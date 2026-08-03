@@ -3,7 +3,7 @@ import type { PiSessionBackend } from "../../types.ts";
 import { createUnixListener } from "./listener.ts";
 import type { UnixServerOptions } from "./types.ts";
 
-/** Compose PiServer with one Unix-domain socket listener. */
+/** 用单个 Unix domain socket 监听器组合出一个完整的 PiServer。 */
 export function createUnixServer(backend: PiSessionBackend, options: UnixServerOptions): PiServer {
 	const listener = createUnixListener({
 		path: options.path,

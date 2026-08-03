@@ -7,10 +7,12 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
+/** 带可选 `getBuiltinModule` 的 process 类型，用于在 Node/Bun 中按需加载 node:os。 */
 type ProcessWithOsBuiltinModule = typeof process & {
 	getBuiltinModule?: (id: "node:os") => typeof NodeOs;
 };
 
+/** 在 Node/Bun 运行时中按需加载 node:os 模块；浏览器环境返回 null。 */
 function loadNodeOs(): typeof NodeOs | null {
 	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
 		return null;
@@ -18,7 +20,7 @@ function loadNodeOs(): typeof NodeOs | null {
 	return (process as ProcessWithOsBuiltinModule).getBuiltinModule?.("node:os") ?? null;
 }
 
-// NEVER convert to top-level runtime imports - breaks browser/Vite builds
+// 切勿改成顶层运行时 import——会破坏浏览器/Vite 构建
 const _os: typeof NodeOs | null = loadNodeOs();
 
 import { clampThinkingLevel } from "../models.ts";
@@ -53,23 +55,34 @@ import { convertResponsesMessages, convertResponsesTools, processResponsesStream
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
-// Configuration
+// 配置
 // ============================================================================
 
+/** 默认的 Codex 后端地址。 */
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
+/** JWT 中携带 chatgpt_account_id 的声明路径。 */
 const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
+/** 默认最大重试次数。 */
 const DEFAULT_MAX_RETRIES = 0;
+/** 指数退避的基准延迟（毫秒）。 */
 const BASE_DELAY_MS = 1000;
+/** 默认最大重试延迟（毫秒）。 */
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
+/** 默认 WebSocket 连接超时（毫秒）。 */
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
-// The Codex backend accepts zstd-compressed request bodies on the SSE responses
-// endpoint (the same endpoint the official Codex client compresses against).
+// Codex 后端在 SSE responses 端点接受 zstd 压缩的请求体
+// （官方 Codex 客户端也是对该端点做压缩）。
 const REQUEST_COMPRESSION_ZSTD_LEVEL = 3;
+/** 需要按 Codex 规则转换工具调用消息的 provider 集合。 */
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+/** WebSocket 关闭码：消息过大。 */
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
+/** WebSocket 错误码：连接数达到上限。 */
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
+/** WebSocket 错误码：前一个响应不存在。 */
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
 
+/** Codex 响应的合法状态集合。 */
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
 	"incomplete",
@@ -80,19 +93,27 @@ const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 ]);
 
 // ============================================================================
-// Types
+// 类型
 // ============================================================================
 
+/** 调用 OpenAI Codex Responses API 时 {@link stream} 的配置选项。 */
 export interface OpenAICodexResponsesOptions extends StreamOptions {
+	/** 推理精力级别，`none` 表示关闭推理。 */
 	reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	/** 推理摘要的展示方式。 */
 	reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null;
+	/** 服务层级（如 flex/priority），影响定价。 */
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+	/** 文本输出的详细程度。 */
 	textVerbosity?: "low" | "medium" | "high";
+	/** 工具选择行为。 */
 	toolChoice?: "auto" | "none" | "required";
 }
 
+/** Codex 响应可能的状态。 */
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
 
+/** 发送给 Codex 后端的请求体结构。 */
 interface RequestBody {
 	model: string;
 	store?: boolean;
@@ -112,8 +133,10 @@ interface RequestBody {
 	[key: string]: unknown;
 }
 
+/** 成功结束的助手消息：停止原因必须是 stop/length/toolUse 之一。 */
 type SuccessfulAssistantMessage = AssistantMessage & { stopReason: "stop" | "length" | "toolUse" };
 
+/** 断言输出已成功结束；若仍处于 pending 或已失败则抛错。 */
 function assertSuccessfulOutput(output: AssistantMessage): asserts output is SuccessfulAssistantMessage {
 	if (output.stopReason === "pending") {
 		throw new Error("Codex stream ended without a stop reason");
@@ -124,15 +147,17 @@ function assertSuccessfulOutput(output: AssistantMessage): asserts output is Suc
 }
 
 // ============================================================================
-// Retry Helpers
+// 重试辅助
 // ============================================================================
 
+/** 判断错误文本是否属于“终态”的用量/配额限制错误（这类错误不重试）。 */
 function isTerminalRateLimitError(errorText: string): boolean {
 	return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/i.test(
 		errorText,
 	);
 }
 
+/** 判断某个状态码/错误文本是否可以重试。 */
 function isRetryableError(status: number, errorText: string): boolean {
 	if (status === 429 && isTerminalRateLimitError(errorText)) {
 		return false;
@@ -143,6 +168,7 @@ function isRetryableError(status: number, errorText: string): boolean {
 	return /rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused/i.test(errorText);
 }
 
+/** 从响应头中解析服务器建议的重试延迟（毫秒）。 */
 function getRetryAfterDelayMs(headers: Headers): number | undefined {
 	const retryAfterMs = headers.get("retry-after-ms");
 	if (retryAfterMs !== null) {
@@ -170,8 +196,10 @@ function getRetryAfterDelayMs(headers: Headers): number | undefined {
 	return undefined;
 }
 
+/** 服务器要求的重试延迟超过调用方上限时抛出的错误。 */
 class RetryDelayExceededError extends Error {}
 
+/** 校验重试延迟不超过配置的最大值，超限则抛 {@link RetryDelayExceededError}。 */
 function validateRetryDelayMs(delayMs: number, options?: StreamOptions): number {
 	const maxRetryDelayMs = options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
 	if (maxRetryDelayMs > 0 && delayMs > maxRetryDelayMs) {
@@ -182,6 +210,7 @@ function validateRetryDelayMs(delayMs: number, options?: StreamOptions): number 
 	return delayMs;
 }
 
+/** 可中止的延时，用于重试前的退避等待。 */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
@@ -196,6 +225,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+/** 规范化 timeoutMs：必须是非负有限数字，向下取整。 */
 function normalizeTimeoutMs(value: number | undefined): number | undefined {
 	if (value === undefined) return undefined;
 	if (!Number.isFinite(value) || value < 0) {
@@ -205,13 +235,15 @@ function normalizeTimeoutMs(value: number | undefined): number | undefined {
 }
 
 // ============================================================================
-// Request Compression
+// 请求压缩
 // ============================================================================
 
+/** 带可选 `getBuiltinModule` 的 process 类型，用于在 Node/Bun 中按需加载 node:zlib。 */
 type ProcessWithBuiltinModule = typeof process & {
 	getBuiltinModule?: (id: "node:zlib") => typeof NodeZlib;
 };
 
+/** 在 Node/Bun 运行时中按需加载 node:zlib 模块；浏览器环境返回 null。 */
 function loadNodeZlib(): typeof NodeZlib | null {
 	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
 		return null;
@@ -219,9 +251,8 @@ function loadNodeZlib(): typeof NodeZlib | null {
 	return (process as ProcessWithBuiltinModule).getBuiltinModule?.("node:zlib") ?? null;
 }
 
-// Returns the zstd-compressed body bytes, or null when compression is
-// unavailable (browser/Vite builds). Callers fall back to sending the
-// uncompressed JSON when this returns null.
+// 返回 zstd 压缩后的请求体字节；压缩不可用（浏览器/Vite 构建）时返回 null。
+// 调用方在此函数返回 null 时应回退为发送未压缩的 JSON。
 function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
 	const zlib = loadNodeZlib();
 	if (!zlib || typeof zlib.zstdCompressSync !== "function") {
@@ -238,9 +269,14 @@ function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
 }
 
 // ============================================================================
-// Main Stream Function
+// 主流式函数
 // ============================================================================
 
+/**
+ * 通过 OpenAI Codex Responses API 流式调用模型。
+ * 优先使用 WebSocket 传输（支持连接复用与上下文续传），不可用时回退到 SSE，
+ * 并把推理/文本/工具调用增量推送到事件流中。
+ */
 export const stream: StreamFunction<"openai-codex-responses", OpenAICodexResponsesOptions> = (
 	model: Model<"openai-codex-responses">,
 	context: Context,
@@ -379,16 +415,15 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				}
 			}
 
-			// Compress the request body once for the SSE path. The Codex backend
-			// decodes Content-Encoding: zstd; the WebSocket transport above sends the
-			// uncompressed JSON frame, matching the official Codex client.
+			// 为 SSE 路径压缩一次请求体。Codex 后端会解码 Content-Encoding: zstd；
+			// 上面的 WebSocket 传输则发送未压缩的 JSON 帧，与官方 Codex 客户端一致。
 			const compressedBody = compressRequestBodyZstd(bodyJson);
 			if (compressedBody) {
 				sseHeaders.set("content-encoding", "zstd");
 			}
 			const sseBody: Uint8Array | string = compressedBody ?? bodyJson;
 
-			// Fetch with retry logic for rate limits and transient errors
+			// 带重试逻辑的 fetch：应对限流与瞬时错误
 			let response: Response | undefined;
 			let lastError: Error | undefined;
 			const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
@@ -438,7 +473,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						continue;
 					}
 
-					// Parse error for friendly message on final attempt or non-retryable error
+					// 在最后一次尝试或不可重试的错误上，解析错误以获得友好提示消息
 					const fakeResponse = new Response(errorText, {
 						status: response.status,
 						statusText: response.statusText,
@@ -452,7 +487,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						}
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
-					// Network errors are retryable
+					// 网络错误可重试
 					if (
 						attempt < maxRetries &&
 						!(lastError instanceof RetryDelayExceededError) &&
@@ -489,7 +524,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
-				// Streaming scratch buffers are only used during parsing; never persist them.
+				// 流式临时缓冲字段仅用于解析过程，绝不能持久化。
 				delete (block as { partialJson?: string }).partialJson;
 				delete (block as { customInput?: unknown }).customInput;
 			}
@@ -503,6 +538,10 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 	return stream;
 };
 
+/**
+ * 基于简化配置的 Codex 流式调用入口。
+ * 把简单的推理级别映射为 Codex 的 reasoningEffort，并交给 {@link stream} 执行。
+ */
 export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStreamOptions> = (
 	model: Model<"openai-codex-responses">,
 	context: Context,
@@ -524,9 +563,10 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 };
 
 // ============================================================================
-// Request Building
+// 请求构建
 // ============================================================================
 
+/** 将模型、上下文与选项组装为 Codex 后端的请求体。 */
 function buildRequestBody(
 	model: Model<"openai-codex-responses">,
 	context: Context,
@@ -596,6 +636,7 @@ function buildRequestBody(
 	return body;
 }
 
+/** 返回服务层级对应的成本倍率（flex 半价，priority 加价）。 */
 function getServiceTierCostMultiplier(
 	model: Pick<Model<"openai-codex-responses">, "id">,
 	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
@@ -610,6 +651,7 @@ function getServiceTierCostMultiplier(
 	}
 }
 
+/** 按服务层级的倍率调整用量中的成本字段。 */
 function applyServiceTierPricing(
 	usage: Usage,
 	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
@@ -625,6 +667,7 @@ function applyServiceTierPricing(
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 }
 
+/** 合并请求与响应中的服务层级：当响应为 default 时回退到请求时指定的 flex/priority。 */
 function resolveCodexServiceTier(
 	responseServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
 	requestServiceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
@@ -635,6 +678,7 @@ function resolveCodexServiceTier(
 	return responseServiceTier ?? requestServiceTier;
 }
 
+/** 将 baseUrl 解析为 Codex responses 的 HTTP 端点地址。 */
 function resolveCodexUrl(baseUrl?: string): string {
 	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : DEFAULT_CODEX_BASE_URL;
 	const normalized = raw.replace(/\/+$/, "");
@@ -643,6 +687,7 @@ function resolveCodexUrl(baseUrl?: string): string {
 	return `${normalized}/codex/responses`;
 }
 
+/** 将 Codex HTTP 端点地址转换为对应的 WebSocket 地址（https→wss，http→ws）。 */
 function resolveCodexWebSocketUrl(baseUrl?: string): string {
 	const url = new URL(resolveCodexUrl(baseUrl));
 	if (url.protocol === "https:") url.protocol = "wss:";
@@ -651,9 +696,10 @@ function resolveCodexWebSocketUrl(baseUrl?: string): string {
 }
 
 // ============================================================================
-// Response Processing
+// 响应处理
 // ============================================================================
 
+/** 解析 SSE 响应流并交给共享的 responses 流处理器处理。 */
 async function processStream(
 	response: Response,
 	output: AssistantMessage,
@@ -670,6 +716,7 @@ async function processStream(
 	});
 }
 
+/** Codex API 层面的错误：携带错误码与原始负载。 */
 class CodexApiError extends Error {
 	readonly code?: string;
 	readonly payload?: Record<string, unknown>;
@@ -683,6 +730,7 @@ class CodexApiError extends Error {
 	}
 }
 
+/** Codex 协议解析层面的错误：携带无法解析的原始负载。 */
 class CodexProtocolError extends Error {
 	readonly payload?: unknown;
 
@@ -694,18 +742,22 @@ class CodexProtocolError extends Error {
 	}
 }
 
+/** 判断错误是否为 Codex 业务/协议错误（而非传输层错误）。 */
 function isCodexNonTransportError(error: unknown): boolean {
 	return error instanceof CodexApiError || error instanceof CodexProtocolError;
 }
 
+/** 判断错误是否为 WebSocket 连接数达到上限。 */
 function isWebSocketConnectionLimitReachedError(error: unknown): boolean {
 	return error instanceof CodexApiError && error.code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE;
 }
 
+/** 判断错误是否为前一个响应不存在（WebSocket 续传失效）。 */
 function isPreviousResponseNotFoundError(error: unknown): boolean {
 	return error instanceof CodexApiError && error.code === PREVIOUS_RESPONSE_NOT_FOUND_CODE;
 }
 
+/** 从 Codex 事件对象中提取错误码与错误消息。 */
 function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {
 	const nested = event.error && typeof event.error === "object" ? (event.error as Record<string, unknown>) : undefined;
 	return {
@@ -719,6 +771,7 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 	};
 }
 
+/** 将 Codex 特有的事件类型映射为标准 responses 流事件，并在出错时抛出对应错误。 */
 async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined;
@@ -752,15 +805,17 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 	}
 }
 
+/** 将未知状态值归一化为合法的 {@link CodexResponseStatus}，非法值返回 undefined。 */
 function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined {
 	if (typeof status !== "string") return undefined;
 	return CODEX_RESPONSE_STATUSES.has(status as CodexResponseStatus) ? (status as CodexResponseStatus) : undefined;
 }
 
 // ============================================================================
-// SSE Parsing
+// SSE 解析
 // ============================================================================
 
+/** 解析 Codex SSE 响应体，逐条产出 JSON 事件，支持中止与错误回传。 */
 async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
@@ -821,16 +876,22 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 }
 
 // ============================================================================
-// WebSocket Parsing
+// WebSocket 解析
 // ============================================================================
 
+/** OpenAI-Beta 头中用于 responses WebSocket 的协议标识。 */
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
+/** 会话 WebSocket 空闲回收时间（5 分钟）。 */
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;
+/** 会话 WebSocket 最大存活时间（55 分钟），超过后必须重建连接。 */
 const SESSION_WEBSOCKET_MAX_AGE_MS = 55 * 60 * 1000;
 
+/** WebSocket 事件类型。 */
 type WebSocketEventType = "open" | "message" | "error" | "close";
+/** WebSocket 事件监听器签名。 */
 type WebSocketListener = (event: unknown) => void;
 
+/** 跨运行时（浏览器/Node/Bun）通用的 WebSocket 最小接口。 */
 interface WebSocketLike {
 	close(code?: number, reason?: string): void;
 	send(data: string): void;
@@ -838,12 +899,14 @@ interface WebSocketLike {
 	removeEventListener(type: WebSocketEventType, listener: WebSocketListener): void;
 }
 
+/** 缓存的 WebSocket 连接续传状态，用于下一次请求时做增量输入。 */
 interface CachedWebSocketContinuationState {
 	lastRequestBody: RequestBody;
 	lastResponseId: string;
 	lastResponseItems: ResponseInput;
 }
 
+/** 缓存的 WebSocket 连接条目。 */
 interface CachedWebSocketConnection {
 	socket: WebSocketLike;
 	busy: boolean;
@@ -852,27 +915,46 @@ interface CachedWebSocketConnection {
 	continuation?: CachedWebSocketContinuationState;
 }
 
+/** 每个会话的 WebSocket 传输调试统计信息。 */
 export interface OpenAICodexWebSocketDebugStats {
+	/** 总请求数。 */
 	requests: number;
+	/** 新建连接数。 */
 	connectionsCreated: number;
+	/** 复用连接数。 */
 	connectionsReused: number;
+	/** 使用缓存上下文的请求数。 */
 	cachedContextRequests: number;
+	/** 携带 store: true 的请求数。 */
 	storeTrueRequests: number;
+	/** 携带完整上下文的请求数。 */
 	fullContextRequests: number;
+	/** 携带增量输入的请求数。 */
 	deltaRequests: number;
+	/** 最近一次请求的输入条数。 */
 	lastInputItems: number;
+	/** 最近一次增量请求的输入条数。 */
 	lastDeltaInputItems?: number;
+	/** 最近一次请求的前一个响应 ID。 */
 	lastPreviousResponseId?: string;
+	/** WebSocket 失败次数。 */
 	websocketFailures: number;
+	/** 回退到 SSE 的次数。 */
 	sseFallbacks: number;
+	/** 当前是否处于 WebSocket 回退状态。 */
 	websocketFallbackActive?: boolean;
+	/** 最近一次 WebSocket 错误信息。 */
 	lastWebSocketError?: string;
 }
 
+/** 会话 →（账号 → 连接）的缓存映射。 */
 const websocketSessionCache = new Map<string, Map<string, CachedWebSocketConnection>>();
+/** 会话 → 调试统计的映射。 */
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
+/** 已标记为回退到 SSE 的会话集合。 */
 const websocketSseFallbackSessions = new Set<string>();
 
+/** 获取（必要时创建）某个会话的 WebSocket 调试统计对象。 */
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
 	let stats = websocketDebugStats.get(sessionId);
 	if (!stats) {
@@ -893,11 +975,13 @@ function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocket
 	return stats;
 }
 
+/** 获取某个会话的 WebSocket 调试统计（拷贝返回）。 */
 export function getOpenAICodexWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats | undefined {
 	const stats = websocketDebugStats.get(sessionId);
 	return stats ? { ...stats } : undefined;
 }
 
+/** 重置某个（或全部）会话的 WebSocket 调试统计与回退标记。 */
 export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
 	if (sessionId) {
 		websocketDebugStats.delete(sessionId);
@@ -908,6 +992,7 @@ export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
 	websocketSseFallbackSessions.clear();
 }
 
+/** 关闭某个（或全部）会话缓存的 WebSocket 连接并清理缓存。 */
 export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 	const closeEntry = (entry: CachedWebSocketConnection) => {
 		if (entry.idleTimer) clearTimeout(entry.idleTimer);
@@ -926,10 +1011,12 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
 
+/** 判断某个会话当前是否处于 WebSocket 回退到 SSE 的状态。 */
 function isWebSocketSseFallbackActive(sessionId: string | undefined): boolean {
 	return sessionId ? websocketSseFallbackSessions.has(sessionId) : false;
 }
 
+/** 记录一次回退到 SSE 的事件。 */
 function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	if (!sessionId) return;
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
@@ -937,6 +1024,7 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
+/** 记录一次 WebSocket 失败，并将该会话标记为回退到 SSE。 */
 function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
@@ -947,17 +1035,20 @@ function recordWebSocketFailure(sessionId: string | undefined, error: unknown): 
 	stats.websocketFallbackActive = true;
 }
 
+/** WebSocket 构造函数类型，兼容不同运行时的构造签名。 */
 type WebSocketConstructor = new (
 	url: string,
 	protocols?: string | string[] | { headers?: Record<string, string> },
 ) => WebSocketLike;
 
+/** 缓存的 WebSocket 构造函数。 */
 let _cachedWebsocket: WebSocketConstructor | null = null;
+/** 获取当前运行时可用的 WebSocket 构造函数；不可用时返回 null。 */
 async function getWebSocketConstructor(env?: ProviderEnv): Promise<WebSocketConstructor | null> {
 	if (!env && _cachedWebsocket) return _cachedWebsocket;
 
-	// bun doesn't respect http proxy envs, ref: https://github.com/oven-sh/bun/issues/15489
-	// TODO: remove this when bun supports proxy envs in websocket.
+	// bun 不遵守 http 代理环境变量，见：https://github.com/oven-sh/bun/issues/15489
+	// TODO: bun 支持 websocket 代理环境变量后移除该分支。
 	if (typeof process !== "undefined" && process.versions?.bun) {
 		const WebSocketWithProxy = class extends WebSocket {
 			constructor(url: string | URL, options?: string | string[] | Record<string, unknown>) {

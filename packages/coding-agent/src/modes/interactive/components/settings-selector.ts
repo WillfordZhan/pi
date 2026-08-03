@@ -25,11 +25,13 @@ import {
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
 
+/** 设置子菜单中选项列表的布局约束：主列（选项名）宽度区间。 */
 const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	minPrimaryColumnWidth: 12,
 	maxPrimaryColumnWidth: 32,
 };
 
+/** 各思考级别的说明文案，展示在“思考级别”子菜单中。 */
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
 	minimal: "Very brief reasoning (~1k tokens)",
@@ -40,16 +42,19 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	max: "Maximum reasoning",
 };
 
+/** 项目信任级别的显示标签。 */
 const DEFAULT_PROJECT_TRUST_LABELS: Record<DefaultProjectTrust, string> = {
 	ask: "Ask",
 	always: "Always trust",
 	never: "Never trust",
 };
 
+/** 标签到信任级别的反向映射，用于把界面选中值还原为内部枚举。 */
 const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 	Object.entries(DEFAULT_PROJECT_TRUST_LABELS).map(([value, label]) => [label, value as DefaultProjectTrust]),
 );
 
+/** 设置选择器所需的全部配置值（当前设置状态快照）。 */
 export interface SettingsConfig {
 	autoCompact: boolean;
 	showImages: boolean;
@@ -85,6 +90,7 @@ export interface SettingsConfig {
 	warnings: WarningSettings;
 }
 
+/** 设置项变更与取消操作的回调集合，每个回调对应一个设置项的修改事件。 */
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
 	onShowImagesChange: (enabled: boolean) => void;
@@ -120,7 +126,8 @@ export interface SettingsCallbacks {
 }
 
 /**
- * A submenu component for selecting from a list of options.
+ * 警告设置子菜单：以设置列表的形式调整各警告项的开关。
+ * 内部维护一份警告设置的副本，变更时通过 `onChange` 回传给调用方。
  */
 class WarningSettingsSubmenu extends Container {
 	private settingsList: SettingsList;
@@ -164,6 +171,7 @@ class WarningSettingsSubmenu extends Container {
 	}
 }
 
+/** 通用单选子菜单：展示标题、说明与一个选项列表，支持取消与选择回调。 */
 class SelectSubmenu extends Container {
 	private selectList: SelectList;
 
@@ -228,12 +236,15 @@ class SelectSubmenu extends Container {
 	}
 }
 
+/** 把可用主题名转换为选项列表项。 */
 function themeItems(availableThemes: string[]): SelectItem[] {
 	return availableThemes.map((name) => ({ value: name, label: name }));
 }
 
+/** “自动主题”选项的特殊值，用于标识跟随终端明暗外观的模式。 */
 const AUTOMATIC_THEME_VALUE = "/";
 
+/** 生成单主题模式下的选项列表：在具体主题前附加一个“自动”选项。 */
 function singleModeThemeItems(availableThemes: string[]): SelectItem[] {
 	return [
 		{
@@ -245,12 +256,14 @@ function singleModeThemeItems(availableThemes: string[]): SelectItem[] {
 	];
 }
 
+/** 从可用主题中挑选主题名：优先取指定主题，其次取兜底主题，最后取列表第一个。 */
 function preferredTheme(availableThemes: string[], preferred: string | undefined, fallback: string): string {
 	if (preferred && availableThemes.includes(preferred)) return preferred;
 	if (availableThemes.includes(fallback)) return fallback;
 	return availableThemes[0] ?? fallback;
 }
 
+/** 解析出自动主题模式下的明/暗两套主题；若当前设置不是自动模式则回退为同一主题。 */
 function defaultAutomaticThemes(
 	currentThemeSetting: string,
 	availableThemes: string[],
@@ -263,6 +276,7 @@ function defaultAutomaticThemes(
 	return { lightTheme: themeName, darkTheme: themeName };
 }
 
+/** 主题子菜单：支持“单一主题”和“自动主题（明暗分离）”两种模式，切换时实时预览。 */
 class ThemeSubmenu extends Container {
 	private inputComponent: Component | undefined;
 	private readonly callbacks: SettingsCallbacks;
@@ -472,11 +486,16 @@ class ThemeSubmenu extends Container {
 }
 
 /**
- * Main settings selector component.
+ * 主设置选择器组件：集中呈现全部可调设置项，
+ * 每一项的变更通过 `SettingsCallbacks` 回调通知外部，并支持搜索与子菜单。
  */
 export class SettingsSelectorComponent extends Container {
 	private settingsList: SettingsList;
 
+	/**
+	 * @param config 当前设置状态快照，用于确定各设置项的默认展示值。
+	 * @param callbacks 设置变更与取消事件的回调集合。
+	 */
 	constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
 		super();
 
@@ -857,6 +876,7 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 	}
 
+	/** 返回内部的设置列表组件，供外部获取焦点或注入输入。 */
 	getSettingsList(): SettingsList {
 		return this.settingsList;
 	}

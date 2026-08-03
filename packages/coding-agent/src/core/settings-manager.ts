@@ -9,44 +9,52 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 
+/** 自动压缩（compaction）设置。 */
 export interface CompactionSettings {
-	enabled?: boolean; // default: true
-	reserveTokens?: number; // default: 16384
-	keepRecentTokens?: number; // default: 20000
+	enabled?: boolean; // 默认: true
+	reserveTokens?: number; // 默认: 16384
+	keepRecentTokens?: number; // 默认: 20000
 }
 
+/** 分支摘要（branch summary）设置。 */
 export interface BranchSummarySettings {
-	reserveTokens?: number; // default: 16384 (tokens reserved for prompt + LLM response)
-	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
+	reserveTokens?: number; // 默认: 16384（为提示词与 LLM 回复预留的 token）
+	skipPrompt?: boolean; // 默认: false - 为 true 时跳过 "Summarize branch?" 提示并默认不生成摘要
 }
 
+/** 单个 provider 的重试设置。 */
 export interface ProviderRetrySettings {
-	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
-	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
+	timeoutMs?: number; // SDK/provider 请求超时（毫秒）
+	maxRetries?: number; // SDK/provider 重试次数
+	maxRetryDelayMs?: number; // 默认: 60000（服务端要求的最大延迟，超过即失败）
 }
 
+/** 重试设置。 */
 export interface RetrySettings {
-	enabled?: boolean; // default: true
-	maxRetries?: number; // default: 3
-	baseDelayMs?: number; // default: 2000 (exponential backoff: 2s, 4s, 8s)
+	enabled?: boolean; // 默认: true
+	maxRetries?: number; // 默认: 3
+	baseDelayMs?: number; // 默认: 2000（指数退避：2s, 4s, 8s）
 	provider?: ProviderRetrySettings;
 }
 
+/** UI 布局模式。 */
 export type UiMode = "regular" | "fullscreen";
 
+/** 终端显示相关设置。 */
 export interface TerminalSettings {
-	showImages?: boolean; // default: true (only relevant if terminal supports images)
-	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
-	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
-	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
+	showImages?: boolean; // 默认: true（仅当终端支持图片时相关）
+	imageWidthCells?: number; // 默认: 60（终端单元格中内联图片的首选宽度）
+	clearOnShrink?: boolean; // 默认: false（内容缩小时清除空行）
+	showTerminalProgress?: boolean; // 默认: false（OSC 9;4 终端进度指示）
 }
 
+/** 图片处理相关设置。 */
 export interface ImageSettings {
-	autoResize?: boolean; // default: true (resize images to 2000x2000 max for better model compatibility)
-	blockImages?: boolean; // default: false - when true, prevents all images from being sent to LLM providers
+	autoResize?: boolean; // 默认: true（将图片缩放到最大 2000x2000 以提升模型兼容性）
+	blockImages?: boolean; // 默认: false - 为 true 时阻止所有图片发送给 LLM provider
 }
 
+/** 各思考深度级别的 token 预算设置。 */
 export interface ThinkingBudgetsSettings {
 	minimal?: number;
 	low?: number;
@@ -54,23 +62,27 @@ export interface ThinkingBudgetsSettings {
 	high?: number;
 }
 
+/** Markdown 渲染设置。 */
 export interface MarkdownSettings {
-	codeBlockIndent?: string; // default: "  "
+	codeBlockIndent?: string; // 默认: "  "
 }
 
+/** 警告类设置。 */
 export interface WarningSettings {
-	anthropicExtraUsage?: boolean; // default: true
+	anthropicExtraUsage?: boolean; // 默认: true
 }
 
+/** 默认项目信任策略。 */
 export type DefaultProjectTrust = "ask" | "always" | "never";
 
+/** 传输类型设置（sse / websocket / auto 等）。 */
 export type TransportSetting = Transport;
 
 /**
- * Package source for npm/git packages.
- * - String form: load all resources from the package
- * - Object form: filter which resources to load
- * - autoload=false: start empty and only apply explicit resource patterns
+ * npm/git 包的来源。
+ * - 字符串形式：加载包内的全部资源
+ * - 对象形式：过滤要加载的资源
+ * - autoload=false：初始为空，仅应用显式声明的资源模式
  */
 export type PackageSource =
 	| string
@@ -83,12 +95,13 @@ export type PackageSource =
 			themes?: string[];
 	  };
 
+/** 全部可配置的设置项（含全局与项目范围）。 */
 export interface Settings {
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: ThinkingLevel;
-	transport?: TransportSetting; // default: "auto"
+	transport?: TransportSetting; // 默认: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
@@ -96,44 +109,44 @@ export interface Settings {
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
-	showCacheMissNotices?: boolean; // default: false - show transcript notices for significant prompt-cache misses
-	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
-	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows); supports leading ~ expansion
+	showCacheMissNotices?: boolean; // 默认: false - 对显著的提示缓存未命中显示转录提示
+	externalEditor?: string; // Ctrl+G 外部编辑器的命令；优先级高于 VISUAL/EDITOR
+	shellPath?: string; // 自定义 shell 路径（如 Windows 上的 Cygwin 用户）；支持开头 ~ 展开
 	quietStartup?: boolean;
-	defaultProjectTrust?: DefaultProjectTrust; // default: "ask"; global setting only
-	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
-	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
-	collapseChangelog?: boolean; // Show condensed changelog after update (use /changelog for full)
-	enableInstallTelemetry?: boolean; // default: true - anonymous version/update ping after changelog-detected updates
-	enableAnalytics?: boolean; // default: false - opt-in analytics data sharing
-	trackingId?: string; // analytics tracking identifier, generated when analytics is enabled
-	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
-	extensions?: string[]; // Array of local extension file paths or directories
-	skills?: string[]; // Array of local skill file paths or directories
-	prompts?: string[]; // Array of local prompt template paths or directories
-	themes?: string[]; // Array of local theme file paths or directories
-	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
+	defaultProjectTrust?: DefaultProjectTrust; // 默认: "ask"; 仅全局设置
+	shellCommandPrefix?: string; // 前缀，加在每条 bash 命令之前（如 "shopt -s expand_aliases" 以支持别名）
+	npmCommand?: string[]; // npm 包查找/安装使用的命令，argv 风格（如 ["mise", "exec", "node@20", "--", "npm"]）
+	collapseChangelog?: boolean; // 更新后显示精简版 changelog（用 /changelog 查看完整版）
+	enableInstallTelemetry?: boolean; // 默认: true - changelog 检测到更新后的匿名版本/更新上报
+	enableAnalytics?: boolean; // 默认: false - 可选的匿名分析数据共享
+	trackingId?: string; // 分析跟踪标识，开启分析时生成
+	packages?: PackageSource[]; // npm/git 包来源数组（字符串或带过滤的对象）
+	extensions?: string[]; // 本地扩展文件路径或目录数组
+	skills?: string[]; // 本地技能文件路径或目录数组
+	prompts?: string[]; // 本地提示模板路径或目录数组
+	themes?: string[]; // 本地主题文件路径或目录数组
+	enableSkillCommands?: boolean; // 默认: true - 将技能注册为 /skill:name 命令
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
-	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
-	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
-	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
-	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
-	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
-	outputPad?: 0 | 1; // Horizontal padding for chat message output (default: 1)
-	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
-	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
+	enabledModels?: string[]; // 用于循环切换的模型模式（与 --models CLI 标志格式相同）
+	doubleEscapeAction?: "fork" | "tree" | "none"; // 空编辑器下按两次 Esc 的动作（默认: "tree"）
+	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // 打开 /tree 时的默认过滤方式
+	thinkingBudgets?: ThinkingBudgetsSettings; // 各思考级别的自定义 token 预算
+	editorPaddingX?: number; // 输入编辑器的水平内边距（默认: 0）
+	outputPad?: 0 | 1; // 聊天消息输出的水平内边距（默认: 1）
+	autocompleteMaxVisible?: number; // 自动补全下拉框的最大可见项数（默认: 5）
+	showHardwareCursor?: boolean; // 显示终端光标，同时为 IME 保留光标定位
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
-	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
-	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
-	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
-	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
-	uiMode?: UiMode; // default: "regular"
-	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular UI mode
+	sessionDir?: string; // 自定义会话存储目录（与 --session-dir CLI 标志格式相同）
+	httpProxy?: string; // 应用于 Pi 管理的 HTTP 客户端的代理 URL（HTTP_PROXY/HTTPS_PROXY）
+	httpIdleTimeoutMs?: number; // HTTP 头/正文空闲超时（毫秒）；0 表示禁用
+	websocketConnectTimeoutMs?: number; // WebSocket 连接/握手超时（毫秒）；0 表示禁用
+	uiMode?: UiMode; // 默认: "regular"
+	fullscreenScrollbar?: ScrollViewScrollbar; // 默认: "auto"; regular 模式下无效果
 }
 
-/** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
+/** 深合并设置：项目设置/覆盖优先，嵌套对象递归合并 */
 function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 	const result: Settings = { ...base };
 
@@ -145,7 +158,7 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 			continue;
 		}
 
-		// For nested objects, merge recursively
+		// 对于嵌套对象，递归合并
 		if (
 			typeof overrideValue === "object" &&
 			overrideValue !== null &&
@@ -156,7 +169,7 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 		) {
 			(result as Record<string, unknown>)[key] = { ...baseValue, ...overrideValue };
 		} else {
-			// For primitives and arrays, override value wins
+			// 对于原始值和数组，覆盖值生效
 			(result as Record<string, unknown>)[key] = overrideValue;
 		}
 	}
@@ -164,6 +177,7 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 	return result;
 }
 
+/** 解析超时设置值；非法值抛出带设置名的错误。 */
 function parseTimeoutSetting(value: unknown, settingName: string): number | undefined {
 	const timeoutMs = parseHttpIdleTimeoutMs(value);
 	if (timeoutMs !== undefined) {
@@ -175,25 +189,33 @@ function parseTimeoutSetting(value: unknown, settingName: string): number | unde
 	return undefined;
 }
 
+/** 设置的生效范围：全局或项目。 */
 export type SettingsScope = "global" | "project";
 
+/** 创建 SettingsManager 时的选项。 */
 export interface SettingsManagerCreateOptions {
 	projectTrusted?: boolean;
 }
 
+/** 设置存储后端抽象：在锁内读写当前文件内容。 */
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
 }
 
+/** 设置错误：附带其所属范围。 */
 export interface SettingsError {
 	scope: SettingsScope;
 	error: Error;
 }
 
+/** 基于文件的设置存储：全局与项目 settings.json，用文件锁保证并发安全。 */
 export class FileSettingsStorage implements SettingsStorage {
+	/** 全局设置文件路径。 */
 	private globalSettingsPath: string;
+	/** 项目设置文件路径。 */
 	private projectSettingsPath: string;
 
+	/** @param cwd 项目工作目录。 @param agentDir agent 配置目录。 */
 	constructor(cwd: string, agentDir: string) {
 		const resolvedCwd = resolvePath(cwd);
 		const resolvedAgentDir = resolvePath(agentDir);
@@ -201,6 +223,7 @@ export class FileSettingsStorage implements SettingsStorage {
 		this.projectSettingsPath = join(resolvedCwd, CONFIG_DIR_NAME, "settings.json");
 	}
 
+	/** 同步获取文件锁，遇 `ELOCKED` 时短时重试。 */
 	private acquireLockSyncWithRetry(path: string): () => void {
 		const maxAttempts = 10;
 		const delayMs = 20;
@@ -220,7 +243,7 @@ export class FileSettingsStorage implements SettingsStorage {
 				lastError = error;
 				const start = Date.now();
 				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
+					// 同步忙等，避免把调用方改成异步。
 				}
 			}
 		}
@@ -228,13 +251,14 @@ export class FileSettingsStorage implements SettingsStorage {
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
 	}
 
+	/** 在锁内读取当前设置内容；当回调返回新内容时写回文件。 */
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
 		const dir = dirname(path);
 
 		let release: (() => void) | undefined;
 		try {
-			// Only create directory and lock if file exists or we need to write
+			// 仅在文件存在或需要写入时才创建目录和加锁
 			const fileExists = existsSync(path);
 			if (fileExists) {
 				release = this.acquireLockSyncWithRetry(path);
@@ -242,7 +266,7 @@ export class FileSettingsStorage implements SettingsStorage {
 			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
 			const next = fn(current);
 			if (next !== undefined) {
-				// Only create directory when we actually need to write
+				// 仅在真正需要写入时才创建目录
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
@@ -259,10 +283,14 @@ export class FileSettingsStorage implements SettingsStorage {
 	}
 }
 
+/** 纯内存的设置存储：无文件 I/O，用于测试。 */
 export class InMemorySettingsStorage implements SettingsStorage {
+	/** 内存中的全局设置内容。 */
 	private global: string | undefined;
+	/** 内存中的项目设置内容。 */
 	private project: string | undefined;
 
+	/** 在内存中读取/写入设置内容。 */
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		const current = scope === "global" ? this.global : this.project;
 		const next = fn(current);
@@ -276,21 +304,36 @@ export class InMemorySettingsStorage implements SettingsStorage {
 	}
 }
 
+/** 设置管理器：加载、合并、修改并持久化全局与项目范围的设置。 */
 export class SettingsManager {
+	/** 底层设置存储后端。 */
 	private storage: SettingsStorage;
+	/** 全局设置（已解析）。 */
 	private globalSettings: Settings;
+	/** 项目设置（已解析）。 */
 	private projectSettings: Settings;
+	/** 合并后的有效设置（全局优先、项目覆盖）。 */
 	private settings: Settings;
+	/** 项目是否被信任（决定是否加载/写入项目设置）。 */
 	private projectTrusted: boolean;
-	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
-	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
-	private modifiedProjectFields = new Set<keyof Settings>(); // Track project fields modified during session
-	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>(); // Track project nested field modifications
-	private globalSettingsLoadError: Error | null = null; // Track if global settings file had parse errors
-	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
+	/** 会话期间被修改过的全局字段。 */
+	private modifiedFields = new Set<keyof Settings>();
+	/** 会话期间被修改过的全局嵌套字段（字段 -> 具体嵌套键）。 */
+	private modifiedNestedFields = new Map<keyof Settings, Set<string>>();
+	/** 会话期间被修改过的项目字段。 */
+	private modifiedProjectFields = new Set<keyof Settings>();
+	/** 会话期间被修改过的项目嵌套字段。 */
+	private modifiedProjectNestedFields = new Map<keyof Settings, Set<string>>();
+	/** 全局设置文件解析错误（如 JSON 解析失败）。 */
+	private globalSettingsLoadError: Error | null = null;
+	/** 项目设置文件解析错误。 */
+	private projectSettingsLoadError: Error | null = null;
+	/** 串行化的写入队列，保证写操作顺序执行。 */
 	private writeQueue: Promise<void> = Promise.resolve();
+	/** 累积的设置错误列表。 */
 	private errors: SettingsError[];
 
+	/** 私有构造函数：请使用静态工厂方法创建实例。 */
 	private constructor(
 		storage: SettingsStorage,
 		initialGlobal: Settings,
@@ -310,7 +353,7 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Create a SettingsManager that loads from files */
+	/** 创建一个从文件加载设置的 SettingsManager。 */
 	static create(
 		cwd: string,
 		agentDir: string = getAgentDir(),
@@ -320,7 +363,7 @@ export class SettingsManager {
 		return SettingsManager.fromStorage(storage, options);
 	}
 
-	/** Create a SettingsManager from an arbitrary storage backend */
+	/** 从任意存储后端创建 SettingsManager。 */
 	static fromStorage(storage: SettingsStorage, options: SettingsManagerCreateOptions = {}): SettingsManager {
 		const projectTrusted = options.projectTrusted ?? true;
 		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
@@ -344,7 +387,7 @@ export class SettingsManager {
 		);
 	}
 
-	/** Create an in-memory SettingsManager (no file I/O) */
+	/** 创建一个纯内存的 SettingsManager（无文件 I/O）。 */
 	static inMemory(settings: Partial<Settings> = {}, options: SettingsManagerCreateOptions = {}): SettingsManager {
 		const storage = new InMemorySettingsStorage();
 		const initialSettings = SettingsManager.migrateSettings(structuredClone(settings) as Record<string, unknown>);
@@ -352,6 +395,7 @@ export class SettingsManager {
 		return SettingsManager.fromStorage(storage, options);
 	}
 
+	/** 从存储加载设置；项目范围且不被信任时返回空设置。 */
 	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope, projectTrusted = true): Settings {
 		if (scope === "project" && !projectTrusted) {
 			return {};
@@ -370,6 +414,7 @@ export class SettingsManager {
 		return SettingsManager.migrateSettings(settings);
 	}
 
+	/** 尝试从存储加载设置；失败时返回空设置与错误。 */
 	private static tryLoadFromStorage(
 		storage: SettingsStorage,
 		scope: SettingsScope,
@@ -382,21 +427,21 @@ export class SettingsManager {
 		}
 	}
 
-	/** Migrate old settings format to new format */
+	/** 将旧版设置格式迁移到新版格式。 */
 	private static migrateSettings(settings: Record<string, unknown>): Settings {
-		// Migrate queueMode -> steeringMode
+		// 迁移 queueMode -> steeringMode
 		if ("queueMode" in settings && !("steeringMode" in settings)) {
 			settings.steeringMode = settings.queueMode;
 			delete settings.queueMode;
 		}
 
-		// Migrate legacy websockets boolean -> transport enum
+		// 迁移旧版 websockets 布尔值 -> transport 枚举
 		if (!("transport" in settings) && typeof settings.websockets === "boolean") {
 			settings.transport = settings.websockets ? "websocket" : "sse";
 			delete settings.websockets;
 		}
 
-		// Migrate old skills object format to new array format
+		// 迁移旧版 skills 对象格式到新数组格式
 		if (
 			"skills" in settings &&
 			typeof settings.skills === "object" &&
@@ -417,7 +462,7 @@ export class SettingsManager {
 			}
 		}
 
-		// Migrate retry.maxDelayMs -> retry.provider.maxRetryDelayMs
+		// 迁移 retry.maxDelayMs -> retry.provider.maxRetryDelayMs
 		if (
 			"retry" in settings &&
 			typeof settings.retry === "object" &&
@@ -444,18 +489,22 @@ export class SettingsManager {
 		return settings as Settings;
 	}
 
+	/** 返回全局设置的深拷贝。 */
 	getGlobalSettings(): Settings {
 		return structuredClone(this.globalSettings);
 	}
 
+	/** 返回项目设置的深拷贝。 */
 	getProjectSettings(): Settings {
 		return structuredClone(this.projectSettings);
 	}
 
+	/** 项目是否被信任。 */
 	isProjectTrusted(): boolean {
 		return this.projectTrusted;
 	}
 
+	/** 设置项目信任状态；切换时会重新加载（或清空）项目设置。 */
 	setProjectTrusted(trusted: boolean): void {
 		if (this.projectTrusted === trusted) {
 			return;
@@ -481,6 +530,7 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
+	/** 等待写入队列后重新从存储加载全局与项目设置。 */
 	async reload(): Promise<void> {
 		await this.writeQueue;
 		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
@@ -509,12 +559,12 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Apply additional overrides on top of current settings */
+	/** 在当前设置之上应用额外的覆盖项。 */
 	applyOverrides(overrides: Partial<Settings>): void {
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
-	/** Mark a global field as modified during this session */
+	/** 将会话期间修改过的全局字段做标记（可选嵌套键）。 */
 	private markModified(field: keyof Settings, nestedKey?: string): void {
 		this.modifiedFields.add(field);
 		if (nestedKey) {
@@ -525,7 +575,7 @@ export class SettingsManager {
 		}
 	}
 
-	/** Mark a project field as modified during this session */
+	/** 将会话期间修改过的项目字段做标记（可选嵌套键）。 */
 	private markProjectModified(field: keyof Settings, nestedKey?: string): void {
 		this.modifiedProjectFields.add(field);
 		if (nestedKey) {
@@ -536,17 +586,20 @@ export class SettingsManager {
 		}
 	}
 
+	/** 写入项目设置前断言项目被信任。 */
 	private assertProjectTrustedForWrite(): void {
 		if (!this.projectTrusted) {
 			throw new Error("Project is not trusted; refusing to write project settings");
 		}
 	}
 
+	/** 记录一个设置错误（按范围）。 */
 	private recordError(scope: SettingsScope, error: unknown): void {
 		const normalizedError = error instanceof Error ? error : new Error(String(error));
 		this.errors.push({ scope, error: normalizedError });
 	}
 
+	/** 清空指定范围的修改标记。 */
 	private clearModifiedScope(scope: SettingsScope): void {
 		if (scope === "global") {
 			this.modifiedFields.clear();
@@ -558,6 +611,7 @@ export class SettingsManager {
 		this.modifiedProjectNestedFields.clear();
 	}
 
+	/** 把一次写任务排入串行队列；写失败时记录错误。 */
 	private enqueueWrite(scope: SettingsScope, task: () => void): void {
 		this.writeQueue = this.writeQueue
 			.then(() => {
@@ -572,6 +626,7 @@ export class SettingsManager {
 			});
 	}
 
+	/** 深拷贝被修改的嵌套字段集合（避免异步写回时被后续修改影响）。 */
 	private cloneModifiedNestedFields(source: Map<keyof Settings, Set<string>>): Map<keyof Settings, Set<string>> {
 		const snapshot = new Map<keyof Settings, Set<string>>();
 		for (const [key, value] of source.entries()) {
@@ -580,6 +635,7 @@ export class SettingsManager {
 		return snapshot;
 	}
 
+	/** 把快照中标记为修改过的字段合并回存储文件并写回。 */
 	private persistScopedSettings(
 		scope: SettingsScope,
 		snapshotSettings: Settings,
@@ -611,6 +667,7 @@ export class SettingsManager {
 		});
 	}
 
+	/** 保存全局设置：把修改过的字段异步写回存储。 */
 	private save(): void {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 
@@ -627,6 +684,7 @@ export class SettingsManager {
 		});
 	}
 
+	/** 保存项目设置：把修改过的字段异步写回存储。 */
 	private saveProjectSettings(settings: Settings): void {
 		this.assertProjectTrustedForWrite();
 		this.projectSettings = structuredClone(settings);
@@ -644,6 +702,7 @@ export class SettingsManager {
 		});
 	}
 
+	/** 通过更新回调修改项目设置的某个字段并保存。 */
 	private updateProjectSettings(field: keyof Settings, update: (settings: Settings) => void): void {
 		this.assertProjectTrustedForWrite();
 		const projectSettings = structuredClone(this.projectSettings);
@@ -652,16 +711,19 @@ export class SettingsManager {
 		this.saveProjectSettings(projectSettings);
 	}
 
+	/** 等待所有排队的写操作完成。 */
 	async flush(): Promise<void> {
 		await this.writeQueue;
 	}
 
+	/** 取出并清空累积的设置错误。 */
 	drainErrors(): SettingsError[] {
 		const drained = [...this.errors];
 		this.errors = [];
 		return drained;
 	}
 
+	/** 获取上次看到的 changelog 版本。 */
 	getLastChangelogVersion(): string | undefined {
 		return this.settings.lastChangelogVersion;
 	}

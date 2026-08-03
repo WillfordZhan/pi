@@ -3,51 +3,58 @@ import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 
+/** 终端图片协议：Kitty、iTerm2 或 null（不支持图片）。 */
 export type ImageProtocol = "kitty" | "iterm2" | null;
 
+/** 终端的特性能力：是否支持图片、真彩色和 OSC 8 超链接。 */
 export interface TerminalCapabilities {
 	images: ImageProtocol;
 	trueColor: boolean;
 	hyperlinks: boolean;
 }
 
+/** 终端单元格的像素尺寸。 */
 export interface CellDimensions {
 	widthPx: number;
 	heightPx: number;
 }
 
+/** 图片的像素尺寸。 */
 export interface ImageDimensions {
 	widthPx: number;
 	heightPx: number;
 }
 
+/** 渲染图片时的选项。 */
 export interface ImageRenderOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	preserveAspectRatio?: boolean;
-	/** Kitty image ID. If provided, reuses/replaces existing image with this ID. */
+	/** Kitty 图片 ID。若提供，会复用/替换该 ID 对应的已有图片。 */
 	imageId?: number;
-	/** Whether Kitty should apply its default cursor movement after placement. */
+	/** 是否让 Kitty 在放置图片后执行默认的光标移动。 */
 	moveCursor?: boolean;
 }
 
 let cachedCapabilities: TerminalCapabilities | null = null;
 
-// Default cell dimensions - updated by TUI when terminal responds to query
+// 默认单元格尺寸——TUI 收到终端查询响应后会更新它
 let cellDimensions: CellDimensions = { widthPx: 9, heightPx: 18 };
 
+/** 获取当前终端单元格的像素尺寸。 */
 export function getCellDimensions(): CellDimensions {
 	return cellDimensions;
 }
 
+/** 设置终端单元格的像素尺寸。 */
 export function setCellDimensions(dims: CellDimensions): void {
 	cellDimensions = dims;
 }
 
 /**
- * Checks whether the attached tmux client forwards OSC 8 hyperlinks to the
- * outer terminal. tmux only re-emits them when its `client_termfeatures` lists
- * `hyperlinks`, and strips them otherwise. On any error fallbacks `false`.
+ * 探测当前挂载的 tmux 客户端是否会把 OSC 8 超链接转发给外层终端。
+ * 仅当 tmux 的 `client_termfeatures` 包含 `hyperlinks` 时才会重发超链接，否则会剥离它们。
+ * 任何错误时回退为 false。
  */
 function probeTmuxHyperlinks(): boolean {
 	try {
@@ -65,6 +72,11 @@ function probeTmuxHyperlinks(): boolean {
 	}
 }
 
+/**
+ * 根据环境变量探测当前终端的各项能力。
+ * 逐个识别已知终端（Kitty、Ghostty、WezTerm、iTerm2 等），
+ * 未知终端则保守地关闭超链接与图片。
+ */
 export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks): TerminalCapabilities {
 	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() || "";
 	const terminalEmulator = process.env.TERMINAL_EMULATOR?.toLowerCase() || "";
@@ -72,13 +84,13 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 	const colorTerm = process.env.COLORTERM?.toLowerCase() || "";
 	const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit";
 
-	// Emit OSC 8 hyperlinks only when tmux confirms it forwards.
-	// Image protocols are unreliable under tmux, so leave `images: null`.
+	// 仅当 tmux 确认会转发时才开启 OSC 8 超链接。
+	// 图片协议在 tmux 下不可靠，因此保持 `images: null`。
 	if (process.env.TMUX || term.startsWith("tmux")) {
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: tmuxForwardsHyperlink() };
 	}
 
-	// screen does not forward OSC 8 hyperlinks, so keep them off there.
+	// screen 不转发 OSC 8 超链接，因此这里关闭超链接。
 	if (term.startsWith("screen")) {
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 	}
@@ -95,7 +107,7 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
 
-	// Warp supports the Kitty graphics protocol and OSC 8 hyperlinks.
+	// Warp 支持 Kitty 图形协议和 OSC 8 超链接。
 	if (termProgram === "warpterminal" || process.env.WARP_SESSION_ID || process.env.WARP_TERMINAL_SESSION_UUID) {
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
@@ -120,13 +132,13 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 		return { images: null, trueColor: true, hyperlinks: false };
 	}
 
-	// Unknown terminal: be conservative. OSC 8 is rendered invisibly as "just
-	// text" on terminals that swallow it, which means the URL disappears from
-	// the rendered output. Default to the legacy `text (url)` behavior unless we
-	// have positively identified a hyperlink-capable terminal above.
+	// 未知终端：保持保守。OSC 8 在会吞掉它的终端上会不可见地渲染成
+	// “纯文本”，导致 URL 从渲染输出中消失。
+	// 除非上面已明确识别出支持超链接的终端，否则回退到旧的 `text (url)` 行为。
 	return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 }
 
+/** 获取（并缓存）终端能力。 */
 export function getCapabilities(): TerminalCapabilities {
 	if (!cachedCapabilities) {
 		cachedCapabilities = detectCapabilities();
@@ -134,11 +146,12 @@ export function getCapabilities(): TerminalCapabilities {
 	return cachedCapabilities;
 }
 
+/** 清空终端能力缓存（下次调用会重新探测）。 */
 export function resetCapabilitiesCache(): void {
 	cachedCapabilities = null;
 }
 
-/** Override the cached capabilities. Useful in tests to exercise both code paths. */
+/** 覆盖缓存的能力值。用于测试中覆盖两条代码路径。 */
 export function setCapabilities(caps: TerminalCapabilities): void {
 	cachedCapabilities = caps;
 }
@@ -146,32 +159,36 @@ export function setCapabilities(caps: TerminalCapabilities): void {
 const KITTY_PREFIX = "\x1b_G";
 const ITERM2_PREFIX = "\x1b]1337;File=";
 
+/** 判断一行文本是否包含终端图片转义序列。 */
 export function isImageLine(line: string): boolean {
-	// Fast path: sequence at line start (single-row images)
+	// 快路径：序列在行首（单行图片）
 	if (line.startsWith(KITTY_PREFIX) || line.startsWith(ITERM2_PREFIX)) {
 		return true;
 	}
-	// Slow path: sequence elsewhere (multi-row images have cursor-up prefix)
+	// 慢路径：序列在其它位置（多行图片带光标上移前缀）
 	return line.includes(KITTY_PREFIX) || line.includes(ITERM2_PREFIX);
 }
 
 /**
- * Generate a random image ID for Kitty graphics protocol.
- * Uses random IDs to avoid collisions between different module instances
- * (e.g., main app vs extensions).
+ * 为 Kitty 图形协议生成一个随机图片 ID。
+ * 使用随机 ID 以避免不同模块实例（如主应用与扩展）之间的冲突。
  */
 export function allocateImageId(): number {
-	// Use random ID in range [1, 0xffffffff] to avoid collisions
+	// 使用 [1, 0xffffffff] 范围内的随机 ID 以避免冲突
 	return Math.floor(Math.random() * 0xfffffffe) + 1;
 }
 
+/**
+ * 把 base64 编码的图片数据编码为 Kitty 图形协议序列。
+ * 大图会自动分块传输（每块 4096 字符）。
+ */
 export function encodeKitty(
 	base64Data: string,
 	options: {
 		columns?: number;
 		rows?: number;
 		imageId?: number;
-		/** Whether Kitty should apply its default cursor movement after placement. Default: true. */
+		/** 是否在放置后让 Kitty 执行默认光标移动。默认：true。 */
 		moveCursor?: boolean;
 	} = {},
 ): string {
@@ -188,6 +205,7 @@ export function encodeKitty(
 		return `\x1b_G${params.join(",")};${base64Data}\x1b\\`;
 	}
 
+	// 分块传输：首个块携带参数，中间块 m=1，末尾块 m=0
 	const chunks: string[] = [];
 	let offset = 0;
 	let isFirst = true;
@@ -212,26 +230,27 @@ export function encodeKitty(
 }
 
 /**
- * Delete a Kitty graphics image by ID.
- * Uses uppercase 'I' to also free the image data.
+ * 按 ID 删除一张 Kitty 图片。
+ * 使用大写 'I' 同时释放图片数据。
  */
 export function deleteKittyImage(imageId: number): string {
 	return `\x1b_Ga=d,d=I,i=${imageId},q=2\x1b\\`;
 }
 
 /**
- * Delete all visible Kitty graphics images.
- * Uses uppercase 'A' to also free the image data.
+ * 删除所有可见的 Kitty 图片。
+ * 使用大写 'A' 同时释放图片数据。
  */
 export function deleteAllKittyImages(): string {
 	return "\x1b_Ga=d,d=A,q=2\x1b\\";
 }
 
-/** Delete all visible Kitty placements while retaining their uploaded image data. */
+/** 删除所有可见的 Kitty 图片放置（placement），但保留已上传的图片数据。 */
 export function deleteAllKittyPlacements(): string {
 	return "\x1b_Ga=d,d=a,q=2\x1b\\";
 }
 
+/** 把 base64 编码的图片数据编码为 iTerm2 内联图片序列。 */
 export function encodeITerm2(
 	base64Data: string,
 	options: {
@@ -257,21 +276,25 @@ export function encodeITerm2(
 	return `\x1b]1337;File=${params.join(";")}:${base64Data}\x07`;
 }
 
+/** 图片在终端中占用的单元格尺寸。 */
 export interface ImageCellSize {
 	columns: number;
 	rows: number;
 }
 
+/** Kitty 图片的元数据：ID、占用单元格数与像素尺寸。 */
 export interface KittyImageMetadata extends ImageCellSize {
 	imageId: number;
 	widthPx: number;
 	heightPx: number;
 }
 
+/** 注册表中的 Kitty 图片元数据：额外记录传输代数。 */
 interface RegisteredKittyImageMetadata extends KittyImageMetadata {
 	transmissionGeneration: number;
 }
 
+/** Kitty 图片放置（placement）信息：用于把传输序列替换为仅放置命令。 */
 export interface KittyImagePlacement {
 	imageId: number;
 	transmissionGeneration: number;
@@ -279,9 +302,12 @@ export interface KittyImagePlacement {
 	replacementLine: string;
 }
 
+/** 已注册的 Kitty 图片元数据表：imageId -> 元数据。 */
 const kittyImageMetadata = new Map<number, RegisteredKittyImageMetadata>();
+/** 全局传输代数计数器，每次注册递增。 */
 let kittyTransmissionGeneration = 0;
 
+/** 注册一张 Kitty 图片的元数据；超过 1000 条时淘汰最旧的记录。 */
 export function registerKittyImageMetadata(metadata: KittyImageMetadata): void {
 	kittyTransmissionGeneration += 1;
 	kittyImageMetadata.delete(metadata.imageId);
@@ -292,6 +318,7 @@ export function registerKittyImageMetadata(metadata: KittyImageMetadata): void {
 	}
 }
 
+/** 从一行 Kitty 序列中提取已注册的图片元数据。 */
 function getRegisteredKittyImageMetadata(line: string): RegisteredKittyImageMetadata | undefined {
 	const controls = /\x1b_G([^;]*);/.exec(line)?.[1];
 	if (!controls) return undefined;
@@ -299,6 +326,7 @@ function getRegisteredKittyImageMetadata(line: string): RegisteredKittyImageMeta
 	return imageId === undefined ? undefined : kittyImageMetadata.get(Number.parseInt(imageId, 10));
 }
 
+/** 获取一行 Kitty 序列中图片的公开元数据（不含传输代数）。 */
 export function getKittyImageMetadata(line: string): KittyImageMetadata | undefined {
 	const metadata = getRegisteredKittyImageMetadata(line);
 	if (!metadata) return undefined;
@@ -311,6 +339,7 @@ export function getKittyImageMetadata(line: string): KittyImageMetadata | undefi
 	};
 }
 
+/** 放置命令允许携带的控制参数键（其余控制参数会被剥离）。 */
 const KITTY_PLACEMENT_CONTROL_KEYS = new Set([
 	"i",
 	"p",
@@ -331,12 +360,13 @@ const KITTY_PLACEMENT_CONTROL_KEYS = new Set([
 	"V",
 ]);
 
-/** Build a placement-only command for an image line emitted by {@link renderImage}. */
+/** 为 {@link renderImage} 生成的图片行构建仅放置（placement）命令。 */
 export function getKittyImagePlacement(line: string): KittyImagePlacement | undefined {
 	const match = /\x1b_G([^;]*);/.exec(line);
 	const metadata = getRegisteredKittyImageMetadata(line);
 	if (!match || !metadata) return undefined;
 
+	// 跳过分块传输的中间块，定位到完整传输结束位置
 	let commandStart = match.index;
 	let commandControls = match[1];
 	let transmissionEnd: number;
@@ -364,6 +394,10 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 	};
 }
 
+/**
+ * 裁剪一张 Kitty 图片行：只显示指定范围内的行。
+ * 通过调整 y/h/r 控制参数实现源图像区域的裁剪。
+ */
 export function cropKittyImageLine(line: string, hiddenRows: number, visibleRows: number): string {
 	const metadata = getKittyImageMetadata(line);
 	const match = /\x1b_G([^;]*);/.exec(line);
@@ -378,6 +412,10 @@ export function cropKittyImageLine(line: string, hiddenRows: number, visibleRows
 	return `${line.slice(0, match.index)}\x1b_G${controls.join(",")};${line.slice(match.index + match[0].length)}`;
 }
 
+/**
+ * 根据图片尺寸、单元格尺寸和最大占用单元格数，计算图片应占用的单元格大小。
+ * 在不超过宽度/高度限制的前提下尽量保持宽高比。
+ */
 export function calculateImageCellSize(
 	imageDimensions: ImageDimensions,
 	maxWidthCells: number,
@@ -404,6 +442,7 @@ export function calculateImageCellSize(
 	};
 }
 
+/** 计算图片在指定目标宽度下所占的行数（保持宽高比）。 */
 export function calculateImageRows(
 	imageDimensions: ImageDimensions,
 	targetWidthCells: number,
@@ -412,6 +451,7 @@ export function calculateImageRows(
 	return calculateImageCellSize(imageDimensions, targetWidthCells, undefined, cellDimensions).rows;
 }
 
+/** 解析 base64 PNG 数据的像素尺寸（从 PNG 头读取）。 */
 export function getPngDimensions(base64Data: string): ImageDimensions | null {
 	try {
 		const buffer = Buffer.from(base64Data, "base64");
@@ -420,6 +460,7 @@ export function getPngDimensions(base64Data: string): ImageDimensions | null {
 			return null;
 		}
 
+		// 校验 PNG 魔数
 		if (buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47) {
 			return null;
 		}
@@ -433,6 +474,7 @@ export function getPngDimensions(base64Data: string): ImageDimensions | null {
 	}
 }
 
+/** 解析 base64 JPEG 数据的像素尺寸（遍历标记段找 SOF 帧）。 */
 export function getJpegDimensions(base64Data: string): ImageDimensions | null {
 	try {
 		const buffer = Buffer.from(base64Data, "base64");
@@ -441,6 +483,7 @@ export function getJpegDimensions(base64Data: string): ImageDimensions | null {
 			return null;
 		}
 
+		// 校验 JPEG 魔数
 		if (buffer[0] !== 0xff || buffer[1] !== 0xd8) {
 			return null;
 		}
@@ -454,6 +497,7 @@ export function getJpegDimensions(base64Data: string): ImageDimensions | null {
 
 			const marker = buffer[offset + 1];
 
+			// SOF0/SOF1/SOF2 帧头包含宽高
 			if (marker >= 0xc0 && marker <= 0xc2) {
 				const height = buffer.readUInt16BE(offset + 5);
 				const width = buffer.readUInt16BE(offset + 7);
@@ -476,6 +520,7 @@ export function getJpegDimensions(base64Data: string): ImageDimensions | null {
 	}
 }
 
+/** 解析 base64 GIF 数据的像素尺寸（从逻辑屏幕描述符读取）。 */
 export function getGifDimensions(base64Data: string): ImageDimensions | null {
 	try {
 		const buffer = Buffer.from(base64Data, "base64");
@@ -498,6 +543,7 @@ export function getGifDimensions(base64Data: string): ImageDimensions | null {
 	}
 }
 
+/** 解析 base64 WebP 数据的像素尺寸（支持 VP8、VP8L 和 VP8X 三种块格式）。 */
 export function getWebpDimensions(base64Data: string): ImageDimensions | null {
 	try {
 		const buffer = Buffer.from(base64Data, "base64");
@@ -537,6 +583,7 @@ export function getWebpDimensions(base64Data: string): ImageDimensions | null {
 	}
 }
 
+/** 根据 MIME 类型解析对应图片格式的像素尺寸；不支持的类型返回 null。 */
 export function getImageDimensions(base64Data: string, mimeType: string): ImageDimensions | null {
 	if (mimeType === "image/png") {
 		return getPngDimensions(base64Data);
@@ -553,6 +600,10 @@ export function getImageDimensions(base64Data: string, mimeType: string): ImageD
 	return null;
 }
 
+/**
+ * 按终端能力渲染一张图片：返回图片转义序列和占用的单元格尺寸。
+ * 终端不支持图片时返回 null（调用方可回退到文本显示）。
+ */
 export function renderImage(
 	base64Data: string,
 	imageDimensions: ImageDimensions,
@@ -599,20 +650,19 @@ export function renderImage(
 }
 
 /**
- * Wrap text in an OSC 8 hyperlink sequence.
- * The text is rendered as a clickable hyperlink in terminals that support OSC 8
- * (Ghostty, Kitty, WezTerm, iTerm2, VSCode, and others).
- * In terminals that do not support OSC 8, the escape sequences are ignored
- * and only the plain text is displayed.
+ * 用 OSC 8 超链接序列包裹文本。
+ * 在支持 OSC 8 的终端（Ghostty、Kitty、WezTerm、iTerm2、VSCode 等）中，
+ * 文本会被渲染为可点击的超链接；不支持的终端会忽略转义序列，
+ * 仅显示纯文本。
  *
- * @param text - The visible text to display
- * @param url - The URL to link to
+ * @param text - 要显示的可见文本
+ * @param url - 链接到的 URL
  */
 export function hyperlink(text: string, url: string): string {
 	return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
 }
 
-/** Shorten home-prefixed absolute paths to ~/... for compact display. */
+/** 把以 home 开头的绝对路径缩短为 ~/... 以紧凑显示。 */
 function shortenImagePath(filename: string): string {
 	const home = homedir();
 	if (home && (filename === home || filename.startsWith(`${home}/`) || filename.startsWith(`${home}\\`))) {
@@ -622,9 +672,9 @@ function shortenImagePath(filename: string): string {
 }
 
 /**
- * Text fallback when the terminal cannot render inline images.
- * Absolute paths are shown shortened (~/...) and, when OSC 8 hyperlinks are
- * available, linked to file:// so the full path remains openable.
+ * 终端无法渲染内联图片时的文本回退显示。
+ * 绝对路径会缩短为 ~/...，且在支持 OSC 8 超链接时链接到 file://，
+ * 保证完整路径仍可打开。
  */
 export function imageFallback(mimeType: string, dimensions?: ImageDimensions, filename?: string): string {
 	const parts: string[] = [];

@@ -34,6 +34,7 @@ import { advanceSequence, getNextSequence } from "./session-sequences.ts";
 import { rowToMetadata, type SessionRow } from "./sessions.ts";
 import { invalidEntry, invalidSession, leafIdAfterEntry } from "./shared.ts";
 
+/** 批量解码条目行；任一解码失败即抛出 invalid_entry 错误。 */
 function decodeEntryRows(entryRows: SessionEntryRow[]): SessionTreeEntry[] {
 	const entries: SessionTreeEntry[] = [];
 	for (const entryRow of entryRows) {
@@ -47,6 +48,7 @@ function decodeEntryRows(entryRows: SessionEntryRow[]): SessionTreeEntry[] {
 	return entries;
 }
 
+/** 从数据库加载会话行及其物化状态（汇总 + 逐条目物化数据）。 */
 async function loadSqliteSession(
 	db: SqliteDatabase,
 	sessionId: string,
@@ -74,12 +76,15 @@ async function loadSqliteSession(
 	};
 }
 
+/** 单个 SQLite 会话的连接：承载条目的读取、追加、分支查询与物化状态维护。 */
 export class SqliteSessionConnection {
 	private readonly db: SqliteDatabase;
 	readonly metadata: SqliteSessionMetadata;
+	/** 内存缓存：已读取过的条目按 ID 缓存，避免重复查询。 */
 	private byId: Map<string, SessionTreeEntry>;
 	private materializedState: SessionMaterializedState;
 
+	/** 在某个分支上查询条目，优先使用缓存，缓存失效时自动重建。 */
 	async findEntriesOnBranch(query: SessionBranchQuery & { start: string | null }): Promise<SessionTreeEntry[]> {
 		if (query.limit !== undefined && (!Number.isInteger(query.limit) || query.limit <= 0)) {
 			throw new RangeError("Session branch query limit must be a positive integer");
@@ -108,6 +113,7 @@ export class SqliteSessionConnection {
 		return entries;
 	}
 
+	/** 沿规范条目表的 parent 链逐条向上读取，用于缓存不可用时的兜底查询。 */
 	private async findEntriesOnCanonicalBranch(
 		query: SessionBranchQuery & { start: string },
 	): Promise<SessionTreeEntry[]> {
@@ -140,6 +146,7 @@ export class SqliteSessionConnection {
 		return limited;
 	}
 
+	/** 为查询重建到 `leafId` 的缓存分支；先校验父链无环，再执行重建并验证结果。 */
 	private async repairBranchCacheForQuery(leafId: string, branchIdToReplace?: string): Promise<CachedBranch> {
 		const visited = new Set<string>();
 		let currentId: string | null = leafId;
@@ -168,6 +175,7 @@ export class SqliteSessionConnection {
 		return cached;
 	}
 
+	/** 读取从叶子到根（或到最近 compaction 边界）的路径；缓存有效时直接返回，否则重建。 */
 	async readPathToRootOrCompaction(leafId: string | null): Promise<SessionTreeEntry[]> {
 		if (leafId === null) return [];
 		const cached = await readCachedBranch(this.db, this.metadata.id, leafId);
@@ -219,6 +227,7 @@ export class SqliteSessionConnection {
 		return this.trimPathToRootOrCompaction(entries);
 	}
 
+	/** 重建到 `leafId` 的缓存分支，并返回重建前读取的规范路径条目。 */
 	private async repairBranchCache(leafId: string, branchIdToReplace?: string): Promise<SessionTreeEntry[]> {
 		const entries = await this.readCanonicalPathToRoot(leafId);
 		try {
@@ -230,6 +239,7 @@ export class SqliteSessionConnection {
 		return entries;
 	}
 
+	/** 沿 parent 链从叶子向上读取到根，返回自根到叶子的有序路径。 */
 	private async readCanonicalPathToRoot(leafId: string): Promise<SessionTreeEntry[]> {
 		const path: SessionTreeEntry[] = [];
 		let current = await this.readEntry(leafId);
@@ -247,6 +257,7 @@ export class SqliteSessionConnection {
 		return path.reverse();
 	}
 
+	/** 校验缓存路径的完整性：首尾正确且相邻条目的父链衔接无误。 */
 	private isValidCachedPath(
 		entries: readonly SessionTreeEntry[],
 		leafId: string,
@@ -260,6 +271,7 @@ export class SqliteSessionConnection {
 		return true;
 	}
 
+	/** 裁剪路径：在 compaction 边界处停止（保留尾巴或跳到其 firstKeptEntryId）。 */
 	private trimPathToRootOrCompaction(entries: readonly SessionTreeEntry[]): SessionTreeEntry[] {
 		const path: SessionTreeEntry[] = [];
 		let stopAtEntryId: string | null = null;
@@ -275,6 +287,11 @@ export class SqliteSessionConnection {
 		return path.reverse();
 	}
 
+	/**
+	 * @param db 共享的数据库实例
+	 * @param metadata 会话元数据
+	 * @param materializedState 该会话当前的物化状态
+	 */
 	private constructor(
 		db: SqliteDatabase,
 		metadata: SqliteSessionMetadata,
@@ -286,11 +303,13 @@ export class SqliteSessionConnection {
 		this.materializedState = materializedState;
 	}
 
+	/** 打开已存在的会话连接，从数据库加载其物化状态。 */
 	static async open(db: SqliteDatabase, metadata: SqliteSessionMetadata): Promise<SqliteSessionConnection> {
 		const loaded = await loadSqliteSession(db, metadata.id);
 		return new SqliteSessionConnection(db, rowToMetadata(loaded.row, metadata.path), loaded.materializedState);
 	}
 
+	/** 创建一个新会话：写入 sessions 行并初始化序号与物化状态。 */
 	static async create(
 		db: SqliteDatabase,
 		path: string,
@@ -332,19 +351,23 @@ export class SqliteSessionConnection {
 		);
 	}
 
+	/** 读取条目的标签（来自物化状态）。 */
 	async getLabel(id: string): Promise<string | undefined> {
 		return this.materializedState.labelsById.get(id);
 	}
 
+	/** 读取会话名称（来自物化状态）。 */
 	async getName(): Promise<string | undefined> {
 		return this.materializedState.name;
 	}
 
+	/** 读取会话统计信息（消息数、token 与成本）。 */
 	async getStats(): Promise<SessionStats> {
 		const { messageCount, cachedTokens, uncachedTokens, totalTokens, costTotal } = this.materializedState;
 		return { messageCount, cachedTokens, uncachedTokens, totalTokens, costTotal };
 	}
 
+	/** 读取会话当前叶子条目 ID，校验其仍然存在。 */
 	async readHead(): Promise<{ leafId: string | null }> {
 		const row = await this.db
 			.prepare(
@@ -364,6 +387,7 @@ export class SqliteSessionConnection {
 		return { leafId: row.active_leaf_id };
 	}
 
+	/** 追加一条会话条目：写条目表、更新序号/物化状态/分支缓存，并更新会话叶子指针。 */
 	async appendEntry(entry: SessionTreeEntry, options: { transaction?: boolean } = {}): Promise<void> {
 		if (entry.type === "leaf" && entry.targetId !== null && !(await this.readEntry(entry.targetId))) {
 			throw new SessionError("not_found", `Entry ${entry.targetId} not found`);
@@ -418,6 +442,7 @@ export class SqliteSessionConnection {
 		}
 	}
 
+	/** 按 ID 读取单条条目，优先使用内存缓存。 */
 	async readEntry(id: string): Promise<SessionTreeEntry | undefined> {
 		const cached = this.byId.get(id);
 		if (cached) return cached;
@@ -436,6 +461,7 @@ export class SqliteSessionConnection {
 		}
 	}
 
+	/** 按序号游标读取条目（可设置 afterEntrySeq 与 limit），结果按序号升序。 */
 	async readEntries(options?: SessionEntryCursorOptions): Promise<SessionTreeEntry[]> {
 		const afterEntrySeq = options?.afterEntrySeq ?? 0;
 		const rows =

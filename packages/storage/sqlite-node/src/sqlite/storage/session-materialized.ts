@@ -1,11 +1,13 @@
 import type { SessionTreeEntry, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { invalidSession, isRecord } from "./shared.ts";
 
+/** 会话级物化汇总行：`payload` 为序列化的汇总 JSON。 */
 export interface SessionMaterializedRow {
 	session_id: string;
 	payload: string;
 }
 
+/** 条目级物化行：记录需要单独存储的条目（目前仅 label）。 */
 export interface EntryMaterializedRow {
 	session_id: string;
 	entry_seq: number;
@@ -13,12 +15,14 @@ export interface EntryMaterializedRow {
 	payload: string;
 }
 
+/** 模型思考配置：记录某模型（provider + modelId）使用过的思考等级。 */
 export interface ModelThinkingConfig {
 	provider: string;
 	modelId: string;
 	thinkingLevel: ThinkingLevel;
 }
 
+/** 会话的物化状态：由条目流增量维护，避免全量回放。 */
 export interface SessionMaterializedState {
 	name: string | undefined;
 	messageCount: number;
@@ -32,6 +36,7 @@ export interface SessionMaterializedState {
 	currentThinkingLevel: ThinkingLevel | null;
 }
 
+/** 持久化到 session_materialized.payload 的汇总结构（不含标签映射）。 */
 interface SessionMaterializedSummary {
 	name?: string;
 	messageCount: number;
@@ -43,6 +48,7 @@ interface SessionMaterializedSummary {
 	currentThinkingLevel?: ThinkingLevel | null;
 }
 
+/** 模型思考配置的比较函数，用于排序与去重。 */
 function compareModelThinkingConfig(left: ModelThinkingConfig, right: ModelThinkingConfig): number {
 	return (
 		left.provider.localeCompare(right.provider) ||
@@ -51,6 +57,7 @@ function compareModelThinkingConfig(left: ModelThinkingConfig, right: ModelThink
 	);
 }
 
+/** 去重（按 provider/modelId/thinkingLevel）并排序模型思考配置。 */
 function normalizeModelThinkingConfigs(configs: readonly ModelThinkingConfig[]): ModelThinkingConfig[] {
 	const unique = new Map<string, ModelThinkingConfig>();
 	for (const config of configs) {
@@ -59,6 +66,7 @@ function normalizeModelThinkingConfigs(configs: readonly ModelThinkingConfig[]):
 	return [...unique.values()].sort(compareModelThinkingConfig);
 }
 
+/** 把一条新的模型思考配置并入状态中的配置列表。 */
 function addModelThinkingConfig(
 	state: SessionMaterializedState,
 	provider: string,
@@ -71,6 +79,7 @@ function addModelThinkingConfig(
 	]);
 }
 
+/** 判断值是否为合法的思考等级。 */
 export function isThinkingLevel(value: unknown): value is ThinkingLevel {
 	return (
 		value === "off" ||
@@ -82,6 +91,7 @@ export function isThinkingLevel(value: unknown): value is ThinkingLevel {
 	);
 }
 
+/** 从 assistant 消息中提取用量与模型信息；格式不符时返回 undefined。 */
 function getAssistantUsage(message: unknown):
 	| {
 			provider: string;
@@ -118,6 +128,7 @@ function getAssistantUsage(message: unknown):
 	};
 }
 
+/** 创建一个全零/全空的初始物化状态。 */
 export function createEmptyMaterializedState(): SessionMaterializedState {
 	return {
 		name: undefined,
@@ -133,6 +144,7 @@ export function createEmptyMaterializedState(): SessionMaterializedState {
 	};
 }
 
+/** 把一条会话条目增量应用到物化状态（更新名称、标签、token、成本与模型信息）。 */
 export function applyEntryToMaterializedState(state: SessionMaterializedState, entry: SessionTreeEntry): void {
 	switch (entry.type) {
 		case "session_info":
@@ -207,6 +219,7 @@ export function applyEntryToMaterializedState(state: SessionMaterializedState, e
 	}
 }
 
+/** 把物化状态中的汇总字段序列化为 JSON 字符串，用于持久化。 */
 export function serializeSummary(state: SessionMaterializedState): string {
 	const summary: SessionMaterializedSummary = {
 		name: state.name,
@@ -221,6 +234,7 @@ export function serializeSummary(state: SessionMaterializedState): string {
 	return JSON.stringify(summary);
 }
 
+/** 解析并校验会话汇总 JSON，非法时抛出 invalid_session 错误。 */
 function parseSummary(json: string): SessionMaterializedSummary {
 	let parsed: unknown;
 	try {
@@ -267,6 +281,7 @@ function parseSummary(json: string): SessionMaterializedSummary {
 	};
 }
 
+/** 解析单条条目级物化数据的 JSON 载荷。 */
 function parseEntryMaterializedPayload(row: EntryMaterializedRow): unknown {
 	try {
 		return JSON.parse(row.payload);
@@ -278,6 +293,7 @@ function parseEntryMaterializedPayload(row: EntryMaterializedRow): unknown {
 	}
 }
 
+/** 从数据库行（汇总 + 条目级物化）重建完整的物化状态。 */
 export function materializedStateFromRows(
 	summaryRow: SessionMaterializedRow,
 	entryRows: EntryMaterializedRow[],
@@ -316,6 +332,7 @@ export function materializedStateFromRows(
 	return state;
 }
 
+/** 把会话汇总转换为可写入 session_materialized 表的 (sessionId, payload) 元组。 */
 export function materializedStateValues(
 	sessionId: string,
 	state: SessionMaterializedState,
@@ -323,6 +340,7 @@ export function materializedStateValues(
 	return [sessionId, serializeSummary(state)];
 }
 
+/** 生成写入 entry_materialized 表的行值；目前仅 label 条目需要单独物化存储。 */
 export function entryMaterializedValues(
 	entry: SessionTreeEntry,
 ): Array<{ type: EntryMaterializedRow["type"]; payload: string }> {

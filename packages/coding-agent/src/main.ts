@@ -1,8 +1,8 @@
 /**
- * Main entry point for the coding agent CLI.
+ * coding-agent CLI 的主入口。
  *
- * This file handles CLI argument parsing and translates them into
- * createAgentSession() options. The SDK does the heavy lifting.
+ * 本文件负责解析命令行参数，并将其转换为 createAgentSession() 的选项。
+ * 具体实现由 SDK 完成。
  */
 
 import { createInterface } from "node:readline";
@@ -58,14 +58,14 @@ import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
-const EXTENSION_LOAD_FAILURE_HINT = 'Hint: Start without extensions using "pi -ne".';
+const EXTENSION_LOAD_FAILURE_HINT = '提示：可以使用 "pi -ne" 在不加载扩展的情况下启动。';
 
 /**
- * Read all content from piped stdin.
- * Returns undefined if stdin is a TTY (interactive terminal).
+ * 读取管道（piped）stdin 的全部内容。
+ * 当 stdin 是 TTY（交互终端）时返回 undefined。
  */
 async function readPipedStdin(): Promise<string | undefined> {
-	// If stdin is a TTY, we're running interactively - don't read stdin
+	// 若 stdin 是 TTY，说明正在交互运行 - 不读取 stdin
 	if (process.stdin.isTTY) {
 		return undefined;
 	}
@@ -83,6 +83,7 @@ async function readPipedStdin(): Promise<string | undefined> {
 	});
 }
 
+/** 收集设置管理器中累积的错误并转换为运行时诊断信息（带上下文说明）。 */
 function collectSettingsDiagnostics(
 	settingsManager: SettingsManager,
 	context: string,
@@ -93,6 +94,7 @@ function collectSettingsDiagnostics(
 	}));
 }
 
+/** 把诊断信息按类型着色后输出到 stderr。 */
 function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
 	for (const diagnostic of diagnostics) {
 		const color = diagnostic.type === "error" ? chalk.red : diagnostic.type === "warning" ? chalk.yellow : chalk.dim;
@@ -101,11 +103,13 @@ function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]
 	}
 }
 
+/** 判断环境变量值是否为真（1 / true / yes）。 */
 function isTruthyEnvFlag(value: string | undefined): boolean {
 	if (!value) return false;
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
+/** 根据参数与 TTY 状态决定应用运行模式（rpc / json / print / interactive）。 */
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
 	if (parsed.mode === "rpc") {
 		return "rpc";
@@ -119,14 +123,17 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean)
 	return "interactive";
 }
 
+/** 把非 RPC 的应用模式映射为打印模式的输出格式。 */
 function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
 	return appMode === "json" ? "json" : "text";
 }
 
+/** 判断是否为仅输出运行时元数据（帮助 / 模型列表）的命令。 */
 function isPlainRuntimeMetadataCommand(parsed: Args): boolean {
 	return !parsed.print && parsed.mode === undefined && (parsed.help === true || parsed.listModels !== undefined);
 }
 
+/** 处理 `auth` 打印凭据的子命令；返回 true 表示已处理。 */
 async function runCredentialPrintCommand(args: string[]): Promise<boolean> {
 	if (isCredentialPrintHelp(args)) {
 		printCredentialPrintHelp();
@@ -166,6 +173,7 @@ async function runCredentialPrintCommand(args: string[]): Promise<boolean> {
 	return true;
 }
 
+/** 准备初始消息：处理 @文件参数（提取文本与图片）并构建初始提示。 */
 async function prepareInitialMessage(
 	parsed: Args,
 	autoResizeImages: boolean,
@@ -187,16 +195,16 @@ async function prepareInitialMessage(
 	});
 }
 
-/** Result from resolving a session argument */
+/** 解析会话参数的中间结果。 */
 type ResolvedSession =
-	| { type: "path"; path: string } // Direct file path
-	| { type: "local"; path: string } // Found in current project
-	| { type: "global"; path: string; cwd: string } // Found in different project
-	| { type: "not_found"; arg: string }; // Not found anywhere
+	| { type: "path"; path: string } // 直接的文件路径
+	| { type: "local"; path: string } // 在当前项目中找到
+	| { type: "global"; path: string; cwd: string } // 在别的项目中找到
+	| { type: "not_found"; arg: string }; // 任何地方都没找到
 
 /**
- * Resolve a session argument to a file path.
- * If it looks like a path, use as-is. Otherwise try to match as session ID prefix.
+ * 把会话参数解析为文件路径。
+ * 若看起来像路径则原样使用，否则尝试按会话 ID 前缀匹配。
  */
 async function findLocalSessionByExactId(
 	sessionId: string,
@@ -208,13 +216,14 @@ async function findLocalSessionByExactId(
 	return localMatch ? { type: "local", path: localMatch.path } : undefined;
 }
 
+/** 解析会话参数：先按路径，再按当前项目的会话 ID，最后全局查找。 */
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
-	// If it looks like a file path, resolve it before handing it to the session manager.
+	// 若看起来像文件路径，先解析再交给会话管理器。
 	if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
 		return { type: "path", path: resolvePath(sessionArg, cwd) };
 	}
 
-	// Try to match as session ID in current project first
+	// 先在当前项目中按会话 ID 匹配
 	const localSessions = await SessionManager.list(cwd, sessionDir);
 	const localMatch =
 		localSessions.find((s) => s.id === sessionArg) ?? localSessions.find((s) => s.id.startsWith(sessionArg));
@@ -223,7 +232,7 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		return { type: "local", path: localMatch.path };
 	}
 
-	// Try global search across all projects
+	// 尝试跨所有项目全局搜索
 	const allSessions = await SessionManager.listAll(sessionDir);
 	const globalMatch =
 		allSessions.find((s) => s.id === sessionArg) ?? allSessions.find((s) => s.id.startsWith(sessionArg));
@@ -232,11 +241,11 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		return { type: "global", path: globalMatch.path, cwd: globalMatch.cwd };
 	}
 
-	// Not found anywhere
+	// 任何地方都没找到
 	return { type: "not_found", arg: sessionArg };
 }
 
-/** Prompt user for yes/no confirmation */
+/** 提示用户进行是/否确认。 */
 async function promptConfirm(message: string): Promise<boolean> {
 	return new Promise((resolve) => {
 		const rl = createInterface({
@@ -250,6 +259,7 @@ async function promptConfirm(message: string): Promise<boolean> {
 	});
 }
 
+/** 校验 --fork 不与 --session/--continue/--resume/--no-session 冲突。 */
 function validateForkFlags(parsed: Args): void {
 	if (!parsed.fork) return;
 
@@ -266,6 +276,7 @@ function validateForkFlags(parsed: Args): void {
 	}
 }
 
+/** 校验 --session-id 不与 --session/--continue/--resume 冲突，且格式合法。 */
 function validateSessionIdFlags(parsed: Args): void {
 	if (parsed.sessionId === undefined) return;
 
@@ -289,6 +300,7 @@ function validateSessionIdFlags(parsed: Args): void {
 	}
 }
 
+/** 打开会话文件；失败时打印错误并退出进程。 */
 function openSessionOrExit(path: string, sessionDir?: string): SessionManager {
 	try {
 		return SessionManager.open(path, sessionDir);
@@ -299,6 +311,7 @@ function openSessionOrExit(path: string, sessionDir?: string): SessionManager {
 	}
 }
 
+/** 从源会话派生新会话；失败时打印错误并退出进程。 */
 function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string, sessionId?: string): SessionManager {
 	try {
 		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { id: sessionId });
@@ -309,6 +322,7 @@ function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string,
 	}
 }
 
+/** 依据解析后的参数创建（或复用）会话管理器。 */
 async function createSessionManager(
 	parsed: Args,
 	cwd: string,
@@ -402,6 +416,7 @@ async function createSessionManager(
 	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
 }
 
+/** 依据参数与作用域模型构建 createAgentSession 的选项。 */
 function buildSessionOptions(
 	parsed: Args,
 	scopedModels: ScopedModel[],
@@ -417,9 +432,9 @@ function buildSessionOptions(
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
 	let cliThinkingFromModel = false;
 
-	// Model from CLI
-	// - supports --provider <name> --model <pattern>
-	// - supports --model <provider>/<pattern>
+	// 来自 CLI 的模型
+	// - 支持 --provider <name> --model <pattern>
+	// - 支持 --model <provider>/<pattern>
 	if (parsed.model) {
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
@@ -435,8 +450,8 @@ function buildSessionOptions(
 		}
 		if (resolved.model) {
 			options.model = resolved.model;
-			// Allow "--model <pattern>:<thinking>" as a shorthand.
-			// Explicit --thinking still takes precedence (applied later).
+			// 支持 "--model <pattern>:<thinking>" 简写。
+			// 显式的 --thinking 仍优先（稍后应用）。
 			if (!parsed.thinking && resolved.thinkingLevel) {
 				options.thinkingLevel = resolved.thinkingLevel;
 				cliThinkingFromModel = true;

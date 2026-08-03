@@ -46,12 +46,14 @@ import type {
 } from "./types.ts";
 import { AgentHarnessError, BranchSummaryError, CompactionError, SessionError, toError } from "./types.ts";
 
+/** 构造一条可选的带图片的用户消息。 */
 function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
 	const content: Array<{ type: "text"; text: string } | ImageContent> = [{ type: "text", text }];
 	if (images) content.push(...images);
 	return { role: "user", content, timestamp: Date.now() };
 }
 
+/** 构造失败或被中止时的 assistant 消息，附带错误信息和零值 usage。 */
 function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
 	return {
 		role: "assistant",
@@ -73,6 +75,7 @@ function createFailureMessage(model: Model<any>, error: unknown, aborted: boolea
 	};
 }
 
+/** 浅拷贝流式选项，避免外部调用方意外修改内部状态。 */
 function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHarnessStreamOptions {
 	return {
 		...streamOptions,
@@ -81,6 +84,7 @@ function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHar
 	};
 }
 
+/** 找出数组中重复出现的名字。 */
 function findDuplicateNames(names: string[]): string[] {
 	const seen = new Set<string>();
 	const duplicates = new Set<string>();
@@ -91,6 +95,7 @@ function findDuplicateNames(names: string[]): string[] {
 	return [...duplicates];
 }
 
+/** 将部分更新的补丁应用到基础流式选项上，返回新的选项对象；值为 undefined 的字段会被删除。 */
 function applyStreamOptionsPatch(
 	base: AgentHarnessStreamOptions,
 	patch?: AgentHarnessStreamOptionsPatch,
@@ -133,12 +138,16 @@ function applyStreamOptionsPatch(
 	return result;
 }
 
+/** 订阅所有事件时使用的通配符事件类型。 */
 const SUBSCRIBER_EVENT_TYPE = "*";
 
+/** 事件处理函数签名：接收事件和可选的取消信号。 */
 type AgentHarnessHandler = (event: any, signal?: AbortSignal) => Promise<any> | any;
 
+/** 追踪任务种类：`operation` 表示运行中的操作，`mutation` 表示会话变更。 */
 type TrackedTaskKind = "operation" | "mutation";
 
+/** 将任意错误规范化为 {@link AgentHarnessError}，按错误类型映射到对应的错误码。 */
 function normalizeHarnessError(error: unknown, fallbackCode: AgentHarnessError["code"]): AgentHarnessError {
 	if (error instanceof AgentHarnessError) return error;
 	const cause = toError(error);
@@ -148,10 +157,12 @@ function normalizeHarnessError(error: unknown, fallbackCode: AgentHarnessError["
 	return new AgentHarnessError(fallbackCode, cause.message, cause);
 }
 
+/** 将钩子回调抛出的错误规范化为 `hook` 错误码的 {@link AgentHarnessError}。 */
 function normalizeHookError(error: unknown): AgentHarnessError {
 	return normalizeHarnessError(error, "hook");
 }
 
+/** 单个回合运行所需的全部状态，在每个回合开始时统一创建。 */
 interface AgentHarnessTurnState<
 	TContext extends object | undefined,
 	TSkill extends Skill = Skill,
@@ -170,36 +181,67 @@ interface AgentHarnessTurnState<
 	activeTools: TTool[];
 }
 
+/**
+ * Agent 执行器（harness）：持有持久化会话，并编排提示词、steering、follow-up、
+ * 工具调用、压缩（compaction）与分支导航等完整的 agent 运行生命周期。
+ */
 export class AgentHarness<
 	TContext extends object | undefined = undefined,
 	TSkill extends Skill = Skill,
 	TPromptTemplate extends PromptTemplate = PromptTemplate,
 	TTool extends AgentHarnessTool<TContext> = AgentHarnessTool<TContext>,
 > {
+	/** 底层会话存储，保存所有消息与条目。 */
 	private session: Session;
+	/** 模型注册表，用于创建流式模型调用。 */
 	readonly models: Models;
+	/** 当前阶段：idle / turn / compaction / branch_summary。 */
 	private phase: AgentHarnessPhase = "idle";
+	/** 当前运行操作的 abort controller，用于取消进行中的任务。 */
 	private activeAbortController?: AbortController;
+	/** 追踪所有未完成的后台任务，按种类（操作/变更）区分。 */
 	private readonly activeTasks = new Map<Promise<void>, TrackedTaskKind>();
+	/** 关闭流程的 Promise，在请求关闭后等待所有任务结束。 */
 	private shutdownPromise?: Promise<void>;
+	/** 是否已请求关闭。 */
 	private isShutdown = false;
+	/** 运行期间暂存的会话写入，在回合结束时统一落盘。 */
 	private pendingSessionWrites: PendingSessionWrite[] = [];
+	/** 当前使用的模型。 */
 	private model: Model<any>;
+	/** 当前思考级别。 */
 	private thinkingLevel: ThinkingLevel;
+	/** 系统提示词：可以是字符串，也可以是动态生成函数。 */
 	private systemPrompt: AgentHarnessSystemPrompt<TContext, TSkill, TPromptTemplate, TTool> | undefined;
+	/** 工具上下文的来源：直接值或异步解析函数。 */
 	private toolContext: AgentHarnessToolContextSource<TContext> | undefined;
+	/** 默认的流式选项，在创建回合时浅拷贝使用。 */
 	private streamOptions: AgentHarnessStreamOptions;
+	/** 模型调用的重试策略。 */
 	private retry: RetryPolicy | undefined;
+	/** 可用资源：技能与提示词模板。 */
 	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	/** 全部已注册工具，按名称索引。 */
 	private tools = new Map<string, TTool>();
+	/** 当前启用的工具名列表。 */
 	private activeToolNames: string[];
+	/** steering 消息队列，在当前回合运行期间注入。 */
 	private steerQueue: UserMessage[] = [];
+	/** steering 队列的排放模式。 */
 	private steeringQueueMode: QueueMode;
+	/** follow-up 消息队列，在回合结束时注入。 */
 	private followUpQueue: UserMessage[] = [];
+	/** follow-up 队列的排放模式。 */
 	private followUpQueueMode: QueueMode;
+	/** 下一回合消息队列，在下一个回合开始前合并。 */
 	private nextTurnQueue: AgentMessage[] = [];
+	/** 事件处理器集合，按事件类型索引。 */
 	private handlers = new Map<string, Set<AgentHarnessHandler>>();
 
+	/**
+	 * 构造 AgentHarness。
+	 * @param options - 配置选项，包含会话、模型、工具、系统提示词与各类队列模式。
+	 */
 	constructor(options: AgentHarnessOptions<TContext, TSkill, TPromptTemplate, TTool>) {
 		this.session = options.session;
 		this.models = options.models;
@@ -226,14 +268,17 @@ export class AgentHarness<
 		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
 	}
 
+	/** 若实例已关闭则抛出 invalid_state 错误。 */
 	private assertNotShutDown(): void {
 		if (this.isShutdown) throw new AgentHarnessError("invalid_state", "AgentHarness has been shut down");
 	}
 
+	/** 获取指定事件类型的处理器集合。 */
 	private getHandlers(type: string): Set<AgentHarnessHandler> | undefined {
 		return this.handlers.get(type);
 	}
 
+	/** 向所有通配符订阅者广播 harness 自有事件。 */
 	private async emitOwn(event: AgentHarnessOwnEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
 		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
 			try {
@@ -244,6 +289,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 向所有通配符订阅者广播任意 agent 事件。 */
 	private async emitAny(event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
 		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
 			try {
@@ -254,6 +300,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 触发指定类型的钩子，收集所有处理器返回的最后一个非 undefined 结果。 */
 	private async emitHook<TType extends keyof AgentHarnessEventResultMap>(
 		event: Extract<AgentHarnessOwnEvent, { type: TType }>,
 	): Promise<AgentHarnessEventResultMap[TType] | undefined> {
@@ -273,6 +320,7 @@ export class AgentHarness<
 		return lastResult;
 	}
 
+	/** 构建重试回调，将压缩/分支摘要的重试过程转为对应 hook 事件。 */
 	private retryCallbacks(operation: "compaction" | "branch_summary"): RetryCallbacks {
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) =>
@@ -282,6 +330,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 在发起 provider 请求前触发钩子，允许通过补丁修改流式选项。 */
 	private async emitBeforeProviderRequest(
 		model: Model<any>,
 		sessionId: string,
@@ -308,6 +357,7 @@ export class AgentHarness<
 		return current;
 	}
 
+	/** 在 provider 载荷发出前触发钩子，允许替换实际发送的载荷。 */
 	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown> {
 		const handlers = this.getHandlers("before_provider_payload");
 		let current = payload;
@@ -325,6 +375,7 @@ export class AgentHarness<
 		return current;
 	}
 
+	/** 广播当前所有消息队列的快照。 */
 	private async emitQueueUpdate(): Promise<void> {
 		await this.emitOwn({
 			type: "queue_update",
@@ -334,6 +385,7 @@ export class AgentHarness<
 		});
 	}
 
+	/** 开启一次可取消的运行操作，返回取消信号与操作结束回调。 */
 	private startOperation(): { signal: AbortSignal; finish: () => void } {
 		const abortController = new AbortController();
 		let finish = () => {};
@@ -354,6 +406,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 登记并执行一个后台任务，任务结束后自动从追踪集合中移除。 */
 	private async track<T>(kind: TrackedTaskKind, operation: () => Promise<T>): Promise<T> {
 		let settle = () => {};
 		const settled = new Promise<void>((resolve) => {
@@ -368,6 +421,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 等待所有（或指定种类的）后台任务结束。 */
 	private async waitForTasks(kind?: TrackedTaskKind): Promise<void> {
 		while (true) {
 			const tasks = [...this.activeTasks].flatMap(([task, taskKind]) =>
@@ -378,6 +432,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 解析工具上下文：若配置的是函数则调用求值，否则直接返回配置值。 */
 	private async resolveToolContext(): Promise<TContext> {
 		if (typeof this.toolContext === "function") {
 			return await (this.toolContext as () => TContext | Promise<TContext>)();
@@ -385,6 +440,7 @@ export class AgentHarness<
 		return this.toolContext as TContext;
 	}
 
+	/** 将工具上下文绑定到工具的 execute，生成 agent 循环可直接调用的工具。 */
 	private bindToolContext(tool: TTool, context: TContext): AgentTool {
 		return {
 			...tool,
@@ -392,6 +448,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 创建本回合运行所需的完整状态快照（消息、工具、系统提示词等）。 */
 	private async createTurnState(): Promise<AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>> {
 		this.assertNotShutDown();
 		const context = await this.session.buildContext();
@@ -428,6 +485,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 依据回合状态构造 agent 循环上下文（系统提示词、消息、绑定好的工具）。 */
 	private createContext(
 		turnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
 		systemPrompt?: string,
@@ -439,6 +497,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 构造流式函数，在每次模型调用前串联 provider 请求前/载荷前钩子。 */
 	private createStreamFn(
 		getTurnState: () => AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
 	): StreamFn {
@@ -469,6 +528,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 从消息队列取出待处理消息（按模式取全部或一条），并广播队列更新。 */
 	private async drainQueuedMessages(queue: AgentMessage[], mode: QueueMode): Promise<AgentMessage[]> {
 		const messages = mode === "all" ? queue.splice(0) : queue.splice(0, 1);
 		if (messages.length === 0) return messages;
@@ -481,6 +541,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 构造 agent 循环配置，把 harness 的钩子与队列接入底层 agent-loop。 */
 	private createLoopConfig(
 		getTurnState: () => AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
 		setTurnState: (turnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>) => void,
@@ -539,18 +600,21 @@ export class AgentHarness<
 		};
 	}
 
+	/** 校验名字列表没有重复，否则抛出 invalid_argument 错误。 */
 	private validateUniqueNames(names: string[], message: string): void {
 		const duplicates = findDuplicateNames(names);
 		if (duplicates.length > 0)
 			throw new AgentHarnessError("invalid_argument", `${message}: ${duplicates.join(", ")}`);
 	}
 
+	/** 校验工具名没有重复且都已注册，否则抛出 invalid_argument 错误。 */
 	private validateToolNames(toolNames: string[], tools: Map<string, TTool> = this.tools): void {
 		this.validateUniqueNames(toolNames, "Duplicate active tool name(s)");
 		const missing = toolNames.filter((name) => !tools.has(name));
 		if (missing.length > 0) throw new AgentHarnessError("invalid_argument", `Unknown tool(s): ${missing.join(", ")}`);
 	}
 
+	/** 将暂存的会话写入逐条落盘到会话存储，直到队列清空。 */
 	private async flushPendingSessionWrites(): Promise<void> {
 		while (this.pendingSessionWrites.length > 0) {
 			const write = this.pendingSessionWrites[0]!;
@@ -577,6 +641,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 处理 agent 循环事件：将消息写入会话、广播事件并在回合/运行结束时落盘。 */
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
 		if (event.type === "message_end") {
 			await this.session.appendMessage(event.message);
@@ -606,6 +671,7 @@ export class AgentHarness<
 		await this.emitAny(event, signal);
 	}
 
+	/** 运行失败时构造失败消息，并按序发出 message/turn/agent 结束事件。 */
 	private async emitRunFailure(
 		model: Model<any>,
 		error: unknown,
@@ -620,6 +686,7 @@ export class AgentHarness<
 		return [failureMessage];
 	}
 
+	/** 执行单个回合：合并队列消息、运行 agent loop，并返回最后的 assistant 消息。 */
 	private async executeTurn(
 		turnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
 		text: string,
@@ -689,6 +756,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 在空闲状态下发起一次提示词回合，返回最终的 assistant 消息。 */
 	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
 		this.assertNotShutDown();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
@@ -705,6 +773,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 在空闲状态下按名称调用技能发起一次回合，可附加额外指令。 */
 	async skill(name: string, additionalInstructions?: string): Promise<AssistantMessage> {
 		this.assertNotShutDown();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
@@ -727,6 +796,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 在空闲状态下按提示词模板名称发起一次回合，args 为模板参数。 */
 	async promptFromTemplate(name: string, args: string[] = []): Promise<AssistantMessage> {
 		this.assertNotShutDown();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
@@ -745,6 +815,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 在当前回合运行期间注入一条 steering 消息。 */
 	async steer(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		this.assertNotShutDown();
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
@@ -752,6 +823,7 @@ export class AgentHarness<
 		await this.emitQueueUpdate();
 	}
 
+	/** 在当前回合结束、agent 即将空闲时注入一条 follow-up 消息。 */
 	async followUp(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		this.assertNotShutDown();
 		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
@@ -759,12 +831,14 @@ export class AgentHarness<
 		await this.emitQueueUpdate();
 	}
 
+	/** 排队一条将在下一个回合开始前注入的消息。 */
 	async nextTurn(text: string, options?: { images?: ImageContent[] }): Promise<void> {
 		this.assertNotShutDown();
 		this.nextTurnQueue.push(createUserMessage(text, options?.images));
 		await this.emitQueueUpdate();
 	}
 
+	/** 追加一条消息到会话；若正在运行则先暂存，待回合结束时统一落盘。 */
 	async appendMessage(message: AgentMessage): Promise<void> {
 		this.assertNotShutDown();
 		return this.track("mutation", async () => {
@@ -780,6 +854,7 @@ export class AgentHarness<
 		});
 	}
 
+	/** 压缩会话：汇总旧分支条目，保留被标记为保留的尾部，可在空闲状态下调用。 */
 	async compact(customInstructions?: string): Promise<CompactResult> {
 		this.assertNotShutDown();
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
@@ -839,6 +914,7 @@ export class AgentHarness<
 		}
 	}
 
+	/** 将会话叶子指针移动到目标条目，可选为旧分支生成摘要；在空闲状态下调用。 */
 	async navigateTree(
 		targetId: string,
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
@@ -939,10 +1015,12 @@ export class AgentHarness<
 		}
 	}
 
+	/** 返回当前模型。 */
 	getModel(): Model<any> {
 		return this.model;
 	}
 
+	/** 设置模型，并将会话记录模型变更。 */
 	async setModel(model: Model<any>): Promise<void> {
 		this.assertNotShutDown();
 		return this.track("mutation", async () => {
@@ -961,10 +1039,12 @@ export class AgentHarness<
 		});
 	}
 
+	/** 返回当前思考级别。 */
 	getThinkingLevel(): ThinkingLevel {
 		return this.thinkingLevel;
 	}
 
+	/** 设置思考级别，并将会话记录变更。 */
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		this.assertNotShutDown();
 		return this.track("mutation", async () => {
@@ -983,15 +1063,18 @@ export class AgentHarness<
 		});
 	}
 
+	/** 返回全部已注册工具。 */
 	getTools(): TTool[] {
 		return [...this.tools.values()];
 	}
 
+	/** 批量设置工具集合，并可同时指定启用的工具名。 */
 	async setTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
 		this.assertNotShutDown();
 		return this.track("mutation", () => this.applyTools(tools, activeToolNames));
 	}
 
+	/** 应用工具变更：校验唯一性与注册情况，落盘并广播更新事件。 */
 	private async applyTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
 		try {
 			this.validateUniqueNames(
@@ -1023,15 +1106,18 @@ export class AgentHarness<
 		}
 	}
 
+	/** 返回当前启用的工具。 */
 	getActiveTools(): TTool[] {
 		return this.activeToolNames.map((name) => this.tools.get(name)!);
 	}
 
+	/** 设置当前启用的工具名列表。 */
 	async setActiveTools(toolNames: string[]): Promise<void> {
 		this.assertNotShutDown();
 		return this.track("mutation", () => this.applyActiveTools(toolNames));
 	}
 
+	/** 应用启用工具变更：校验、落盘并广播更新事件。 */
 	private async applyActiveTools(toolNames: string[]): Promise<void> {
 		try {
 			this.validateToolNames(toolNames);
@@ -1056,24 +1142,29 @@ export class AgentHarness<
 		}
 	}
 
+	/** 返回 steering 队列的排放模式。 */
 	getSteeringMode(): QueueMode {
 		return this.steeringQueueMode;
 	}
 
+	/** 设置 steering 队列的排放模式。 */
 	async setSteeringMode(mode: QueueMode): Promise<void> {
 		this.assertNotShutDown();
 		this.steeringQueueMode = mode;
 	}
 
+	/** 返回 follow-up 队列的排放模式。 */
 	getFollowUpMode(): QueueMode {
 		return this.followUpQueueMode;
 	}
 
+	/** 设置 follow-up 队列的排放模式。 */
 	async setFollowUpMode(mode: QueueMode): Promise<void> {
 		this.assertNotShutDown();
 		this.followUpQueueMode = mode;
 	}
 
+	/** 返回当前资源（技能与提示词模板）的副本。 */
 	getResources(): AgentHarnessResources<TSkill, TPromptTemplate> {
 		return {
 			skills: this.resources.skills?.slice(),
@@ -1081,6 +1172,7 @@ export class AgentHarness<
 		};
 	}
 
+	/** 设置资源（技能与提示词模板），并广播更新事件。 */
 	async setResources(resources: AgentHarnessResources<TSkill, TPromptTemplate>): Promise<void> {
 		this.assertNotShutDown();
 		const previousResources = this.getResources();
@@ -1091,16 +1183,18 @@ export class AgentHarness<
 		await this.emitOwn({ type: "resources_update", resources: this.getResources(), previousResources });
 	}
 
+	/** 返回当前流式选项的副本。 */
 	getStreamOptions(): AgentHarnessStreamOptions {
 		return cloneStreamOptions(this.streamOptions);
 	}
 
+	/** 设置流式选项。 */
 	async setStreamOptions(streamOptions: AgentHarnessStreamOptions): Promise<void> {
 		this.assertNotShutDown();
 		this.streamOptions = cloneStreamOptions(streamOptions);
 	}
 
-	/** Permanently stop this harness instance without deleting its durable session. */
+	/** 永久停止此 harness 实例，但不会删除其持久化会话。 */
 	requestShutdown(): void {
 		if (this.isShutdown) return;
 		this.isShutdown = true;
@@ -1112,7 +1206,7 @@ export class AgentHarness<
 		this.shutdownPromise = this.waitForTasks();
 	}
 
-	/** Waits for work active when shutdown was requested to settle. */
+	/** 等待请求关闭时仍在进行的工作全部结束。 */
 	waitForShutdown(): Promise<void> {
 		if (!this.shutdownPromise) {
 			return Promise.reject(new AgentHarnessError("invalid_state", "Shutdown has not been requested"));
@@ -1120,6 +1214,7 @@ export class AgentHarness<
 		return this.shutdownPromise;
 	}
 
+	/** 中止当前运行：清空 steering/follow-up 队列、取消操作并等待空闲。 */
 	async abort(): Promise<AbortResult> {
 		this.assertNotShutDown();
 		const clearedSteer = [...this.steerQueue];
@@ -1150,10 +1245,12 @@ export class AgentHarness<
 		return { clearedSteer, clearedFollowUp };
 	}
 
+	/** 等待所有运行中的操作结束。 */
 	async waitForIdle(): Promise<void> {
 		await this.waitForTasks("operation");
 	}
 
+	/** 订阅所有事件（通配符），返回取消订阅函数。 */
 	subscribe(
 		listener: (event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal) => Promise<void> | void,
 	): () => void {
@@ -1167,6 +1264,7 @@ export class AgentHarness<
 		return () => handlers!.delete(listener as AgentHarnessHandler);
 	}
 
+	/** 订阅指定类型的事件，返回取消订阅函数。 */
 	on<TType extends keyof AgentHarnessEventResultMap>(
 		type: TType,
 		handler: (

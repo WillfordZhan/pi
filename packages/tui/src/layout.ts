@@ -5,8 +5,10 @@ import { cropKittyImageLine, getKittyImageMetadata, isImageLine } from "./termin
 import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
 import { extractAnsiCode, getGraphemeCellRange, sliceByColumn, visibleWidth } from "./utils.ts";
 
+/** OSC 133 语义提示（shell prompt 区域标记）前缀，渲染输出时需剥离。 */
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
 
+/** 布局矩形：位置与尺寸。 */
 export interface LayoutRect {
 	x: number;
 	y: number;
@@ -14,19 +16,25 @@ export interface LayoutRect {
 	height: number;
 }
 
+/** 布局树中的一个盒子：包含组件、矩形、裁剪区与子盒子。 */
 export interface LayoutBox {
 	component: Component;
 	rect: LayoutRect;
 	clip: LayoutRect;
 	children: LayoutBox[];
 	parent?: LayoutBox;
+	/** 该盒子的渲染行（普通组件直接持有）。 */
 	lines?: readonly string[];
+	/** 当内容超出可视区时，从该行开始显示（用于光标跟随）。 */
 	lineOffset?: number;
+	/** 若该盒子是滚动视图，记录其状态。 */
 	scrollView?: ScrollView;
+	/** 滚动视图的完整内容行（含溢出部分）。 */
 	scrollContentLines?: readonly string[];
 	layer: number;
 }
 
+/** 一次布局渲染的结果帧。 */
 export interface LayoutFrame {
 	root: LayoutBox;
 	width: number;
@@ -35,6 +43,7 @@ export interface LayoutFrame {
 	primaryScrollView?: ScrollView;
 }
 
+/** 滚动条几何信息（轨道与滑块位置）。 */
 export interface ScrollbarGeometry {
 	column: number;
 	trackTop: number;
@@ -44,6 +53,7 @@ export interface ScrollbarGeometry {
 	maxScrollTop: number;
 }
 
+/** 单次布局渲染过程中的共享上下文。 */
 interface LayoutContext {
 	viewport: { width: number; height: number };
 	renderCache: Map<Component, Map<number, string[]>>;
@@ -51,6 +61,7 @@ interface LayoutContext {
 	primaryScrollView: ScrollView | undefined;
 }
 
+/** 计算两个矩形的交集（裁剪区域）。 */
 function intersect(a: LayoutRect, b: LayoutRect): LayoutRect {
 	const x = Math.max(a.x, b.x);
 	const y = Math.max(a.y, b.y);
@@ -59,6 +70,7 @@ function intersect(a: LayoutRect, b: LayoutRect): LayoutRect {
 	return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
 }
 
+/** 按宽度缓存组件渲染结果，同一宽度避免重复渲染。 */
 function renderCached(context: LayoutContext, component: Component, width: number): string[] {
 	const safeWidth = Math.max(1, Math.floor(width));
 	let widths = context.renderCache.get(component);
@@ -74,29 +86,35 @@ function renderCached(context: LayoutContext, component: Component, width: numbe
 	return lines;
 }
 
+/** 测量组件的固有高度（行数）。 */
 function measureHeight(context: LayoutContext, component: Component, width: number): number {
 	return renderCached(context, component, width).length;
 }
 
+/** 测量组件的固有宽度（最宽行的可见宽度）。 */
 function measureWidth(context: LayoutContext, component: Component, width: number): number {
 	return renderCached(context, component, width).reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 }
 
+/** 设置盒子的父引用并返回它。 */
 function withParent(box: LayoutBox, parent: LayoutBox): LayoutBox {
 	box.parent = parent;
 	return box;
 }
 
+/** 递归平移盒子及其所有子盒子的 Y 坐标。 */
 function translateBox(box: LayoutBox, deltaY: number): void {
 	box.rect.y += deltaY;
 	for (const child of box.children) translateBox(child, deltaY);
 }
 
+/** 递归更新盒子的裁剪区域为父裁剪区与自身矩形的交集。 */
 function updateClips(box: LayoutBox, parentClip: LayoutRect): void {
 	box.clip = intersect(parentClip, box.rect);
 	for (const child of box.children) updateClips(child, box.clip);
 }
 
+/** 对单个组件递归构建布局盒子：普通组件直接渲染，栈/滚动组件分派到对应逻辑。 */
 function layoutComponent(
 	context: LayoutContext,
 	component: Component,
@@ -109,6 +127,7 @@ function layoutComponent(
 	const safeWidth = Math.max(1, Math.floor(width));
 	const node = getLayoutNode(component);
 	if (!node) {
+		// 普通组件：直接渲染，需要时按光标位置计算行偏移。
 		const lines = renderCached(context, component, safeWidth);
 		const allocatedHeight = height === undefined ? lines.length : Math.max(0, Math.floor(height));
 		let lineOffset = 0;
@@ -128,6 +147,7 @@ function layoutComponent(
 	}
 
 	if (node.type === "scroll") {
+		// 滚动视图：先按完整内容布局子组件，再根据滚动偏移平移并设置视口。
 		const previousScrollTop = node.state.scrollTop;
 		const contentWidth = node.state.getContentWidth(safeWidth);
 		const childBox = layoutComponent(
@@ -164,6 +184,7 @@ function layoutComponent(
 	const entries = visibleStackEntries(node.entries, context.viewport);
 	const gapTotal = Math.max(0, entries.length - 1) * node.gap;
 	if (node.type === "vstack") {
+		// 垂直栈：按固有高度分配各子项高度，自顶向下逐个布局。
 		const intrinsicHeights = entries.map((entry) =>
 			typeof entry.basis === "number" ? entry.basis : measureHeight(context, entry.component, safeWidth),
 		);
@@ -191,6 +212,7 @@ function layoutComponent(
 		return box;
 	}
 
+	// 水平栈：先按固有宽度分配列宽，再按交叉轴对齐方式布局各子项。
 	const intrinsicWidths = entries.map((entry) =>
 		typeof entry.basis === "number" ? entry.basis : measureWidth(context, entry.component, safeWidth),
 	);
@@ -240,6 +262,7 @@ function layoutComponent(
 	return box;
 }
 
+/** 给某一行中指定列的字符应用滚动条样式（保留前缀 ANSI 序列、图像行跳过）。 */
 function styleScrollbarCell(line: string, column: number, totalWidth: number, style: (text: string) => string): string {
 	if (isImageLine(line)) return line;
 
@@ -263,6 +286,7 @@ function styleScrollbarCell(line: string, column: number, totalWidth: number, st
 	return `${before}${beforePadding}${targetPrefix}${style(targetText)}${after}`;
 }
 
+/** 计算滚动视图盒子的滚动条几何信息；不可见或越界时返回 undefined。 */
 export function getScrollbarGeometry(box: LayoutBox): ScrollbarGeometry | undefined {
 	if (!box.scrollView?.isScrollbarVisible || box.rect.width <= 0 || box.rect.height <= 0) return undefined;
 
@@ -290,6 +314,7 @@ export function getScrollbarGeometry(box: LayoutBox): ScrollbarGeometry | undefi
 	};
 }
 
+/** 把滚动条的滑块画到屏幕上。 */
 function paintScrollbar(box: LayoutBox, screen: string[], totalWidth: number): void {
 	const geometry = getScrollbarGeometry(box);
 	if (!geometry || !box.scrollView) return;
@@ -301,6 +326,7 @@ function paintScrollbar(box: LayoutBox, screen: string[], totalWidth: number): v
 	}
 }
 
+/** 把布局盒子递归绘制到屏幕行上，处理裁剪、图像行与滚动视图。 */
 function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 	if (box.lines) {
 		const offset = box.lineOffset ?? 0;
@@ -310,18 +336,21 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 			const sourceLine = box.lines[offset + row - box.rect.y];
 			if (sourceLine === undefined) continue;
 			let line = sourceLine.replace(OSC133_ZONE_PREFIX, "");
+			// 对超高的图像行按裁剪边界裁切。
 			const imageMetadata = getKittyImageMetadata(line);
 			if (imageMetadata) {
 				const clipBottom = Math.min(screen.length, box.clip.y + box.clip.height);
 				const visibleRows = Math.min(imageMetadata.rows, clipBottom - row);
 				if (visibleRows < imageMetadata.rows) line = cropKittyImageLine(line, 0, visibleRows);
 			}
+			// 整宽图像行直接占用整行，否则与其他层合成。
 			if (isImageLine(line) && box.rect.x === 0 && box.rect.width >= totalWidth) screen[row] = line;
 			else screen[row] = compositeTuiLine(screen[row] ?? "", line, box.rect.x, box.rect.width, totalWidth);
 		}
 	}
 	for (const child of box.children) paintBox(child, screen, totalWidth);
 
+	// 滚动视图顶部被卷出的图像行需要重绘其可见部分。
 	if (box.scrollView && box.scrollContentLines && box.scrollView.scrollTop > 0 && box.rect.height > 0) {
 		for (let imageRow = box.scrollView.scrollTop - 1; imageRow >= 0; imageRow--) {
 			const imageLine = box.scrollContentLines[imageRow] ?? "";
@@ -342,6 +371,7 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 	paintScrollbar(box, screen, totalWidth);
 }
 
+/** 对整个组件树执行布局并绘制，返回结果帧（含屏幕行与主滚动视图）。 */
 export function renderLayoutFrame(
 	root: Component,
 	width: number,
@@ -373,10 +403,12 @@ export function renderLayoutFrame(
 	};
 }
 
+/** 判断点是否落在矩形内（含边界排除）。 */
 function containsPoint(rect: LayoutRect, x: number, y: number): boolean {
 	return x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
 }
 
+/** 在布局帧中查找指定滚动视图对应的盒子。 */
 export function getScrollViewBox(frame: LayoutFrame, scrollView: ScrollView): LayoutBox | undefined {
 	const visit = (box: LayoutBox): LayoutBox | undefined => {
 		if (box.scrollView === scrollView) return box;
@@ -389,6 +421,7 @@ export function getScrollViewBox(frame: LayoutFrame, scrollView: ScrollView): La
 	return visit(frame.root);
 }
 
+/** 获取坐标 (x, y) 处覆盖的所有滚动视图，按层级从最上层向下排序。 */
 export function getScrollViewsAt(frame: LayoutFrame, x: number, y: number): ScrollView[] {
 	const result: Array<{ scrollView: ScrollView; depth: number }> = [];
 	const visit = (box: LayoutBox, depth: number): void => {

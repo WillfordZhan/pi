@@ -1,12 +1,18 @@
 import { posix } from "node:path";
 
+/** Unix 域套接字传输地址。 */
 export interface UnixTransportAddress {
 	readonly transport: "unix";
 	readonly path: string;
 }
 
+/** 支持的传输地址类型（目前仅 Unix 域套接字一种）。 */
 export type TransportAddress = UnixTransportAddress;
 
+/**
+ * 解析传输地址字符串（如 `unix:///path/to/socket`）。
+ * 依次校验协议、授权信息、绝对路径等，返回地址或错误信息。
+ */
 export function parseTransportAddress(
 	value: string,
 	option: "--listen" | "--connect",

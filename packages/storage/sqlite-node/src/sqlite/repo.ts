@@ -27,6 +27,7 @@ import type {
 	SqliteSessionRepositoryEnv,
 } from "./types.ts";
 
+/** 取路径的父目录部分（支持 / 与 \ 两种分隔符）。 */
 function getParentPath(path: string): string {
 	const normalized = path.replace(/[\\/]+$/, "");
 	const lastSlash = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
@@ -35,21 +36,25 @@ function getParentPath(path: string): string {
 	return normalized.slice(0, lastSlash);
 }
 
+/** 对新打开的数据库执行基础 PRAGMA 配置（WAL、同步级别、忙等待超时）。 */
 async function configureSqliteDatabase(db: SqliteDatabase): Promise<void> {
 	await db.exec("PRAGMA journal_mode=WAL");
 	await db.exec("PRAGMA synchronous=FULL");
 	await db.exec("PRAGMA busy_timeout=5000");
 }
 
+/** 构建 SQLite 会话仓库后端所需的配置。 */
 export type SqliteSessionBackendOptions = {
 	env: SqliteSessionRepositoryEnv;
 	sqlite: SqliteDatabaseFactory;
 	databasePath: string;
 };
 
+/** 简单串行队列：保证所有入库操作按提交顺序依次执行，避免并发写冲突。 */
 class SerialOperationQueue {
 	private tail: Promise<void> = Promise.resolve();
 
+	/** 把操作排到队尾，返回该操作的结果。 */
 	enqueue<T>(operation: () => Promise<T> | T): Promise<T> {
 		const result = this.tail.then(operation);
 		this.tail = result.then(
@@ -59,11 +64,13 @@ class SerialOperationQueue {
 		return result;
 	}
 
+	/** 等待队列中所有操作完成。 */
 	async drain(): Promise<void> {
 		await this.tail;
 	}
 }
 
+/** SQLite 会话后端：管理数据库生命周期、串行化所有操作并缓存会话连接。 */
 class SqliteSessionBackend {
 	private readonly env: SqliteSessionRepositoryEnv;
 	private readonly sqlite: SqliteDatabaseFactory;
@@ -76,12 +83,16 @@ class SqliteSessionBackend {
 	private readonly operations = new SerialOperationQueue();
 	private readonly writers = new Map<string, SqliteSessionConnection>();
 
+	/**
+	 * @param options 后端配置，包含文件系统环境、SQLite 工厂与数据库路径。
+	 */
 	constructor(options: SqliteSessionBackendOptions) {
 		this.env = options.env;
 		this.sqlite = options.sqlite;
 		this.databasePathInput = options.databasePath;
 	}
 
+	/** 创建一个新会话并返回其存储句柄。 */
 	create(options: SqliteSessionCreateOptions): Promise<SessionStorage<SqliteSessionMetadata>> {
 		this.assertOpen();
 		return this.operations.enqueue(async () => {
@@ -100,11 +111,13 @@ class SqliteSessionBackend {
 		});
 	}
 
+	/** 打开一个已存在的会话并返回其存储句柄。 */
 	open(metadata: SqliteSessionMetadata): Promise<SessionStorage<SqliteSessionMetadata>> {
 		this.assertOpen();
 		return this.operations.enqueue(() => this.loadSession(metadata));
 	}
 
+	/** 校验会话数据库存在，加载（或复用）会话连接并包装成存储句柄。 */
 	private async loadSession(metadata: SqliteSessionMetadata): Promise<SessionStorage<SqliteSessionMetadata>> {
 		if (
 			!getFileSystemResultOrThrow(await this.env.exists(metadata.path), `Failed to check database ${metadata.path}`)
@@ -117,11 +130,13 @@ class SqliteSessionBackend {
 		return this.storage(connection);
 	}
 
+	/** 列出会话，可按 cwd 过滤。 */
 	list(options: SqliteSessionListOptions = {}): Promise<SqliteSessionMetadata[]> {
 		this.assertOpen();
 		return this.operations.enqueue(() => this.listSessions(options));
 	}
 
+	/** 从 sessions 表查询会话列表（按创建时间倒序）。 */
 	private async listSessions(options: SqliteSessionListOptions): Promise<SqliteSessionMetadata[]> {
 		const path = await this.getDatabasePath();
 		if (!getFileSystemResultOrThrow(await this.env.exists(path), `Failed to check database ${path}`)) return [];
@@ -140,6 +155,7 @@ class SqliteSessionBackend {
 		return rows.map((row) => rowToMetadata(row, path));
 	}
 
+	/** 向指定会话追加一条条目（复用或打开该会话的连接）。 */
 	private appendEntry(metadata: SqliteSessionMetadata, entry: SessionTreeEntry): Promise<void> {
 		this.assertOpen();
 		return this.operations.enqueue(async () => {
@@ -150,6 +166,7 @@ class SqliteSessionBackend {
 		});
 	}
 
+	/** 在事务中删除会话及其所有关联数据（条目、分支缓存、物化状态等）。 */
 	delete(metadata: SqliteSessionMetadata): Promise<void> {
 		this.assertOpen();
 		return this.operations.enqueue(async () => {
@@ -168,6 +185,7 @@ class SqliteSessionBackend {
 		});
 	}
 
+	/** 基于源会话的条目选择，派生出一个新的分支会话。 */
 	fork(
 		source: SqliteSessionMetadata,
 		options: SqliteSessionCreateOptions,
@@ -194,6 +212,7 @@ class SqliteSessionBackend {
 		});
 	}
 
+	/** 异步释放后端：等所有操作完成后关闭数据库。 */
 	async [Symbol.asyncDispose](): Promise<void> {
 		if (!this.disposePromise) {
 			this.disposed = true;
@@ -202,6 +221,7 @@ class SqliteSessionBackend {
 		await this.disposePromise;
 	}
 
+	/** 清理资源：排空队列、关闭数据库并清空连接缓存。 */
 	private async finishDisposal(): Promise<void> {
 		await this.operations.drain();
 		const db = this.database ?? (this.databasePromise ? await this.databasePromise : undefined);
@@ -211,10 +231,12 @@ class SqliteSessionBackend {
 		if (db) await db.close();
 	}
 
+	/** 校验后端尚未被释放，否则抛出错误。 */
 	private assertOpen(): void {
 		if (this.disposed) throw new SessionError("storage", "SQLite session repository is disposed");
 	}
 
+	/** 把连接包装成存储层要求的 {@link SessionStorage} 接口。 */
 	private storage(connection: SqliteSessionConnection): SessionStorage<SqliteSessionMetadata> {
 		const metadata = connection.metadata;
 		return {
@@ -232,6 +254,7 @@ class SqliteSessionBackend {
 		};
 	}
 
+	/** 在串行队列中执行一次读取操作，复用或打开会话连接。 */
 	private read<T>(
 		metadata: SqliteSessionMetadata,
 		read: (connection: SqliteSessionConnection) => Promise<T>,
@@ -245,6 +268,7 @@ class SqliteSessionBackend {
 		});
 	}
 
+	/** 解析并缓存数据库文件的绝对路径。 */
 	private async getDatabasePath(): Promise<string> {
 		this.databasePath ??= getFileSystemResultOrThrow(
 			await this.env.absolutePath(this.databasePathInput),
@@ -253,12 +277,14 @@ class SqliteSessionBackend {
 		return this.databasePath;
 	}
 
+	/** 获取（必要时惰性打开）共享的数据库实例。 */
 	private async getDatabase(): Promise<SqliteDatabase> {
 		if (!this.databasePromise) this.databasePromise = this.openDatabase();
 		this.database = await this.databasePromise;
 		return this.database;
 	}
 
+	/** 创建数据库目录、打开数据库并完成 PRAGMA 配置与迁移。 */
 	private async openDatabase(): Promise<SqliteDatabase> {
 		const path = await this.getDatabasePath();
 		const directory = getParentPath(path);
@@ -278,38 +304,49 @@ class SqliteSessionBackend {
 	}
 }
 
+/** 构建 {@link SqliteSessionRepository} 时的配置选项。 */
 export interface SqliteSessionRepositoryOptions extends SqliteSessionBackendOptions {
+	/** 构造上层 {@link Session} 对象时的上下文配置。 */
 	contextBuildOptions?: SessionContextBuildOptions;
 }
 
+/** 基于 SQLite 的会话仓库实现，负责会话的创建、打开、列举、删除与分支派生。 */
 export class SqliteSessionRepository
 	implements SessionRepository<SqliteSessionMetadata, SqliteSessionCreateOptions, SqliteSessionListOptions>
 {
 	private readonly backend: SqliteSessionBackend;
 	private readonly contextBuildOptions: SessionContextBuildOptions;
 
+	/**
+	 * @param options 仓库配置，含后端选项与可选的上下文构建选项。
+	 */
 	constructor(options: SqliteSessionRepositoryOptions) {
 		const { contextBuildOptions, ...backendOptions } = options;
 		this.backend = new SqliteSessionBackend(backendOptions);
 		this.contextBuildOptions = contextBuildOptions ?? {};
 	}
 
+	/** 创建新会话并包装成 {@link Session}。 */
 	async create(options: SqliteSessionCreateOptions): Promise<Session<SqliteSessionMetadata>> {
 		return createSession(await this.backend.create(options), this.contextBuildOptions);
 	}
 
+	/** 打开已有会话并包装成 {@link Session}。 */
 	async open(metadata: SqliteSessionMetadata): Promise<Session<SqliteSessionMetadata>> {
 		return createSession(await this.backend.open(metadata), this.contextBuildOptions);
 	}
 
+	/** 列出会话，可按 cwd 过滤。 */
 	async list(options?: SqliteSessionListOptions): Promise<SqliteSessionMetadata[]> {
 		return await this.backend.list(options);
 	}
 
+	/** 删除会话及其全部数据。 */
 	async delete(metadata: SqliteSessionMetadata): Promise<void> {
 		await this.backend.delete(metadata);
 	}
 
+	/** 从源会话按选择派生出一个分支会话。 */
 	async fork(
 		source: SqliteSessionMetadata,
 		options: SessionForkOptions & SqliteSessionCreateOptions,
@@ -321,6 +358,7 @@ export class SqliteSessionRepository
 		);
 	}
 
+	/** 释放底层后端资源。 */
 	async [Symbol.asyncDispose](): Promise<void> {
 		await this.backend[Symbol.asyncDispose]();
 	}

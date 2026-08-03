@@ -1,3 +1,4 @@
+// 远程会话客户端公共导出：RemoteSession 封装远程会话操作，transcript 提供转录状态管理。
 export {
 	type CreateRemoteSessionOptions,
 	RemoteSession,

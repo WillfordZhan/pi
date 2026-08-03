@@ -7,12 +7,14 @@ import type {
 } from "../types.ts";
 import { SessionError } from "../types.ts";
 
+/** 从条目中派生的聚合投影：会话名称、标签表与 token 统计。 */
 interface SessionEntryProjection {
 	name: string | undefined;
 	labelsById: Map<string, string>;
 	stats: SessionStats;
 }
 
+/** 创建一份全新的空投影。 */
 function createProjection(): SessionEntryProjection {
 	return {
 		name: undefined,
@@ -21,6 +23,7 @@ function createProjection(): SessionEntryProjection {
 	};
 }
 
+/** 将一条条目并入投影：更新会话名/标签，并累加 assistant 消息的 token 用量。 */
 function applyProjection(projection: SessionEntryProjection, entry: SessionTreeEntry): void {
 	if (entry.type === "session_info") {
 		projection.name = entry.name?.trim() || undefined;
@@ -54,21 +57,31 @@ function applyProjection(projection: SessionEntryProjection, entry: SessionTreeE
 	projection.stats.costTotal += usage.cost.total;
 }
 
-/** Ordered entries and derived projections for array-backed session storage. */
+/** 基于数组的会话存储索引：保存有序条目并提供按 id 查找、分支回溯与派生投影。 */
 export class ArraySessionIndex {
+	/** 全部条目的顺序数组。 */
 	private entries: SessionTreeEntry[] = [];
+	/** 条目 id 到条目的映射，用于 O(1) 查找。 */
 	private byId = new Map<string, SessionTreeEntry>();
+	/** 当前叶子条目 id。 */
 	private leafId: string | null = null;
+	/** 由条目派生的聚合投影（名称、标签、统计）。 */
 	private projection = createProjection();
 
+	/**
+	 * 构造索引。
+	 * @param entries - 初始条目列表，将整体替换到索引中。
+	 */
 	constructor(entries: readonly SessionTreeEntry[] = []) {
 		this.replace(entries);
 	}
 
+	/** 判断指定 id 的条目是否存在。 */
 	has(id: string): boolean {
 		return this.byId.has(id);
 	}
 
+	/** 追加一条条目，校验 id 唯一性并更新叶子指针与投影。 */
 	append(entry: SessionTreeEntry): void {
 		if (this.byId.has(entry.id)) {
 			throw new SessionError("invalid_entry", `Entry ${entry.id} already exists`);
@@ -79,6 +92,7 @@ export class ArraySessionIndex {
 		applyProjection(this.projection, entry);
 	}
 
+	/** 用一组条目整体替换索引内容（重建映射、叶子指针与投影）。 */
 	replace(entries: readonly SessionTreeEntry[]): void {
 		const nextEntries = [...entries];
 		const nextById = new Map<string, SessionTreeEntry>();
@@ -98,6 +112,7 @@ export class ArraySessionIndex {
 		this.projection = nextProjection;
 	}
 
+	/** 返回当前会话头部（叶子条目 id），若叶子指针失效则报错。 */
 	readHead(): SessionHead {
 		if (this.leafId !== null && !this.byId.has(this.leafId)) {
 			throw new SessionError("invalid_session", `Entry ${this.leafId} not found`);
@@ -105,16 +120,19 @@ export class ArraySessionIndex {
 		return { leafId: this.leafId };
 	}
 
+	/** 按 id 读取单条条目。 */
 	readEntry(id: string): SessionTreeEntry | undefined {
 		return this.byId.get(id);
 	}
 
+	/** 按游标（起始序号 + 限制条数）切片读取条目。 */
 	readEntries(options?: SessionEntryCursorOptions): readonly SessionTreeEntry[] {
 		const start = options?.afterEntrySeq ?? 0;
 		const end = options?.limit === undefined ? undefined : start + options.limit;
 		return this.entries.slice(start, end);
 	}
 
+	/** 在分支上按查询条件回溯查找条目，支持方向、停止条件、类型过滤与条数限制。 */
 	findEntriesOnBranch(query: SessionBranchQuery & { start: string | null }): readonly SessionTreeEntry[] {
 		if (query.limit !== undefined && (!Number.isInteger(query.limit) || query.limit <= 0)) {
 			throw new RangeError("Session branch query limit must be a positive integer");
@@ -152,18 +170,22 @@ export class ArraySessionIndex {
 		return query.limit === undefined ? entries : entries.slice(0, query.limit);
 	}
 
+	/** 返回指定条目 id 的标签。 */
 	getLabel(id: string): string | undefined {
 		return this.projection.labelsById.get(id);
 	}
 
+	/** 返回会话名称（未设置时返回 undefined）。 */
 	getName(): string | undefined {
 		return this.projection.name;
 	}
 
+	/** 返回会话统计信息的副本。 */
 	getStats(): SessionStats {
 		return { ...this.projection.stats };
 	}
 
+	/** 从指定叶子回溯到根或最近压缩点的路径，压缩点带保留尾部时提前停止。 */
 	readPathToRootOrCompaction(requestedLeafId: string | null): readonly SessionTreeEntry[] {
 		if (requestedLeafId === null) return [];
 		const path: SessionTreeEntry[] = [];
