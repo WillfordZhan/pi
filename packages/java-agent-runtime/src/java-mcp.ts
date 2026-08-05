@@ -114,6 +114,8 @@ export class JavaMcpClient {
 					},
 					signal,
 				);
+				// Java 已完成 HTTP 调用不代表业务工具执行成功；抛出异常后由 Pi AgentSession 标记为 Tool error。
+				if (response.ok === false) throw new JavaMcpRequestError(formatToolResult(response));
 				return {
 					content: [{ type: "text", text: formatToolResult(response) }],
 					details: response,

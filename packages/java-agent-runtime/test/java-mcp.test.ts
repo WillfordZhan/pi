@@ -66,4 +66,34 @@ describe("JavaMcpClient", () => {
 			context: { tenantId: "100", userId: "7" },
 		});
 	});
+
+	it("marks a Java business failure as a Pi tool error", async () => {
+		let requestCount = 0;
+		const client = new JavaMcpClient({
+			baseUrl: "http://java-mcp.local",
+			internalToken: "mcp-token",
+			timeoutMs: 1000,
+			fetchImpl: async () => {
+				requestCount += 1;
+				return new Response(
+					JSON.stringify(
+						requestCount === 1
+							? { code: 200, data: { tools: [{ name: "plan_search", inputSchema: { type: "object" } }] } }
+							: {
+									code: 200,
+									data: { ok: false, errorCode: "tool_args_invalid", message: "物料不存在" },
+								},
+					),
+				);
+			},
+		});
+		const [tool] = await client.createTools({
+			conversationId: "conversation-1",
+			caller: { tenantId: "100", userId: "7" },
+		});
+
+		await expect(tool.execute("tool-call-1", {}, undefined, undefined, {} as never)).rejects.toThrow(
+			"Java tool failed (tool_args_invalid): 物料不存在",
+		);
+	});
 });
