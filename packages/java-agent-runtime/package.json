@@ -1,0 +1,36 @@
+{
+	"name": "@earendil-works/pi-java-agent-runtime",
+	"version": "0.83.0",
+	"private": true,
+	"description": "HTTP runtime that embeds Pi for Java AI gateway conversations",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"bin": {
+		"pi-java-agent-runtime": "./dist/main.js"
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "^0.83.0"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"vitest": "4.1.9"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
