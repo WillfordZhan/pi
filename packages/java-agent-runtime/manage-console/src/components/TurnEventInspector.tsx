@@ -33,14 +33,16 @@ export function TurnEventInspector({
       return turn.events;
     }
     if (eventFilter === "llm") {
-      return turn.events.filter((item) => item.event_type === "llm_request" || item.event_type === "llm_response");
+      return turn.events.filter((item) =>
+        ["llm_request", "llm_response", "assistant_message"].includes(item.event_type)
+      );
     }
     if (eventFilter === "tool") {
       return turn.events.filter((item) => item.event_type === "tool_call" || item.event_type === "tool_result");
     }
     if (eventFilter === "final") {
       return turn.events.filter((item) =>
-        ["final", "clarification_needed", "answer_delta"].includes(item.event_type)
+        ["final", "clarification_needed", "answer_delta", "assistant_message"].includes(item.event_type)
       );
     }
     return turn.events.filter((item) => item.event_type === "conversation_failed");
@@ -201,6 +203,7 @@ export function eventTypeColor(eventType: string | undefined) {
       return "purple";
     case "llm_request":
     case "llm_response":
+    case "assistant_message":
       return "geekblue";
     case "user_message":
       return "gold";
@@ -223,6 +226,7 @@ function eventTypeSwatch(eventType: string | undefined) {
       return "#b69bff";
     case "llm_request":
     case "llm_response":
+    case "assistant_message":
       return "#7ed8ff";
     case "user_message":
       return "#f4a261";
