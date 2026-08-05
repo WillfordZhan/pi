@@ -26,7 +26,6 @@ import {
 import {
   AppstoreOutlined,
   BulbOutlined,
-  LinkOutlined,
   LoginOutlined,
   LogoutOutlined,
   MenuFoldOutlined,
@@ -38,11 +37,8 @@ import { useEffect, useMemo, useState } from "react";
 import {
   apiFetch,
   AUTH_STORAGE_KEY,
-  bootstrapApiBaseUrlFromLocation,
-  describeApiBaseUrl,
   getUserFacingErrorMessage,
   login,
-  setApiBaseUrl,
 } from "./api";
 import { SchemaInspector } from "./components/SchemaInspector";
 import { MarkdownMessage } from "./components/MarkdownMessage";
@@ -90,13 +86,10 @@ const THEME_STORAGE_KEY = "ai-manage.theme-mode";
 export default function App() {
   const { message } = AntApp.useApp();
   const [loginForm] = Form.useForm<{ mobileNo: string; password: string }>();
-  const [apiBaseUrlForm] = Form.useForm<{ apiBaseUrl: string }>();
   const [authLoading, setAuthLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
   const [loginError, setLoginError] = useState("");
-  const [backendConfigOpen, setBackendConfigOpen] = useState(false);
-  const [apiBaseUrl, setApiBaseUrlState] = useState<string>(() => bootstrapApiBaseUrlFromLocation());
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => loadThemeMode());
   const [navCollapsed, setNavCollapsed] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>("live-debug");
@@ -230,44 +223,6 @@ export default function App() {
     if (activeView === "live-debug" && liveConversationId) {
       await refreshLiveTimeline(liveConversationId, true);
     }
-  }
-
-  function resetConsoleStateAfterBackendSwitch() {
-    // 后端地址切换后，旧 token、当前工厂和已加载会话都可能已经不再属于同一个环境。
-    // 这里主动清理前端状态，避免用户把 A 环境的认证和 B 环境的数据混在同一个页签里。
-    window.sessionStorage.removeItem(AUTH_STORAGE_KEY);
-    setSession(null);
-    setDeptId("");
-    setUsers([]);
-    setSelectedUserId("");
-    resetConversationPane();
-    resetLivePane();
-  }
-
-  function openBackendConfig() {
-    apiBaseUrlForm.setFieldsValue({ apiBaseUrl });
-    setBackendConfigOpen(true);
-  }
-
-  async function handleSaveBackendConfig(values: { apiBaseUrl: string }) {
-    const normalized = setApiBaseUrl(values.apiBaseUrl || "");
-    setApiBaseUrlState(normalized);
-    resetConsoleStateAfterBackendSwitch();
-    setBackendConfigOpen(false);
-    message.success(
-      normalized
-        ? `后端地址已切换到 ${normalized}，请重新登录。`
-        : "已恢复为当前页面同域后端，请重新登录。"
-    );
-  }
-
-  function handleResetBackendConfig() {
-    const normalized = setApiBaseUrl("");
-    setApiBaseUrlState(normalized);
-    apiBaseUrlForm.setFieldsValue({ apiBaseUrl: normalized });
-    resetConsoleStateAfterBackendSwitch();
-    setBackendConfigOpen(false);
-    message.success("已恢复为当前页面同域后端，请重新登录。");
   }
 
   async function loadUsers(
@@ -868,11 +823,6 @@ export default function App() {
               ) : (
                 <Badge status={isAuthed ? "warning" : "default"} text={isAuthed ? "校验中" : "未登录"} />
               )}
-              <Tooltip title={`当前后端: ${describeApiBaseUrl(apiBaseUrl)}`}>
-                <Button icon={<LinkOutlined />} onClick={openBackendConfig}>
-                  后端
-                </Button>
-              </Tooltip>
               <Button icon={<BulbOutlined />} onClick={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}>
                 {themeMode === "dark" ? "浅色" : "深色"}
               </Button>
@@ -1062,36 +1012,6 @@ export default function App() {
             </Space>
           </Form>
         </Drawer>
-
-        <Modal
-          title="后端服务地址"
-          open={backendConfigOpen}
-          onCancel={() => setBackendConfigOpen(false)}
-          onOk={() => void apiBaseUrlForm.submit()}
-          okText="保存"
-          cancelText="取消"
-        >
-          <Form form={apiBaseUrlForm} layout="vertical" onFinish={(values) => void handleSaveBackendConfig(values)}>
-            <Alert
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-              message="manage console 会直接把请求发到这里"
-              description="在线调试会调用 Pi 同域 /api/ai/** 代理，再由 Java 网关转发到 Pi 内部运行时；管理查询会调用 Pi 的 /ai/management/** 接口。留空表示继续走当前页面同域。"
-            />
-            <Form.Item
-              name="apiBaseUrl"
-              label="Pi Runtime 地址"
-              extra="示例：https://python.example.com 或 http://127.0.0.1:8000"
-            >
-              <Input placeholder="留空表示当前页面同域" allowClear />
-            </Form.Item>
-            <Space>
-              <Button onClick={handleResetBackendConfig}>恢复同域</Button>
-              <Text type="secondary">当前值：{describeApiBaseUrl(apiBaseUrl)}</Text>
-            </Space>
-          </Form>
-        </Modal>
 
         <ToolDetailModal payload={selectedTool} onClose={() => setSelectedTool(null)} />
       </Layout>
