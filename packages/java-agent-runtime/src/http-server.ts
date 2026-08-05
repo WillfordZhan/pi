@@ -12,7 +12,7 @@ import { extname, join, normalize } from "node:path";
 import type { RuntimeConfig } from "./config.ts";
 import type { JavaMcpCallerContext } from "./java-mcp.ts";
 import { ManagementRequestError, PiManagementService } from "./management.ts";
-import { ConversationNotFoundError, type PiConversationRuntime } from "./runtime.ts";
+import { ConversationAccessDeniedError, ConversationNotFoundError, type PiConversationRuntime } from "./runtime.ts";
 
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
 
@@ -409,6 +409,10 @@ export function createHttpServer(runtime: PiConversationRuntime, config: Runtime
 			}
 			if (error instanceof ConversationNotFoundError) {
 				writeJson(response, 404, { detail: error.message });
+				return;
+			}
+			if (error instanceof ConversationAccessDeniedError) {
+				writeJson(response, 403, { detail: error.message });
 				return;
 			}
 			if (error instanceof ManagementRequestError) {

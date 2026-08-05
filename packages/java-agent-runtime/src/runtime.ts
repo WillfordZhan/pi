@@ -15,6 +15,7 @@ import {
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRuntime,
+	type SessionEntry,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { RuntimeConfig } from "./config.ts";
@@ -36,6 +37,29 @@ export class ConversationNotFoundError extends Error {
 	constructor(conversationId: string) {
 		super(`Conversation not found: ${conversationId}`);
 		this.name = "ConversationNotFoundError";
+	}
+}
+
+/** 已签名的当前调用人不属于目标会话时拒绝续聊，避免仅凭会话 ID 越权读取历史上下文。 */
+export class ConversationAccessDeniedError extends Error {
+	constructor() {
+		super("conversation access denied");
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 新会话在创建时写入最小调用人范围；续聊必须与 Java 本次签名上下文完全一致。
+ * 旧 JSONL 没有该条目时按拒绝处理，宁可要求用户新建会话，也不能放开历史上下文访问。
+ */
+export function assertConversationCaller(entries: readonly SessionEntry[], caller: JavaMcpCallerContext): void {
+	const context = entries.find((entry) => entry.type === "custom" && entry.customType === "java_gateway_context");
+	if (!context || context.type !== "custom" || !isRecord(context.data)) throw new ConversationAccessDeniedError();
+	if (context.data.tenantId !== caller.tenantId || context.data.userId !== caller.userId) {
+		throw new ConversationAccessDeniedError();
 	}
 }
 
@@ -142,7 +166,7 @@ export class PiConversationRuntime {
 	): Promise<AgentSession> {
 		const sessionManager = create
 			? SessionManager.create(this.config.workingDirectory, this.config.sessionDirectory, { id: conversationId })
-			: await this.openExistingSession(conversationId);
+			: await this.openExistingSession(conversationId, caller);
 		if (create) {
 			// 管理台只读取最小的 Java 调用人范围，避免把签名上下文或业务快照写入本地会话文件。
 			sessionManager.appendCustomEntry("java_gateway_context", caller);
@@ -166,11 +190,13 @@ export class PiConversationRuntime {
 		return session;
 	}
 
-	private async openExistingSession(conversationId: string): Promise<SessionManager> {
+	private async openExistingSession(conversationId: string, caller: JavaMcpCallerContext): Promise<SessionManager> {
 		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
 		const target = sessions.find((session) => session.id === conversationId);
 		if (!target) throw new ConversationNotFoundError(conversationId);
-		return SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
+		const session = SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
+		assertConversationCaller(session.getEntries(), caller);
+		return session;
 	}
 }
 
