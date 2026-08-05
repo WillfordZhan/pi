@@ -8,7 +8,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, relative } from "node:path";
 import type { RuntimeConfig } from "./config.ts";
 import type { JavaMcpCallerContext } from "./java-mcp.ts";
 import { ManagementRequestError, PiManagementService } from "./management.ts";
@@ -224,15 +224,17 @@ function contentType(path: string): string {
 	);
 }
 
+/** 静态文件必须位于管理台根目录内，不能用字符串前缀判断目录归属。 */
+export function isPathInsideDirectory(directory: string, target: string): boolean {
+	const path = relative(directory, target);
+	return path !== "" && path !== ".." && !path.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`);
+}
+
 function serveManageConsole(response: ServerResponse, config: RuntimeConfig, pathname: string): boolean {
-	const relative = pathname.replace(/^\/ai\/management\/console\/?/u, "") || "index.html";
-	const target = normalize(join(config.manageConsoleDirectory, relative));
-	if (
-		!target.startsWith(normalize(config.manageConsoleDirectory)) ||
-		!existsSync(target) ||
-		!statSync(target).isFile()
-	)
-		return false;
+	const resource = pathname.replace(/^\/ai\/management\/console\/?/u, "") || "index.html";
+	const directory = normalize(config.manageConsoleDirectory);
+	const target = normalize(join(directory, resource));
+	if (!isPathInsideDirectory(directory, target) || !existsSync(target) || !statSync(target).isFile()) return false;
 	response.writeHead(200, { "Content-Type": contentType(target) });
 	createReadStream(target).pipe(response);
 	return true;
@@ -416,13 +418,27 @@ export function createHttpServer(runtime: PiConversationRuntime, config: Runtime
 				writeJson(response, 200, { ...result, conversation_id: result.conversationId, accepted: true });
 				return;
 			}
+			const interruptMatch = /^\/ai\/conversations\/([A-Za-z0-9._-]+)\/interrupt$/u.exec(url.pathname);
+			if (request.method === "POST" && interruptMatch) {
+				const interrupted = await runtime.interrupt(interruptMatch[1], caller);
+				writeJson(response, 200, {
+					conversation_id: interruptMatch[1],
+					accepted: true,
+					interrupted,
+				});
+				return;
+			}
 			const messagesMatch = /^\/ai\/conversations\/([A-Za-z0-9._-]+)\/messages$/u.exec(url.pathname);
 			if (request.method === "GET" && messagesMatch) {
 				const afterMessageId = Number(url.searchParams.get("after_message_id") ?? 0);
 				writeJson(
 					response,
 					200,
-					await management.messages(messagesMatch[1], Number.isSafeInteger(afterMessageId) ? afterMessageId : 0),
+					await management.messages(
+						messagesMatch[1],
+						Number.isSafeInteger(afterMessageId) ? afterMessageId : 0,
+						caller,
+					),
 				);
 				return;
 			}
