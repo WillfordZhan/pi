@@ -7,18 +7,17 @@
 
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { type Api, contentText, type Model } from "@earendil-works/pi-ai";
-import {
-	type AgentSession,
-	type AgentSessionEvent,
-	createAgentSession,
-	DefaultResourceLoader,
-	getAgentDir,
-	ModelRuntime,
-	type SessionEntry,
-	SessionManager,
-} from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "../../ai/src/types.ts";
+import { contentText } from "../../ai/src/utils/text.ts";
+import { getAgentDir } from "../../coding-agent/src/config.ts";
+import type { AgentSession, AgentSessionEvent } from "../../coding-agent/src/core/agent-session.ts";
+import { ModelRuntime } from "../../coding-agent/src/core/model-runtime.ts";
+import { DefaultResourceLoader } from "../../coding-agent/src/core/resource-loader.ts";
+import { createAgentSession } from "../../coding-agent/src/core/sdk.ts";
+import { type SessionEntry, SessionManager } from "../../coding-agent/src/core/session-manager.ts";
 import type { RuntimeConfig } from "./config.ts";
+
+import { JavaConversationStoreClient } from "./java-conversation-store.ts";
 import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 
 export interface ConversationResponse {
@@ -32,6 +31,16 @@ export interface StartedConversation {
 	conversationId: string;
 	result: Promise<ConversationResponse>;
 	abort: () => void;
+}
+
+interface OpenedConversationSession {
+	session: AgentSession;
+	sessionManager: SessionManager;
+}
+
+interface RunningConversation {
+	session: AgentSession;
+	caller: JavaMcpCallerContext;
 }
 
 export class ConversationNotFoundError extends Error {
@@ -83,7 +92,9 @@ export class PiConversationRuntime {
 	private readonly modelRuntime: ModelRuntime;
 	private readonly model: Model<Api>;
 	private readonly javaMcp: JavaMcpClient;
+	private readonly javaConversationStore: JavaConversationStoreClient;
 	private readonly conversationQueues = new Map<string, Promise<void>>();
+	private readonly runningConversations = new Map<string, RunningConversation>();
 
 	private constructor(config: RuntimeConfig, modelRuntime: ModelRuntime, model: Model<Api>) {
 		this.config = config;
@@ -94,6 +105,7 @@ export class PiConversationRuntime {
 			internalToken: config.javaMcpToken,
 			timeoutMs: config.mcpTimeoutMs,
 		});
+		this.javaConversationStore = new JavaConversationStoreClient(config);
 	}
 
 	static async create(config: RuntimeConfig): Promise<PiConversationRuntime> {
@@ -133,6 +145,16 @@ export class PiConversationRuntime {
 		};
 	}
 
+	async interrupt(conversationId: string, caller: JavaMcpCallerContext): Promise<boolean> {
+		const running = this.runningConversations.get(conversationId);
+		if (!running) return false;
+		if (running.caller.tenantId !== caller.tenantId || running.caller.userId !== caller.userId) {
+			throw new ConversationAccessDeniedError();
+		}
+		await running.session.abort();
+		return true;
+	}
+
 	private async runConversation(
 		conversationId: string,
 		caller: JavaMcpCallerContext,
@@ -152,18 +174,33 @@ export class PiConversationRuntime {
 		if (signal?.aborted) throw new ConversationAbortedError();
 
 		try {
-			const session = await this.openSession(conversationId, caller, create);
+			const opened = await this.openSession(conversationId, caller, create);
+			const { session, sessionManager } = opened;
 			const abortSession = () => void session.abort();
 			signal?.addEventListener("abort", abortSession, { once: true });
 			const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
+			this.runningConversations.set(conversationId, { session, caller });
 			try {
 				if (signal?.aborted) throw new ConversationAbortedError();
-				await session.prompt(query, { source: "rpc" });
+				let promptFailure: unknown;
+				try {
+					await session.prompt(query, { source: "rpc" });
+				} catch (error) {
+					promptFailure = error;
+				}
 				const response = lastAssistantText(session);
 				const assistant = session.messages.at(-1);
-				if (assistant?.role === "assistant" && assistant.errorMessage) throw new Error(assistant.errorMessage);
+				if (!promptFailure && assistant?.role === "assistant" && assistant.errorMessage) {
+					promptFailure = new Error(assistant.errorMessage);
+				}
+				// Pi 已先持久化 JSONL；Java 同步失败时不写 marker，下一次会自动幂等补传。
+				await this.syncConversation(sessionManager, conversationId, caller);
+				if (promptFailure) throw promptFailure;
 				return { conversationId, response };
 			} finally {
+				if (this.runningConversations.get(conversationId)?.session === session) {
+					this.runningConversations.delete(conversationId);
+				}
 				unsubscribe?.();
 				signal?.removeEventListener("abort", abortSession);
 				session.dispose();
@@ -178,7 +215,7 @@ export class PiConversationRuntime {
 		conversationId: string,
 		caller: JavaMcpCallerContext,
 		create: boolean,
-	): Promise<AgentSession> {
+	): Promise<OpenedConversationSession> {
 		const sessionManager = create
 			? SessionManager.create(this.config.workingDirectory, this.config.sessionDirectory, { id: conversationId })
 			: await this.openExistingSession(conversationId, caller);
@@ -202,7 +239,20 @@ export class PiConversationRuntime {
 			customTools,
 			noTools: "builtin",
 		});
-		return session;
+		return { session, sessionManager };
+	}
+
+	private async syncConversation(
+		sessionManager: SessionManager,
+		conversationId: string,
+		caller: JavaMcpCallerContext,
+	): Promise<void> {
+		const entries = sessionManager.getEntries();
+		await this.javaConversationStore.sync(conversationId, caller, entries);
+		sessionManager.appendCustomEntry(
+			JavaConversationStoreClient.syncMarkerType,
+			this.javaConversationStore.markSynced(entries),
+		);
 	}
 
 	private async openExistingSession(conversationId: string, caller: JavaMcpCallerContext): Promise<SessionManager> {

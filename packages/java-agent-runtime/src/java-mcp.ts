@@ -5,7 +5,7 @@
  * 因此工具选择、Agent loop 与工具生命周期完全由 Pi 控制。
  */
 
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "../../coding-agent/src/core/extensions/types.ts";
 
 export interface JavaMcpCallerContext {
 	tenantId: string;

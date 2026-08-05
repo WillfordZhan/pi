@@ -1,5 +1,5 @@
-import type { CustomEntry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
+import type { CustomEntry } from "../../coding-agent/src/core/session-manager.ts";
 import { assertConversationCaller, ConversationAccessDeniedError } from "../src/runtime.ts";
 
 const caller = { tenantId: "100", userId: "9007199254740993" };

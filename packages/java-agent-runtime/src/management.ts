@@ -1,9 +1,10 @@
 /** Pi 管理台的会话投影与 Java 管理接口访问。 */
 
-import { contentText } from "@earendil-works/pi-ai";
-import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
+import { contentText } from "../../ai/src/utils/text.ts";
+import { type SessionEntry, SessionManager } from "../../coding-agent/src/core/session-manager.ts";
 import type { RuntimeConfig } from "./config.ts";
-import { JavaMcpClient } from "./java-mcp.ts";
+import { JavaConversationStoreClient, JavaConversationStoreError } from "./java-conversation-store.ts";
+import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 
 export class ManagementRequestError extends Error {
 	readonly statusCode: number;
@@ -166,6 +167,7 @@ export function aggregateSessionUsers(
 
 export class PiManagementService {
 	private readonly mcp: JavaMcpClient;
+	private readonly conversationStore: JavaConversationStoreClient;
 	private readonly config: RuntimeConfig;
 
 	constructor(config: RuntimeConfig) {
@@ -175,6 +177,7 @@ export class PiManagementService {
 			internalToken: config.javaMcpToken,
 			timeoutMs: config.mcpTimeoutMs,
 		});
+		this.conversationStore = new JavaConversationStoreClient(config);
 	}
 
 	async currentUser(authorization: string): Promise<Record<string, unknown>> {
@@ -251,55 +254,26 @@ export class PiManagementService {
 		const pageSize = Math.min(100, Math.max(1, Number(value(payload, "pageSize", "page_size") ?? 20) || 20));
 		const deptId = String(value(payload, "deptId", "dept_id") ?? "");
 		const userId = String(value(payload, "userId", "user_id") ?? "");
-		const keyword = String(value(payload, "keyword", "keyword") ?? "")
-			.trim()
-			.toLowerCase();
+		const keyword = String(value(payload, "keyword", "keyword") ?? "").trim();
 		const createdFrom = optionalDate(payload, "createdFrom", "created_from");
 		const createdTo = optionalDate(payload, "createdTo", "created_to");
 		if (createdFrom && createdTo && createdFrom > createdTo) {
 			throw new ManagementRequestError(400, "created_from must be before created_to");
 		}
-		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
-		const items = sessions.flatMap((session) => {
-			const manager = SessionManager.open(session.path, this.config.sessionDirectory, this.config.workingDirectory);
-			const context = sessionContext(manager.getEntries());
-			if (deptId && (!context || deptId !== context.tenantId)) return [];
-			if (userId && (!context || userId !== context.userId)) return [];
-			if (!conversationCreatedInRange(session.created, createdFrom, createdTo)) return [];
-			const events = projectEntries(manager.getEntries());
-			const preview = [...events]
-				.reverse()
-				.find((event) => event.event_type === "assistant_message" || event.event_type === "user_message");
-			const item = {
-				conversationId: session.id,
-				deptId: context?.tenantId,
-				userId: context?.userId,
-				title: session.firstMessage.slice(0, 80),
-				initialQuery: session.firstMessage,
-				previewText: preview?.summary ?? "",
-				latestEventType: events.at(-1)?.event_type ?? "",
-				latestEventId: events.length,
-				turnCount: events.filter((event) => event.event_type === "user_message").length,
-				createdAt: session.created.toISOString(),
-				updatedAt: session.modified.toISOString(),
-			};
-			return keyword &&
-				!Object.values(item).some((itemValue) =>
-					String(itemValue ?? "")
-						.toLowerCase()
-						.includes(keyword),
-				)
-				? []
-				: [item];
+		return this.conversationStore.searchConversations({
+			pageNum,
+			pageSize,
+			deptId,
+			userId,
+			keyword,
+			createdFrom: createdFrom?.toISOString(),
+			createdTo: createdTo?.toISOString(),
 		});
-		const offset = Math.max(0, pageNum - 1) * pageSize;
-		return { total: items.length, pageNum, pageSize, items: items.slice(offset, offset + pageSize) };
 	}
 
 	async timeline(authorization: string, conversationId: string): Promise<Record<string, unknown>> {
 		await this.currentUser(authorization);
-		const manager = await this.openSession(conversationId);
-		const events = projectEntries(manager.getEntries());
+		const events = projectEntries(await this.entries(conversationId));
 		const messages = events
 			.filter((event) => Boolean(event.visible_in_messages))
 			.map((event) => ({
@@ -314,9 +288,12 @@ export class PiManagementService {
 		return { conversation: { conversationId }, messages };
 	}
 
-	async messages(conversationId: string, afterMessageId: number): Promise<Record<string, unknown>> {
-		const manager = await this.openSession(conversationId);
-		const events = projectEntries(manager.getEntries());
+	async messages(
+		conversationId: string,
+		afterMessageId: number,
+		caller: JavaMcpCallerContext,
+	): Promise<Record<string, unknown>> {
+		const events = projectEntries(await this.entries(conversationId, caller));
 		const messages = events
 			.filter((event) => Number(event.id) > afterMessageId && Boolean(event.visible_in_messages))
 			.map((event) => ({
@@ -333,8 +310,7 @@ export class PiManagementService {
 
 	async turns(authorization: string, conversationId: string): Promise<Record<string, unknown>> {
 		await this.currentUser(authorization);
-		const manager = await this.openSession(conversationId);
-		const events = projectEntries(manager.getEntries());
+		const events = projectEntries(await this.entries(conversationId));
 		const groups = new Map<number, SessionEvent[]>();
 		for (const event of events) {
 			const index = Number(event.turn_index);
@@ -367,8 +343,7 @@ export class PiManagementService {
 
 	async event(authorization: string, conversationId: string, eventId: number): Promise<Record<string, unknown>> {
 		await this.currentUser(authorization);
-		const manager = await this.openSession(conversationId);
-		const event = projectEntries(manager.getEntries()).find((item) => item.id === eventId);
+		const event = projectEntries(await this.entries(conversationId)).find((item) => item.id === eventId);
 		if (!event) throw new ManagementRequestError(404, "event not found");
 		return { conversation_id: conversationId, event: { ...event, raw_json: JSON.stringify(event) } };
 	}
@@ -428,11 +403,17 @@ export class PiManagementService {
 		return fetch(`${this.config.javaGatewayBaseUrl}${path}`, request);
 	}
 
-	private async openSession(conversationId: string): Promise<SessionManager> {
-		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
-		const target = sessions.find((item) => item.id === conversationId);
-		if (!target) throw new ManagementRequestError(404, "conversation not found");
-		return SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
+	/** Java 只保存原始 Entry；这里校验为对象后再按 Pi SessionEntry 进行展示投影。 */
+	private async entries(conversationId: string, caller?: JavaMcpCallerContext): Promise<SessionEntry[]> {
+		try {
+			const entries = await this.conversationStore.listEntries(conversationId, caller);
+			return entries.filter(isRecord) as unknown as SessionEntry[];
+		} catch (error) {
+			if (error instanceof JavaConversationStoreError) {
+				throw new ManagementRequestError(error.statusCode, error.message);
+			}
+			throw error;
+		}
 	}
 
 	private async javaJson(
