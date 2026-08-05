@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aggregateSessionUsers } from "../src/management.ts";
+import { aggregateSessionUsers, conversationCreatedInRange } from "../src/management.ts";
 
 describe("aggregateSessionUsers", () => {
 	it("lists Pi JSONL session owners without depending on the legacy conversation table", () => {
@@ -30,5 +30,14 @@ describe("aggregateSessionUsers", () => {
 				lastConversationAt: "2026-08-04T01:00:00.000Z",
 			},
 		]);
+	});
+});
+
+describe("conversationCreatedInRange", () => {
+	it("keeps conversations created within the selected inclusive date range", () => {
+		const createdAt = new Date("2026-08-05T12:00:00.000Z");
+		expect(conversationCreatedInRange(createdAt, new Date("2026-08-05T12:00:00.000Z"))).toBe(true);
+		expect(conversationCreatedInRange(createdAt, undefined, new Date("2026-08-05T12:00:00.000Z"))).toBe(true);
+		expect(conversationCreatedInRange(createdAt, new Date("2026-08-05T12:00:01.000Z"))).toBe(false);
 	});
 });

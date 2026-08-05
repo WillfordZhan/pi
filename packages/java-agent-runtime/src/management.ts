@@ -111,6 +111,20 @@ function value(payload: Record<string, unknown>, camelCase: string, snakeCase: s
 	return payload[camelCase] ?? payload[snakeCase];
 }
 
+/** 管理台日期筛选统一按会话创建时间的闭区间处理，非法时间不能静默放宽检索范围。 */
+export function conversationCreatedInRange(createdAt: Date, createdFrom?: Date, createdTo?: Date): boolean {
+	return (!createdFrom || createdAt >= createdFrom) && (!createdTo || createdAt <= createdTo);
+}
+
+function optionalDate(payload: Record<string, unknown>, camelCase: string, snakeCase: string): Date | undefined {
+	const raw = value(payload, camelCase, snakeCase);
+	if (raw === undefined || raw === null || raw === "") return undefined;
+	if (typeof raw !== "string") throw new ManagementRequestError(400, `${snakeCase} must be an ISO date-time`);
+	const date = new Date(raw);
+	if (Number.isNaN(date.getTime())) throw new ManagementRequestError(400, `${snakeCase} must be an ISO date-time`);
+	return date;
+}
+
 function normalizeDept(raw: unknown, currentDeptId?: string): Record<string, unknown> | undefined {
 	if (!isRecord(raw)) return undefined;
 	const deptId = raw.deptId === undefined ? "" : String(raw.deptId);
@@ -240,12 +254,18 @@ export class PiManagementService {
 		const keyword = String(value(payload, "keyword", "keyword") ?? "")
 			.trim()
 			.toLowerCase();
+		const createdFrom = optionalDate(payload, "createdFrom", "created_from");
+		const createdTo = optionalDate(payload, "createdTo", "created_to");
+		if (createdFrom && createdTo && createdFrom > createdTo) {
+			throw new ManagementRequestError(400, "created_from must be before created_to");
+		}
 		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
 		const items = sessions.flatMap((session) => {
 			const manager = SessionManager.open(session.path, this.config.sessionDirectory, this.config.workingDirectory);
 			const context = sessionContext(manager.getEntries());
 			if (deptId && (!context || deptId !== context.tenantId)) return [];
 			if (userId && (!context || userId !== context.userId)) return [];
+			if (!conversationCreatedInRange(session.created, createdFrom, createdTo)) return [];
 			const events = projectEntries(manager.getEntries());
 			const preview = [...events]
 				.reverse()
