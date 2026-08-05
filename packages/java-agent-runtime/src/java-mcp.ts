@@ -9,7 +9,8 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 export interface JavaMcpCallerContext {
 	tenantId: string;
-	userId: number;
+	// Java 用户主键可能超过 JavaScript 安全整数范围，必须以十进制字符串跨越 Pi Runtime。
+	userId: string;
 }
 
 interface JavaMcpToolDescriptor {

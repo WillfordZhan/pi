@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { type Api, contentText, type Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
+	type AgentSessionEvent,
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
@@ -22,6 +23,13 @@ import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 export interface ConversationResponse {
 	conversationId: string;
 	response: string;
+}
+
+export type ConversationEventListener = (event: AgentSessionEvent) => void;
+
+export interface StartedConversation {
+	conversationId: string;
+	result: Promise<ConversationResponse>;
 }
 
 export class ConversationNotFoundError extends Error {
@@ -70,12 +78,26 @@ export class PiConversationRuntime {
 	}
 
 	async createConversation(query: string, caller: JavaMcpCallerContext): Promise<ConversationResponse> {
-		const conversationId = randomUUID().replaceAll("-", "");
-		return this.runConversation(conversationId, caller, query, true);
+		return this.startConversation(query, caller, true).result;
 	}
 
 	async chat(conversationId: string, query: string, caller: JavaMcpCallerContext): Promise<ConversationResponse> {
-		return this.runConversation(conversationId, caller, query, false);
+		return this.startConversation(query, caller, false, undefined, conversationId).result;
+	}
+
+	startConversation(
+		query: string,
+		caller: JavaMcpCallerContext,
+		create: boolean,
+		onEvent?: ConversationEventListener,
+		existingConversationId?: string,
+	): StartedConversation {
+		const conversationId = create ? randomUUID().replaceAll("-", "") : existingConversationId;
+		if (!conversationId) throw new ConversationNotFoundError("");
+		return {
+			conversationId,
+			result: this.runConversation(conversationId, caller, query, create, onEvent),
+		};
 	}
 
 	private async runConversation(
@@ -83,6 +105,7 @@ export class PiConversationRuntime {
 		caller: JavaMcpCallerContext,
 		query: string,
 		create: boolean,
+		onEvent?: ConversationEventListener,
 	): Promise<ConversationResponse> {
 		let release: (() => void) | undefined;
 		const previous = this.conversationQueues.get(conversationId) ?? Promise.resolve();
@@ -95,10 +118,15 @@ export class PiConversationRuntime {
 
 		try {
 			const session = await this.openSession(conversationId, caller, create);
+			const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
 			try {
 				await session.prompt(query, { source: "rpc" });
-				return { conversationId, response: lastAssistantText(session) };
+				const response = lastAssistantText(session);
+				const assistant = session.messages.at(-1);
+				if (assistant?.role === "assistant" && assistant.errorMessage) throw new Error(assistant.errorMessage);
+				return { conversationId, response };
 			} finally {
+				unsubscribe?.();
 				session.dispose();
 			}
 		} finally {
@@ -115,6 +143,10 @@ export class PiConversationRuntime {
 		const sessionManager = create
 			? SessionManager.create(this.config.workingDirectory, this.config.sessionDirectory, { id: conversationId })
 			: await this.openExistingSession(conversationId);
+		if (create) {
+			// 管理台只读取最小的 Java 调用人范围，避免把签名上下文或业务快照写入本地会话文件。
+			sessionManager.appendCustomEntry("java_gateway_context", caller);
+		}
 		const customTools = await this.javaMcp.createTools({ conversationId, caller });
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: this.config.workingDirectory,
@@ -169,7 +201,8 @@ function registerQwenProvider(modelRuntime: ModelRuntime, config: RuntimeConfig,
 				input: ["text", "image"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 1_000_000,
-				maxTokens: 65_536,
+				// DashScope qwen-plus 的 max_tokens 上限是 32768；超出会在整轮开始前被拒绝。
+				maxTokens: 32_768,
 				compat: {
 					thinkingFormat: "qwen",
 					supportsDeveloperRole: false,

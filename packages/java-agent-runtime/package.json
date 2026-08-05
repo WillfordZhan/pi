@@ -20,8 +20,8 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "tsgo -p tsconfig.build.json",
-		"start": "node dist/main.js",
+		"build": "tsgo -p tsconfig.build.json && npm --prefix manage-console run build",
+		"start": "npm run build && PI_RUNTIME_CWD=../.. node dist/main.js",
 		"test": "vitest --run"
 	},
 	"dependencies": {

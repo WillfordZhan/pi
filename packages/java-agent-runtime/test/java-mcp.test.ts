@@ -52,7 +52,7 @@ describe("JavaMcpClient", () => {
 		});
 		const [tool] = await client.createTools({
 			conversationId: "conversation-1",
-			caller: { tenantId: "100", userId: 7 },
+			caller: { tenantId: "100", userId: "7" },
 		});
 
 		const result = await tool.execute("tool-call-1", { keyword: "today" }, undefined, undefined, {} as never);
@@ -63,7 +63,7 @@ describe("JavaMcpClient", () => {
 			toolCallId: "tool-call-1",
 			toolName: "plan_search",
 			args: { keyword: "today" },
-			context: { tenantId: "100", userId: 7 },
+			context: { tenantId: "100", userId: "7" },
 		});
 	});
 });

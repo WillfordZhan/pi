@@ -5,7 +5,8 @@
  */
 
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface RuntimeConfig {
 	port: number;
@@ -16,6 +17,8 @@ export interface RuntimeConfig {
 	clockSkewSeconds: number;
 	javaMcpBaseUrl: string;
 	javaMcpToken: string;
+	javaGatewayBaseUrl: string;
+	manageConsoleDirectory: string;
 	mcpTimeoutMs: number;
 	modelProvider: string;
 	modelId: string;
@@ -48,6 +51,17 @@ function trimTrailingSlash(value: string): string {
 	return value.replace(/\/+$/u, "");
 }
 
+function resolveKeyFile(
+	value: string | undefined,
+	environment: NodeJS.ProcessEnv,
+	workingDirectory: string,
+): string | undefined {
+	if (!value?.trim()) return undefined;
+	if (isAbsolute(value)) return value;
+	// 旧运行时把相对密钥路径写在 APP_ENV_FILE 中；迁移后仍以该配置文件所在目录为基准。
+	return resolve(environment.APP_ENV_FILE ? dirname(resolve(environment.APP_ENV_FILE)) : workingDirectory, value);
+}
+
 /**
  * 复用旧 Python Runtime 的 APP_ENV_FILE 约定，避免部署时维护两套密钥配置。
  */
@@ -58,6 +72,8 @@ export function loadRuntimeEnvironment(environment: NodeJS.ProcessEnv = process.
 
 export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env): RuntimeConfig {
 	const workingDirectory = resolve(environment.PI_RUNTIME_CWD ?? process.cwd());
+	const runtimeDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+	const javaMcpBaseUrl = trimTrailingSlash(requiredEnvironment("MCP_BASE_URL", environment));
 	return {
 		port: parsePort(environment.PI_RUNTIME_PORT),
 		workingDirectory,
@@ -69,13 +85,19 @@ export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env):
 			environment.AI_GATEWAY_CLOCK_SKEW_SECONDS,
 			30,
 		),
-		javaMcpBaseUrl: trimTrailingSlash(requiredEnvironment("MCP_BASE_URL", environment)),
+		javaMcpBaseUrl,
 		javaMcpToken: requiredEnvironment("MCP_API_TOKEN", environment),
+		javaGatewayBaseUrl: trimTrailingSlash(
+			environment.JAVA_GATEWAY_BASE_URL?.trim() || javaMcpBaseUrl.replace(/\/ai\/mcp$/u, ""),
+		),
+		manageConsoleDirectory: resolve(
+			environment.PI_RUNTIME_MANAGE_CONSOLE_DIR ?? resolve(runtimeDirectory, "static/manage-console"),
+		),
 		mcpTimeoutMs: parsePositiveNumber("MCP_TIMEOUT_SECONDS", environment.MCP_TIMEOUT_SECONDS, 10) * 1000,
 		modelProvider: environment.PI_RUNTIME_MODEL_PROVIDER?.trim() || "dashscope",
 		modelId: environment.QWEN_MODEL?.trim() || "qwen3.7-plus",
 		qwenApiKey: environment.QWEN_API_KEY?.trim() || undefined,
-		qwenApiKeyFile: environment.QWEN_API_KEY_FILE?.trim() || undefined,
+		qwenApiKeyFile: resolveKeyFile(environment.QWEN_API_KEY_FILE, environment, workingDirectory),
 		qwenApiBase: environment.QWEN_API_BASE?.trim() || "https://dashscope.aliyuncs.com/compatible-mode/v1",
 	};
 }
