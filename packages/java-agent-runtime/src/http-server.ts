@@ -118,6 +118,7 @@ async function readJsonBody(request: IncomingMessage): Promise<{ query: string }
 }
 
 function writeJson(response: ServerResponse, statusCode: number, body: unknown): void {
+	if (response.destroyed || response.writableEnded) return;
 	response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
 	response.end(JSON.stringify(body));
 }
@@ -127,6 +128,7 @@ function acceptsEventStream(request: IncomingMessage): boolean {
 }
 
 function writeSse(response: ServerResponse, event: string, data: Record<string, unknown>): void {
+	if (response.destroyed || response.writableEnded) return;
 	response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
@@ -174,17 +176,27 @@ async function streamConversation(
 		},
 		conversationId,
 	);
+	let clientDisconnected = false;
+	const abortOnClose = () => {
+		clientDisconnected = true;
+		started.abort();
+	};
+	response.once("close", abortOnClose);
 	writeSse(response, "conversation_started", { conversation_id: started.conversationId });
 	try {
 		const result = await started.result;
 		writeSse(response, "final", { conversation_id: result.conversationId, answer: result.response });
 	} catch (error) {
-		writeSse(response, "conversation_failed", {
-			conversation_id: started.conversationId,
-			detail: error instanceof Error ? error.message : "Pi runtime failed",
-		});
+		if (!clientDisconnected) {
+			writeSse(response, "conversation_failed", {
+				conversation_id: started.conversationId,
+				detail: error instanceof Error ? error.message : "Pi runtime failed",
+			});
+		}
+	} finally {
+		response.off("close", abortOnClose);
+		if (!clientDisconnected) response.end();
 	}
-	response.end();
 }
 
 async function readJsonObject(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -239,14 +251,27 @@ async function proxyJava(
 	const requestBody = Buffer.concat(chunks);
 	// GET/HEAD 不允许携带 body；浏览器管理台读取会话时也会走这条通用代理。
 	const accept = getHeader(request, "accept");
-	const upstream = await management.proxyJava(
-		method,
-		`${url.pathname}${url.search}`,
-		authorization,
-		requestBody.length > 0 && method !== "GET" && method !== "HEAD" ? requestBody : undefined,
-		accept,
-	);
-	if (accept?.toLowerCase().includes("text/event-stream") && upstream.body) {
+	const eventStream = accept?.toLowerCase().includes("text/event-stream") ?? false;
+	const abortController = eventStream ? new AbortController() : undefined;
+	const abortUpstream = () => abortController?.abort();
+	if (eventStream) response.once("close", abortUpstream);
+	try {
+		const upstream = await management.proxyJava(
+			method,
+			`${url.pathname}${url.search}`,
+			authorization,
+			requestBody.length > 0 && method !== "GET" && method !== "HEAD" ? requestBody : undefined,
+			accept,
+			abortController?.signal,
+		);
+		if (!eventStream || !upstream.body) {
+			const body = Buffer.from(await upstream.arrayBuffer());
+			response.writeHead(upstream.status, {
+				"Content-Type": upstream.headers.get("content-type") ?? "application/json",
+			});
+			response.end(body);
+			return;
+		}
 		response.writeHead(upstream.status, {
 			"Content-Type": upstream.headers.get("content-type") ?? "text/event-stream; charset=utf-8",
 			"Cache-Control": upstream.headers.get("cache-control") ?? "no-cache",
@@ -257,17 +282,17 @@ async function proxyJava(
 			while (true) {
 				const next = await reader.read();
 				if (next.done) break;
+				if (response.destroyed) break;
 				response.write(next.value);
 			}
 		} finally {
+			if (response.destroyed) await reader.cancel();
 			reader.releaseLock();
 		}
-		response.end();
-		return;
+		if (!response.destroyed) response.end();
+	} finally {
+		if (eventStream) response.off("close", abortUpstream);
 	}
-	const body = Buffer.from(await upstream.arrayBuffer());
-	response.writeHead(upstream.status, { "Content-Type": upstream.headers.get("content-type") ?? "application/json" });
-	response.end(body);
 }
 
 export function createHttpServer(runtime: PiConversationRuntime, config: RuntimeConfig): Server {

@@ -31,6 +31,7 @@ export type ConversationEventListener = (event: AgentSessionEvent) => void;
 export interface StartedConversation {
 	conversationId: string;
 	result: Promise<ConversationResponse>;
+	abort: () => void;
 }
 
 export class ConversationNotFoundError extends Error {
@@ -44,6 +45,12 @@ export class ConversationNotFoundError extends Error {
 export class ConversationAccessDeniedError extends Error {
 	constructor() {
 		super("conversation access denied");
+	}
+}
+
+export class ConversationAbortedError extends Error {
+	constructor() {
+		super("conversation aborted");
 	}
 }
 
@@ -118,9 +125,11 @@ export class PiConversationRuntime {
 	): StartedConversation {
 		const conversationId = create ? randomUUID().replaceAll("-", "") : existingConversationId;
 		if (!conversationId) throw new ConversationNotFoundError("");
+		const abortController = new AbortController();
 		return {
 			conversationId,
-			result: this.runConversation(conversationId, caller, query, create, onEvent),
+			result: this.runConversation(conversationId, caller, query, create, onEvent, abortController.signal),
+			abort: () => abortController.abort(),
 		};
 	}
 
@@ -130,6 +139,7 @@ export class PiConversationRuntime {
 		query: string,
 		create: boolean,
 		onEvent?: ConversationEventListener,
+		signal?: AbortSignal,
 	): Promise<ConversationResponse> {
 		let release: (() => void) | undefined;
 		const previous = this.conversationQueues.get(conversationId) ?? Promise.resolve();
@@ -139,11 +149,15 @@ export class PiConversationRuntime {
 		const queued = previous.then(() => current);
 		this.conversationQueues.set(conversationId, queued);
 		await previous;
+		if (signal?.aborted) throw new ConversationAbortedError();
 
 		try {
 			const session = await this.openSession(conversationId, caller, create);
+			const abortSession = () => void session.abort();
+			signal?.addEventListener("abort", abortSession, { once: true });
 			const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
 			try {
+				if (signal?.aborted) throw new ConversationAbortedError();
 				await session.prompt(query, { source: "rpc" });
 				const response = lastAssistantText(session);
 				const assistant = session.messages.at(-1);
@@ -151,6 +165,7 @@ export class PiConversationRuntime {
 				return { conversationId, response };
 			} finally {
 				unsubscribe?.();
+				signal?.removeEventListener("abort", abortSession);
 				session.dispose();
 			}
 		} finally {

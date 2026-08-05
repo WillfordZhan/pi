@@ -394,6 +394,7 @@ export class PiManagementService {
 		authorization: string,
 		body?: Buffer,
 		accept?: string,
+		signal?: AbortSignal,
 	): Promise<Response> {
 		const headers: Record<string, string> = { "Content-Type": "application/json" };
 		if (authorization) headers.Authorization = authorization;
@@ -401,6 +402,7 @@ export class PiManagementService {
 		const request: RequestInit = {
 			method,
 			headers,
+			signal,
 		};
 		if (body && method !== "GET" && method !== "HEAD") request.body = body;
 		return fetch(`${this.config.javaGatewayBaseUrl}${path}`, request);
