@@ -44,6 +44,7 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
   const [liveOutputMode, setLiveOutputMode] = useState<RequestOutputMode>("sse");
   const [liveActiveOutputMode, setLiveActiveOutputMode] = useState<EffectiveOutputMode>("sse");
   const [liveStreamingAnswer, setLiveStreamingAnswer] = useState("");
+  const [livePendingUserMessage, setLivePendingUserMessage] = useState("");
 
   async function handleLivePrimaryAction() {
     const query = liveInput.trim();
@@ -53,6 +54,8 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
     setLivePollStatus("connecting");
     setLiveActiveOutputMode(liveOutputMode);
     setLiveStreamingAnswer("");
+    // Pi 的持久化消息要等本轮结束后才能重新投影；先展示本次输入，避免用户误以为 Enter 未发送。
+    setLivePendingUserMessage(query);
     try {
       if (liveOutputMode === "sse") {
         await runSse(query);
@@ -65,6 +68,8 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
       setLivePollStatus("error");
       message.error(`发送失败: ${String(error)}`);
     } finally {
+      // 无论成功还是失败，临时消息都由下一次 timeline 投影或错误状态收口，不能遗留到下一轮。
+      setLivePendingUserMessage("");
       setLiveActionLoading(false);
     }
   }
@@ -98,14 +103,17 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
             failureMessage = String(event.data?.detail || "Pi 会话执行失败");
             return;
           }
-          void handleSseEvent(event, conversationId);
+          handleSseEvent(event);
         },
       }
     );
     if (failureMessage) throw new Error(failureMessage);
+    // 以 SSE EOF 作为本轮结束信号：即使中间 final 事件被代理层截断，Pi 已落盘的消息也能回显。
+    if (streamedConversationId) await refreshLiveTimeline(streamedConversationId, true);
+    setLiveStreamingAnswer("");
   }
 
-  async function handleSseEvent(event: SseConversationEvent, conversationId: string) {
+  function handleSseEvent(event: SseConversationEvent) {
     if (event.event === "answer_delta") {
       const delta = typeof event.data?.delta === "string" ? event.data.delta : "";
       if (delta) setLiveStreamingAnswer((current) => current + delta);
@@ -114,8 +122,6 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
     if (event.event === "final") {
       const answer = typeof event.data?.answer === "string" ? event.data.answer : "";
       if (answer) setLiveStreamingAnswer(answer);
-      if (conversationId) await refreshLiveTimeline(conversationId, true);
-      setLiveStreamingAnswer("");
       return;
     }
   }
@@ -135,10 +141,11 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
       setLiveConversationId("");
       setLiveInput("");
       setLiveStreamingAnswer("");
+      setLivePendingUserMessage("");
       setLivePollStatus("idle");
     },
     handleLivePrimaryAction,
-    buildPreviewMessages: (messages) => buildLivePreviewMessages(messages, liveStreamingAnswer, liveActionLoading),
+    buildPreviewMessages: (messages) => buildLivePreviewMessages(messages, livePendingUserMessage, liveStreamingAnswer, liveActionLoading),
   };
 }
 
@@ -148,14 +155,27 @@ export function resolveEffectiveOutputMode(outputMode: RequestOutputMode): Effec
 
 export function buildLivePreviewMessages(
   liveMessages: TimelineMessage[],
+  livePendingUserMessage: string,
   liveStreamingAnswer: string,
   liveAwaitingTerminal: boolean
 ): TimelineMessage[] {
-  if (!liveAwaitingTerminal && !liveStreamingAnswer) return liveMessages;
+  if (!liveAwaitingTerminal && !livePendingUserMessage && !liveStreamingAnswer) return liveMessages;
   const lastMessage = liveMessages[liveMessages.length - 1];
   const turnIndex = lastMessage?.role === "user" ? lastMessage.turn_index : (lastMessage?.turn_index || 0) + 1;
   return [
     ...liveMessages,
+    ...(livePendingUserMessage
+      ? [
+          {
+            message_id: -1,
+            turn_index: turnIndex || 1,
+            role: "user" as const,
+            content: livePendingUserMessage,
+            created_at: "sending",
+            status: "sending",
+          },
+        ]
+      : []),
     {
       message_id: -1,
       turn_index: turnIndex || 1,
