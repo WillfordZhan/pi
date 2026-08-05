@@ -16,6 +16,7 @@ export class ManagementRequestError extends Error {
 
 type GatewayContext = { tenantId: string; userId: string };
 type SessionEvent = Record<string, unknown>;
+type SessionOwner = GatewayContext & { updatedAt: Date };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -117,6 +118,38 @@ function normalizeDept(raw: unknown, currentDeptId?: string): Record<string, unk
 	return { deptId, deptName: String(raw.deptName ?? ""), current: deptId === currentDeptId };
 }
 
+/**
+ * Pi 的会话真相源是 JSONL，用户列表必须由 JSONL 的创建人范围汇总，不能回查旧 Runtime 的会话表。
+ * 用户资料尚未写入 JSONL 时以 userId 作为稳定展示名，避免为了显示昵称重新引入旧存储依赖。
+ */
+export function aggregateSessionUsers(
+	owners: readonly SessionOwner[],
+	deptId: string,
+	keyword: string,
+): Record<string, unknown>[] {
+	const users = new Map<string, { conversationCount: number; lastConversationAt: Date }>();
+	for (const owner of owners) {
+		if (owner.tenantId !== deptId) continue;
+		const current = users.get(owner.userId);
+		users.set(owner.userId, {
+			conversationCount: (current?.conversationCount ?? 0) + 1,
+			lastConversationAt:
+				current && current.lastConversationAt > owner.updatedAt ? current.lastConversationAt : owner.updatedAt,
+		});
+	}
+	const normalizedKeyword = keyword.trim().toLowerCase();
+	return [...users.entries()]
+		.map(([userId, summary]) => ({
+			userId,
+			username: userId,
+			deptId,
+			conversationCount: summary.conversationCount,
+			lastConversationAt: summary.lastConversationAt.toISOString(),
+		}))
+		.filter((item) => !normalizedKeyword || item.userId.toLowerCase().includes(normalizedKeyword))
+		.sort((left, right) => right.lastConversationAt.localeCompare(left.lastConversationAt));
+}
+
 export class PiManagementService {
 	private readonly mcp: JavaMcpClient;
 	private readonly config: RuntimeConfig;
@@ -181,13 +214,18 @@ export class PiManagementService {
 		await this.currentUser(authorization);
 		const deptId = String(value(payload, "deptId", "dept_id") ?? "").trim();
 		if (!deptId) throw new ManagementRequestError(400, "dept_id is required");
-		const response = await this.javaJson("POST", "/ai/management/support/users/search", authorization, {
-			deptId,
-			keyword: value(payload, "keyword", "keyword") ?? undefined,
-			pageNum: value(payload, "pageNum", "page_num") ?? 1,
-			pageSize: value(payload, "pageSize", "page_size") ?? 20,
+		const pageNum = Math.max(1, Number(value(payload, "pageNum", "page_num") ?? 1) || 1);
+		const pageSize = Math.min(100, Math.max(1, Number(value(payload, "pageSize", "page_size") ?? 20) || 20));
+		const keyword = String(value(payload, "keyword", "keyword") ?? "");
+		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
+		const owners = sessions.flatMap((session) => {
+			const manager = SessionManager.open(session.path, this.config.sessionDirectory, this.config.workingDirectory);
+			const context = sessionContext(manager.getEntries());
+			return context ? [{ ...context, updatedAt: session.modified }] : [];
 		});
-		return isRecord(response.data) ? response.data : { total: 0, pageNum: 1, pageSize: 20, items: [] };
+		const items = aggregateSessionUsers(owners, deptId, keyword);
+		const offset = (pageNum - 1) * pageSize;
+		return { total: items.length, pageNum, pageSize, items: items.slice(offset, offset + pageSize) };
 	}
 
 	async searchConversations(
