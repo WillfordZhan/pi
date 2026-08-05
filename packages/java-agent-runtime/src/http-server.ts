@@ -5,6 +5,7 @@
  * 不能在这里加入 Agent 编排或业务 Tool 规则。
  */
 
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { RuntimeConfig } from "./config.ts";
 import type { JavaMcpCallerContext } from "./java-mcp.ts";
@@ -33,11 +34,20 @@ function requireGatewayToken(request: IncomingMessage, config: RuntimeConfig): v
 	}
 }
 
-function parseCallerContext(request: IncomingMessage): JavaMcpCallerContext {
+function parseCallerContext(request: IncomingMessage, config: RuntimeConfig): JavaMcpCallerContext {
 	const rawContext = getHeader(request, "x-ai-biz-context");
 	if (!rawContext) throw new HttpRequestError(401, "missing business context");
 	const parts = rawContext.split(".");
 	if (parts.length !== 3 || parts[0] !== "v1") throw new HttpRequestError(401, "invalid business context");
+	const expectedSignature = createHmac("sha256", config.contextSignSecret).update(parts[1]).digest("base64url");
+	const actualSignature = Buffer.from(parts[2]);
+	const expectedSignatureBuffer = Buffer.from(expectedSignature);
+	if (
+		actualSignature.length !== expectedSignatureBuffer.length ||
+		!timingSafeEqual(actualSignature, expectedSignatureBuffer)
+	) {
+		throw new HttpRequestError(401, "invalid business context signature");
+	}
 
 	let payload: unknown;
 	try {
@@ -53,7 +63,12 @@ function parseCallerContext(request: IncomingMessage): JavaMcpCallerContext {
 	const rawUserId = data.userId;
 	const userId = typeof rawUserId === "string" ? Number(rawUserId) : typeof rawUserId === "number" ? rawUserId : NaN;
 	const expiresAt = typeof data.exp === "number" ? data.exp : 0;
-	if (!tenantId || !Number.isSafeInteger(userId) || userId < 1 || expiresAt <= Math.floor(Date.now() / 1000)) {
+	if (
+		!tenantId ||
+		!Number.isSafeInteger(userId) ||
+		userId < 1 ||
+		expiresAt + config.clockSkewSeconds <= Math.floor(Date.now() / 1000)
+	) {
 		throw new HttpRequestError(401, "invalid or expired business context");
 	}
 	return { tenantId, userId };
@@ -95,7 +110,7 @@ export function createHttpServer(runtime: PiConversationRuntime, config: Runtime
 				return;
 			}
 			requireGatewayToken(request, config);
-			const caller = parseCallerContext(request);
+			const caller = parseCallerContext(request, config);
 			const url = new URL(request.url ?? "/", "http://pi-runtime.local");
 			if (request.method === "POST" && url.pathname === "/ai/conversations") {
 				const { query } = await readJsonBody(request);

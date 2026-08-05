@@ -1,9 +1,10 @@
 /** Java Agent Runtime 进程入口。 */
 
-import { loadRuntimeConfig } from "./config.ts";
+import { loadRuntimeConfig, loadRuntimeEnvironment } from "./config.ts";
 import { createHttpServer } from "./http-server.ts";
 import { PiConversationRuntime } from "./runtime.ts";
 
+loadRuntimeEnvironment();
 const config = loadRuntimeConfig();
 const runtime = await PiConversationRuntime.create(config);
 const server = createHttpServer(runtime, config);

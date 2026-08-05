@@ -14,7 +14,7 @@ describe("JavaMcpClient", () => {
 		const server = createServer(async (request, response) => {
 			let body = "";
 			for await (const chunk of request) body += chunk;
-			if (request.url === "/ai/mcp/tools/list") {
+			if (request.url === "/tools/list") {
 				response.end(
 					JSON.stringify({
 						code: 200,
@@ -36,7 +36,9 @@ describe("JavaMcpClient", () => {
 				return;
 			}
 			receivedCall = JSON.parse(body) as Record<string, unknown>;
-			response.end(JSON.stringify({ code: 200, data: { ok: true, preview: "found one plan" } }));
+			response.end(
+				JSON.stringify({ code: 200, data: { ok: true, preview: "found one plan", payload: { count: 1 } } }),
+			);
 		});
 		servers.push(server);
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -46,6 +48,7 @@ describe("JavaMcpClient", () => {
 		const client = new JavaMcpClient({
 			baseUrl: `http://127.0.0.1:${address.port}`,
 			internalToken: "mcp-token",
+			timeoutMs: 1000,
 		});
 		const [tool] = await client.createTools({
 			conversationId: "conversation-1",
@@ -54,7 +57,7 @@ describe("JavaMcpClient", () => {
 
 		const result = await tool.execute("tool-call-1", { keyword: "today" }, undefined, undefined, {} as never);
 
-		expect(result.content).toEqual([{ type: "text", text: "found one plan" }]);
+		expect(result.content).toEqual([{ type: "text", text: '{"preview":"found one plan","payload":{"count":1}}' }]);
 		expect(receivedCall).toMatchObject({
 			conversationId: "conversation-1",
 			toolCallId: "tool-call-1",

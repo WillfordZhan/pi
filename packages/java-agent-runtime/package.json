@@ -21,6 +21,7 @@
 	],
 	"scripts": {
 		"build": "tsgo -p tsconfig.build.json",
+		"start": "node dist/main.js",
 		"test": "vitest --run"
 	},
 	"dependencies": {

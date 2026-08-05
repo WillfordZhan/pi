@@ -6,6 +6,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { type Api, contentText, type Model } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
@@ -52,11 +53,15 @@ export class PiConversationRuntime {
 		this.javaMcp = new JavaMcpClient({
 			baseUrl: config.javaMcpBaseUrl,
 			internalToken: config.javaMcpToken,
+			timeoutMs: config.mcpTimeoutMs,
 		});
 	}
 
 	static async create(config: RuntimeConfig): Promise<PiConversationRuntime> {
 		const modelRuntime = await ModelRuntime.create({ modelsPath: null });
+		const apiKey = resolveQwenApiKey(config);
+		registerQwenProvider(modelRuntime, config, apiKey);
+		if (apiKey) await modelRuntime.setRuntimeApiKey(config.modelProvider, apiKey, { allowNetwork: false });
 		const model = modelRuntime.getModel(config.modelProvider, config.modelId);
 		if (!model) {
 			throw new Error(`Pi model is not registered: ${config.modelProvider}/${config.modelId}`);
@@ -135,4 +140,43 @@ export class PiConversationRuntime {
 		if (!target) throw new ConversationNotFoundError(conversationId);
 		return SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
 	}
+}
+
+/** 兼容旧 QWEN_API_KEY_FILE，优先使用直接注入的密钥。 */
+function resolveQwenApiKey(config: RuntimeConfig): string | undefined {
+	if (config.qwenApiKey) return config.qwenApiKey;
+	if (!config.qwenApiKeyFile) return undefined;
+	return readFileSync(config.qwenApiKeyFile, "utf8").trim() || undefined;
+}
+
+/**
+ * 旧 Runtime 使用 DashScope OpenAI 兼容接口；在 Pi Runtime 内注册为标准 Provider，
+ * 仅替换 Agent Runtime，不改变现有 Qwen 密钥和模型配置语义。
+ */
+function registerQwenProvider(modelRuntime: ModelRuntime, config: RuntimeConfig, apiKey: string | undefined): void {
+	modelRuntime.registerProvider(config.modelProvider, {
+		name: "DashScope",
+		baseUrl: config.qwenApiBase,
+		apiKey,
+		api: "openai-completions",
+		authHeader: true,
+		models: [
+			{
+				id: config.modelId,
+				name: config.modelId,
+				api: "openai-completions",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_000_000,
+				maxTokens: 65_536,
+				compat: {
+					thinkingFormat: "qwen",
+					supportsDeveloperRole: false,
+					supportsStore: false,
+					supportsReasoningEffort: false,
+				},
+			},
+		],
+	});
 }

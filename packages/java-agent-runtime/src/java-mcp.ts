@@ -39,6 +39,7 @@ interface JavaMcpCallPayload {
 export interface JavaMcpClientOptions {
 	baseUrl: string;
 	internalToken: string;
+	timeoutMs: number;
 	fetchImpl?: typeof fetch;
 }
 
@@ -67,24 +68,27 @@ function formatToolResult(payload: JavaMcpCallPayload): string {
 	if (payload.ok === false) {
 		return `Java tool failed${payload.errorCode ? ` (${payload.errorCode})` : ""}: ${payload.message ?? "unknown error"}`;
 	}
+	// preview 只适合人读，payload 才是模型继续推理所需的结构化业务结果。
+	if (payload.payload !== undefined) return JSON.stringify({ preview: payload.preview, payload: payload.payload });
 	if (payload.preview) return payload.preview;
-	if (payload.payload !== undefined) return JSON.stringify(payload.payload);
 	return payload.message ?? "Java tool completed without a result";
 }
 
 export class JavaMcpClient {
 	private readonly baseUrl: string;
 	private readonly internalToken: string;
+	private readonly timeoutMs: number;
 	private readonly fetchImpl: typeof fetch;
 
 	constructor(options: JavaMcpClientOptions) {
 		this.baseUrl = options.baseUrl;
 		this.internalToken = options.internalToken;
+		this.timeoutMs = options.timeoutMs;
 		this.fetchImpl = options.fetchImpl ?? fetch;
 	}
 
 	async createTools(options: CreateJavaMcpToolsOptions): Promise<ToolDefinition[]> {
-		const response = await this.post<JavaMcpListPayload>("/ai/mcp/tools/list", {});
+		const response = await this.post<JavaMcpListPayload>("/tools/list", {});
 		return (response.tools ?? [])
 			.filter((tool) => tool.name.trim().length > 0)
 			.map((tool) => this.toPiTool(tool, options));
@@ -127,10 +131,11 @@ export class JavaMcpClient {
 		},
 		signal: AbortSignal | undefined,
 	): Promise<JavaMcpCallPayload> {
-		return this.post<JavaMcpCallPayload>("/ai/mcp/tools/call", body, signal);
+		return this.post<JavaMcpCallPayload>("/tools/call", body, signal);
 	}
 
 	private async post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+		const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
 		const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
 			method: "POST",
 			headers: {
@@ -138,7 +143,7 @@ export class JavaMcpClient {
 				"X-AI-MCP-TOKEN": this.internalToken,
 			},
 			body: JSON.stringify(body),
-			signal,
+			signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
 		});
 		const raw = await response.text();
 		let envelope: JavaMcpEnvelope<T>;
