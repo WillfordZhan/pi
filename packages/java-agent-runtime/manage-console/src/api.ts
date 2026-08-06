@@ -1,8 +1,29 @@
 export const AUTH_STORAGE_KEY = "ai-chat.authorization";
+// Pi 管理台不复用旧 Python 页面的后端地址，避免浏览器残留配置绕过 Pi 同源代理。
+export const API_BASE_URL_STORAGE_KEY = "pi-manage.api-base-url";
 
 import type { SseConversationEvent } from "./types";
 
-// 模块说明：统一管理 Pi 管理台的同源 HTTP/SSE 传输层，所有请求均由 Pi 网关处理。
+// 模块说明：统一管理管理台的 HTTP/SSE 传输层，包括鉴权头注入、后端基址解析、
+// 以及运行时可切换的 apiBaseUrl 配置，避免页面组件各自硬编码环境地址。
+
+type ManageConsoleRuntimeConfig = {
+  apiBaseUrl?: string;
+};
+
+declare global {
+  interface ImportMetaEnv {
+    readonly VITE_API_BASE_URL?: string;
+  }
+
+  interface ImportMeta {
+    readonly env: ImportMetaEnv;
+  }
+
+  interface Window {
+    __AI_MANAGE_CONFIG__?: ManageConsoleRuntimeConfig;
+  }
+}
 
 export type SearchPayload = {
   page_num: number;
@@ -37,8 +58,72 @@ export class ApiRequestError extends Error {
   }
 }
 
+let locationBootstrapDone = false;
+
+export function bootstrapApiBaseUrlFromLocation(): string {
+  if (locationBootstrapDone) {
+    return getApiBaseUrl();
+  }
+  locationBootstrapDone = true;
+
+  // 允许在前后端分离部署时通过 URL 临时覆盖后端地址，方便测试环境直接切换。
+  // 一旦识别到 apiBaseUrl，就持久化到 localStorage，并从地址栏清掉，避免后续刷新丢失。
+  const currentUrl = new URL(window.location.href);
+  const queryValue = currentUrl.searchParams.get("apiBaseUrl");
+  if (queryValue !== null) {
+    const normalized = setApiBaseUrl(queryValue);
+    currentUrl.searchParams.delete("apiBaseUrl");
+    window.history.replaceState({}, "", `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`);
+    return normalized;
+  }
+
+  return getApiBaseUrl();
+}
+
+export function getApiBaseUrl(): string {
+  // 优先级：
+  // 1. 用户在当前浏览器手工配置并持久化的值
+  // 2. 页面部署时注入的 runtime config
+  // 3. Vite 构建期 env
+  // 4. 空字符串（表示继续走当前页面同域）
+  const stored = normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_URL_STORAGE_KEY) || "");
+  if (stored) {
+    return stored;
+  }
+  const runtime = normalizeApiBaseUrl(window.__AI_MANAGE_CONFIG__?.apiBaseUrl || "");
+  if (runtime) {
+    return runtime;
+  }
+  return normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL || "");
+}
+
+export function setApiBaseUrl(value: string): string {
+  const normalized = normalizeApiBaseUrl(value);
+  if (normalized) {
+    window.localStorage.setItem(API_BASE_URL_STORAGE_KEY, normalized);
+  } else {
+    window.localStorage.removeItem(API_BASE_URL_STORAGE_KEY);
+  }
+  return normalized;
+}
+
+export function describeApiBaseUrl(value: string): string {
+  return value || "当前页面同域";
+}
+
 export function resolveApiUrl(path: string): string {
-  return path.startsWith("/") ? path : `/${path}`;
+  if (!path.trim()) {
+    return path;
+  }
+  if (isAbsoluteUrl(path)) {
+    return path;
+  }
+  const baseUrl = getApiBaseUrl();
+  if (!baseUrl) {
+    return path;
+  }
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${baseUrl}${normalizedPath}`;
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -290,4 +375,16 @@ function readPayloadMessage(payload: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeApiBaseUrl(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) {
+    return "";
+  }
+  return normalized.replace(/\/+$/, "");
+}
+
+function isAbsoluteUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value.trim());
 }
