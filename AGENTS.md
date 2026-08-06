@@ -6,8 +6,19 @@
 - No emojis in commits, issues, PR comments, or code
 - No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!")
 - Technical prose only, be direct
+- Assume the user is unfamiliar with frontend development and this codebase. When discussing changes, explain the relevant code and end-to-end logic flow in clear, accessible language.
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
+
+## Project Direction
+
+- PI is the project foundation. The primary focus is the Java Runtime layer, which connects to the ERP system.
+- The long-term product goal is to build an ERP digital employee on top of PI. Treat this as the baseline architectural consensus when discussing or implementing changes.
+
+## 语言与注释
+
+- `AGENTS.md`、各类项目文档和规格说明（spec）均使用中文。
+- 代码注释使用中文。新增或修改代码时，必须补充详尽、说明设计意图、关键流程、边界条件与维护注意事项的中文注释。
 
 ## Code Quality
 

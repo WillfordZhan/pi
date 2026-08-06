@@ -193,8 +193,14 @@ export class PiConversationRuntime {
 				if (!promptFailure && assistant?.role === "assistant" && assistant.errorMessage) {
 					promptFailure = new Error(assistant.errorMessage);
 				}
-				// Pi 已先持久化 JSONL；Java 同步失败时不写 marker，下一次会自动幂等补传。
-				await this.syncConversation(sessionManager, conversationId, caller);
+				// Pi 已先持久化 JSONL；索引异常不能把已完成的回复伪装成一次对话失败。
+				// 不写 marker 后，下一轮或管理台检索会按 Entry ID 幂等补传。
+				try {
+					await this.syncConversation(sessionManager, conversationId, caller);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(`Java conversation index sync failed for ${conversationId}: ${message}`);
+				}
 				if (promptFailure) throw promptFailure;
 				return { conversationId, response };
 			} finally {
@@ -248,7 +254,7 @@ export class PiConversationRuntime {
 		caller: JavaMcpCallerContext,
 	): Promise<void> {
 		const entries = sessionManager.getEntries();
-		await this.javaConversationStore.sync(conversationId, caller, entries);
+		if (!(await this.javaConversationStore.sync(conversationId, caller, entries))) return;
 		sessionManager.appendCustomEntry(
 			JavaConversationStoreClient.syncMarkerType,
 			this.javaConversationStore.markSynced(entries),

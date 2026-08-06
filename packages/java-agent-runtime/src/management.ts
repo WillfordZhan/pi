@@ -3,7 +3,11 @@
 import { contentText } from "../../ai/src/utils/text.ts";
 import { type SessionEntry, SessionManager } from "../../coding-agent/src/core/session-manager.ts";
 import type { RuntimeConfig } from "./config.ts";
-import { JavaConversationStoreClient, JavaConversationStoreError } from "./java-conversation-store.ts";
+import {
+	JavaConversationStoreClient,
+	JavaConversationStoreError,
+	syncPendingConversationEntries,
+} from "./java-conversation-store.ts";
 import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 
 export class ManagementRequestError extends Error {
@@ -30,7 +34,7 @@ function eventSummary(type: string, data: Record<string, unknown>): string {
 	return type;
 }
 
-function projectEntries(entries: SessionEntry[]): SessionEvent[] {
+export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 	const events: SessionEvent[] = [];
 	let turnIndex = 0;
 	for (const entry of entries) {
@@ -260,15 +264,24 @@ export class PiManagementService {
 		if (createdFrom && createdTo && createdFrom > createdTo) {
 			throw new ManagementRequestError(400, "created_from must be before created_to");
 		}
-		return this.conversationStore.searchConversations({
-			pageNum,
-			pageSize,
-			deptId,
-			userId,
-			keyword,
-			createdFrom: createdFrom?.toISOString(),
-			createdTo: createdTo?.toISOString(),
-		});
+		try {
+			// 管理台读 Java 索引前先补偿建表前已落盘的 Pi JSONL；后续无增量时不会产生写请求。
+			await syncPendingConversationEntries(this.config, this.conversationStore);
+			return await this.conversationStore.searchConversations({
+				pageNum,
+				pageSize,
+				deptId,
+				userId,
+				keyword,
+				createdFrom: createdFrom?.toISOString(),
+				createdTo: createdTo?.toISOString(),
+			});
+		} catch (error) {
+			if (error instanceof JavaConversationStoreError) {
+				throw new ManagementRequestError(error.statusCode, error.message);
+			}
+			throw error;
+		}
 	}
 
 	async timeline(authorization: string, conversationId: string): Promise<Record<string, unknown>> {
@@ -390,9 +403,12 @@ export class PiManagementService {
 		body?: Buffer,
 		accept?: string,
 		signal?: AbortSignal,
+		cookie?: string,
 	): Promise<Response> {
 		const headers: Record<string, string> = { "Content-Type": "application/json" };
 		if (authorization) headers.Authorization = authorization;
+		// Java 管理台可能将登录态写入 Cookie；Pi 作为同源反向代理时必须完整转交。
+		if (cookie) headers.Cookie = cookie;
 		if (accept) headers.Accept = accept;
 		const request: RequestInit = {
 			method,

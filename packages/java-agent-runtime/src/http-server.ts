@@ -249,6 +249,7 @@ async function proxyJava(
 	const chunks: Buffer[] = [];
 	for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 	const authorization = getHeader(request, "authorization") ?? "";
+	const cookie = getHeader(request, "cookie");
 	const method = request.method ?? "GET";
 	const requestBody = Buffer.concat(chunks);
 	// GET/HEAD 不允许携带 body；浏览器管理台读取会话时也会走这条通用代理。
@@ -265,12 +266,16 @@ async function proxyJava(
 			requestBody.length > 0 && method !== "GET" && method !== "HEAD" ? requestBody : undefined,
 			accept,
 			abortController?.signal,
+			cookie,
 		);
 		if (!eventStream || !upstream.body) {
 			const body = Buffer.from(await upstream.arrayBuffer());
-			response.writeHead(upstream.status, {
+			const headers: Record<string, string | string[]> = {
 				"Content-Type": upstream.headers.get("content-type") ?? "application/json",
-			});
+			};
+			const setCookies = upstream.headers.getSetCookie();
+			if (setCookies.length) headers["Set-Cookie"] = setCookies;
+			response.writeHead(upstream.status, headers);
 			response.end(body);
 			return;
 		}

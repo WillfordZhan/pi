@@ -56,13 +56,14 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
     setLiveStreamingAnswer("");
     // Pi 的持久化消息要等本轮结束后才能重新投影；先展示本次输入，避免用户误以为 Enter 未发送。
     setLivePendingUserMessage(query);
+    // 输入已经固化为本轮临时 user 消息，发送开始即清空编辑区，允许用户准备下一条内容。
+    setLiveInput("");
     try {
       if (liveOutputMode === "sse") {
         await runSse(query);
       } else {
         await runBlock(query);
       }
-      setLiveInput("");
       setLivePollStatus("idle");
     } catch (error) {
       setLivePollStatus("error");
