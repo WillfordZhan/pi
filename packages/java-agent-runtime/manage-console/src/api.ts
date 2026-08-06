@@ -1,5 +1,5 @@
 export const AUTH_STORAGE_KEY = "ai-chat.authorization";
-// Pi 管理台不复用旧 Python 页面的后端地址，避免浏览器残留配置绕过 Pi 同源代理。
+// 管理台支持独立部署时指定 Pi Runtime 地址，并将用户选择持久化到浏览器本地。
 export const API_BASE_URL_STORAGE_KEY = "pi-manage.api-base-url";
 
 import type { SseConversationEvent } from "./types";
