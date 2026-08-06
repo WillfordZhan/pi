@@ -20,11 +20,12 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "tsgo -p tsconfig.build.json && npm --prefix manage-console run build",
+		"build": "shx rm -rf dist && node ../../node_modules/esbuild/bin/esbuild src/main.ts src/index.ts --bundle --packages=external --platform=node --format=esm --outdir=dist && npm --prefix manage-console run build",
 		"start": "npm run build && APP_ENV_FILE=.env PI_RUNTIME_CWD=../.. node dist/main.js",
 		"test": "vitest --run"
 	},
 	"dependencies": {
+		"@earendil-works/pi-ai": "^0.83.0",
 		"@earendil-works/pi-coding-agent": "^0.83.0"
 	},
 	"devDependencies": {

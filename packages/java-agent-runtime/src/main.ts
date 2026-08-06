@@ -10,5 +10,7 @@ const runtime = await PiConversationRuntime.create(config);
 const server = createHttpServer(runtime, config);
 
 server.listen(config.port, () => {
-	console.info(`Pi Java Agent Runtime listening on port ${config.port}`);
+	const baseUrl = `http://127.0.0.1:${config.port}`;
+	console.info(`Pi API: ${baseUrl}`);
+	console.info(`Management Console: ${baseUrl}/ai/management/console/`);
 });
