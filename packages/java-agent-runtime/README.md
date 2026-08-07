@@ -41,11 +41,13 @@ QWEN_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 Runtime 提供：
 
-- `POST /ai/conversations`，请求体 `{ "query": "..." }`
-- `POST /ai/conversations/{conversationId}/chat`，请求体 `{ "query": "..." }`
+- `POST /ai/conversations`
+- `POST /ai/conversations/{conversationId}/chat`
 - `GET /healthz`
 - `GET /ai/management/console/`，Pi 托管的原管理台页面
 
-两个聊天接口均返回 `{ "conversationId": "...", "response": "..." }`。Java 请求必须携带既有 `X-AI-GW-TOKEN` 与 `X-AI-BIZ-CONTEXT`；Pi 会验证既有 HMAC 上下文签名与有效期，只提取 `tenantId`、`userId` 并在调用 Java MCP Tool 时附带它们。
+两个聊天接口同时接受纯文字 JSON `{ "query": "..." }`，以及包含可选 `query`、最多五个重复 `images` 文件字段的 `multipart/form-data`。单张原图不能超过 10 MiB；仅上传图片时 Runtime 自动使用“请分析这些图片”。图片会先经过 Pi `processImage` 的格式识别、方向处理、缩放与压缩，再与文字共同发送给模型。
+
+两个聊天接口均返回 `{ "conversationId": "...", "response": "..." }`。Java 请求必须携带既有 `X-AI-GW-TOKEN` 与 `X-AI-BIZ-CONTEXT`；Pi 会验证既有 HMAC 上下文签名与有效期，只提取 `tenantId`、`userId` 并在调用 Java MCP Tool 时附带它们。Pi Session JSONL 保留处理后的图片以支持后续追问；Java 管理查询索引只保存图片数量占位，不复制 Base64。
 
 管理台支持 Block 与 SSE：浏览器请求 `/api/ai/**` 经 Java Gateway 回到 Pi；SSE 直接投影 Pi AgentSession 的文本增量和 Tool 生命周期事件。Pi 管理 API 读取同一份 JSONL，投影会话、消息、Tool 调用和结果；不会恢复旧 Python 运行时或事件库。

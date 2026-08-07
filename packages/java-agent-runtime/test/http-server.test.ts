@@ -7,6 +7,8 @@ import { createHttpServer, isPathInsideDirectory, normalizeTenantId, normalizeUs
 import type { PiConversationRuntime } from "../src/runtime.ts";
 
 const servers: Array<ReturnType<typeof createHttpServer>> = [];
+const TINY_PNG_BASE64 =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
 
 afterEach(async () => {
 	await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
@@ -143,5 +145,112 @@ describe("SSE conversation", () => {
 				new Promise<void>((_, reject) => setTimeout(() => reject(new Error("timeout")), 1_000)),
 			]),
 		).resolves.toBeUndefined();
+	});
+});
+
+describe("multipart conversation", () => {
+	it("processes image-only input before handing it to the Pi runtime", async () => {
+		let capturedInput: unknown;
+		const runtime = {
+			createConversation: async (input: unknown) => {
+				capturedInput = input;
+				return { conversationId: "conversation-image", response: "ok" };
+			},
+		} as unknown as PiConversationRuntime;
+		const config: RuntimeConfig = {
+			port: 0,
+			workingDirectory: "/tmp",
+			sessionDirectory: "/tmp",
+			gatewayToken: "gateway-token",
+			contextSignSecret: "context-secret",
+			clockSkewSeconds: 30,
+			javaMcpBaseUrl: "http://127.0.0.1:1/ai/mcp",
+			javaMcpToken: "mcp-token",
+			javaGatewayBaseUrl: "http://127.0.0.1:1",
+			manageConsoleDirectory: "/tmp",
+			mcpTimeoutMs: 1_000,
+			modelProvider: "dashscope",
+			modelId: "qwen3.7-plus",
+			qwenApiBase: "http://127.0.0.1:1",
+		};
+		const server = createHttpServer(runtime, config);
+		servers.push(server);
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const { port } = server.address() as AddressInfo;
+		const contextPayload = Buffer.from(
+			JSON.stringify({ tenantId: "100", userId: "7", exp: Math.floor(Date.now() / 1000) + 60 }),
+		).toString("base64url");
+		const signature = createHmac("sha256", config.contextSignSecret).update(contextPayload).digest("base64url");
+		const formData = new FormData();
+		formData.append("images", new Blob([Buffer.from(TINY_PNG_BASE64, "base64")], { type: "image/png" }), "one.png");
+
+		const response = await fetch(`http://127.0.0.1:${port}/ai/conversations`, {
+			method: "POST",
+			headers: {
+				"X-AI-GW-TOKEN": config.gatewayToken,
+				"X-AI-BIZ-CONTEXT": `v1.${contextPayload}.${signature}`,
+			},
+			body: formData,
+		});
+
+		expect(response.status).toBe(200);
+		expect(capturedInput).toMatchObject({
+			query: "请分析这些图片",
+			images: [{ type: "image", mimeType: "image/png", data: TINY_PNG_BASE64 }],
+		});
+	});
+
+	it("rejects more than five images before starting a conversation", async () => {
+		let started = false;
+		const runtime = {
+			createConversation: async () => {
+				started = true;
+				return { conversationId: "unexpected", response: "unexpected" };
+			},
+		} as unknown as PiConversationRuntime;
+		const config: RuntimeConfig = {
+			port: 0,
+			workingDirectory: "/tmp",
+			sessionDirectory: "/tmp",
+			gatewayToken: "gateway-token",
+			contextSignSecret: "context-secret",
+			clockSkewSeconds: 30,
+			javaMcpBaseUrl: "http://127.0.0.1:1/ai/mcp",
+			javaMcpToken: "mcp-token",
+			javaGatewayBaseUrl: "http://127.0.0.1:1",
+			manageConsoleDirectory: "/tmp",
+			mcpTimeoutMs: 1_000,
+			modelProvider: "dashscope",
+			modelId: "qwen3.7-plus",
+			qwenApiBase: "http://127.0.0.1:1",
+		};
+		const server = createHttpServer(runtime, config);
+		servers.push(server);
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		const { port } = server.address() as AddressInfo;
+		const contextPayload = Buffer.from(
+			JSON.stringify({ tenantId: "100", userId: "7", exp: Math.floor(Date.now() / 1000) + 60 }),
+		).toString("base64url");
+		const signature = createHmac("sha256", config.contextSignSecret).update(contextPayload).digest("base64url");
+		const formData = new FormData();
+		for (let index = 0; index < 6; index += 1) {
+			formData.append(
+				"images",
+				new Blob([Buffer.from(TINY_PNG_BASE64, "base64")], { type: "image/png" }),
+				`${index}.png`,
+			);
+		}
+
+		const response = await fetch(`http://127.0.0.1:${port}/ai/conversations`, {
+			method: "POST",
+			headers: {
+				"X-AI-GW-TOKEN": config.gatewayToken,
+				"X-AI-BIZ-CONTEXT": `v1.${contextPayload}.${signature}`,
+			},
+			body: formData,
+		});
+
+		expect(response.status).toBe(413);
+		expect(started).toBe(false);
 	});
 });

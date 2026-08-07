@@ -26,11 +26,13 @@ import {
 import {
   AppstoreOutlined,
   BulbOutlined,
+  DeleteOutlined,
   LinkOutlined,
   LoginOutlined,
   LogoutOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
+  PaperClipOutlined,
   RadarChartOutlined,
   ReloadOutlined,
 } from "@ant-design/icons";
@@ -67,7 +69,10 @@ import type {
   UserListItem,
   UserSearchResponse,
 } from "./types";
-import { useLiveDebugTransport } from "./useLiveDebugTransport";
+import {
+  MAX_LIVE_IMAGE_COUNT,
+  useLiveDebugTransport,
+} from "./useLiveDebugTransport";
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -575,12 +580,15 @@ export default function App() {
   const {
     liveConversationId,
     liveInput,
+    liveImages,
     liveActionLoading,
     liveAwaitingTerminal,
     livePollStatus,
     liveOutputMode,
     liveActiveOutputMode,
     setLiveInput,
+    addLiveImages,
+    removeLiveImage,
     setLiveOutputMode,
     openLiveConversation,
     resetLiveTransport,
@@ -919,6 +927,7 @@ export default function App() {
                     liveSelectedTurn={liveSelectedTurn}
                     liveSelectedEvent={liveSelectedEvent}
                     liveInput={liveInput}
+                    liveImages={liveImages}
                     liveActionLoading={liveActionLoading}
                     liveAwaitingTerminal={liveAwaitingTerminal}
                     livePollStatus={livePollStatus}
@@ -954,6 +963,8 @@ export default function App() {
                     onRefreshTools={() => void loadToolCatalog()}
                     onNewConversation={resetLivePane}
                     onInputChange={setLiveInput}
+                    onImagesAdd={addLiveImages}
+                    onImageRemove={removeLiveImage}
                     onPrimaryAction={() => void handleLivePrimaryAction()}
                     onSelectAssistantMessage={(item) => {
                       if (liveConversationId && item.turn_index) {
@@ -1111,6 +1122,7 @@ function LiveDebugView({
   liveSelectedTurn,
   liveSelectedEvent,
   liveInput,
+  liveImages,
   liveActionLoading,
   liveAwaitingTerminal,
   livePollStatus,
@@ -1139,6 +1151,8 @@ function LiveDebugView({
   onRefreshTools,
   onNewConversation,
   onInputChange,
+  onImagesAdd,
+  onImageRemove,
   onPrimaryAction,
   onSelectAssistantMessage,
   onSelectLiveEvent,
@@ -1150,6 +1164,7 @@ function LiveDebugView({
   liveSelectedTurn: ReplayTurn | null;
   liveSelectedEvent: EventItem | null;
   liveInput: string;
+  liveImages: File[];
   liveActionLoading: boolean;
   liveAwaitingTerminal: boolean;
   livePollStatus: "idle" | "connecting" | "connected" | "error";
@@ -1178,6 +1193,8 @@ function LiveDebugView({
   onRefreshTools: () => void;
   onNewConversation: () => void;
   onInputChange: (value: string) => void;
+  onImagesAdd: (files: File[]) => void;
+  onImageRemove: (index: number) => void;
   onPrimaryAction: () => void;
   onSelectAssistantMessage: (item: TimelineMessage) => void;
   onSelectLiveEvent: (item: EventItem) => void;
@@ -1425,7 +1442,7 @@ function LiveDebugView({
             <Input.TextArea
               value={liveInput}
               autoSize={{ minRows: 3, maxRows: 5 }}
-              placeholder="请输入问题，Enter 发送，Shift + Enter 换行"
+              placeholder="输入文字或添加图片，Enter 发送，Shift + Enter 换行"
               onChange={(event) => onInputChange(event.target.value)}
               onPressEnter={(event) => {
                 if (event.shiftKey) {
@@ -1435,8 +1452,39 @@ function LiveDebugView({
                 void onPrimaryAction();
               }}
             />
+            {liveImages.length > 0 ? (
+              <div className="live-image-list" aria-label="待发送图片">
+                {liveImages.map((file, index) => (
+                  <LiveImagePreview
+                    key={`${file.name}-${file.lastModified}-${file.size}-${index}`}
+                    file={file}
+                    index={index}
+                    onRemove={onImageRemove}
+                  />
+                ))}
+              </div>
+            ) : null}
             <div className="live-composer-actions">
               <div className="live-composer-controls">
+                <label
+                  className={`live-image-picker ${
+                    liveActionLoading || liveImages.length >= MAX_LIVE_IMAGE_COUNT ? "is-disabled" : ""
+                  }`}
+                >
+                  <PaperClipOutlined />
+                  添加图片 {liveImages.length}/{MAX_LIVE_IMAGE_COUNT}
+                  <input
+                    type="file"
+                    multiple
+                    accept="image/jpeg,image/png,image/gif,image/webp,image/bmp"
+                    disabled={liveActionLoading || liveImages.length >= MAX_LIVE_IMAGE_COUNT}
+                    onChange={(event) => {
+                      onImagesAdd(Array.from(event.target.files || []));
+                      // 清空 input 才能再次选择同一个文件，实际附件状态由 liveImages 单独管理。
+                      event.target.value = "";
+                    }}
+                  />
+                </label>
                 <Select
                   className="live-output-select"
                   size="large"
@@ -1463,6 +1511,47 @@ function LiveDebugView({
       </div>
     </div>
   );
+}
+
+function LiveImagePreview({
+  file,
+  index,
+  onRemove,
+}: {
+  file: File;
+  index: number;
+  onRemove: (index: number) => void;
+}) {
+  const previewUrl = useMemo(() => URL.createObjectURL(file), [file]);
+
+  useEffect(() => {
+    // object URL 只服务浏览器本地预览，附件删除、发送或组件卸载时必须释放内存。
+    return () => URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
+
+  return (
+    <div className="live-image-item">
+      <img src={previewUrl} alt={file.name || `待发送图片 ${index + 1}`} />
+      <div className="live-image-meta">
+        <div className="live-image-name" title={file.name}>
+          {file.name || `图片 ${index + 1}`}
+        </div>
+        <div className="live-image-size">{formatFileSize(file.size)}</div>
+      </div>
+      <Button
+        type="text"
+        danger
+        size="small"
+        icon={<DeleteOutlined />}
+        aria-label={`删除 ${file.name || `图片 ${index + 1}`}`}
+        onClick={() => onRemove(index)}
+      />
+    </div>
+  );
+}
+
+function formatFileSize(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MiB` : `${Math.ceil(bytes / 1024)} KiB`;
 }
 
 function ManagementView({

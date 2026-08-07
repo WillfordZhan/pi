@@ -132,7 +132,8 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   if (authorization && !headers.has("Authorization")) {
     headers.set("Authorization", authorization);
   }
-  if (!headers.has("Content-Type") && init?.body) {
+  // FormData 的 boundary 只能由浏览器生成；手工设置 JSON 类型会让 Java 与 Runtime 无法解析图片字段。
+  if (!headers.has("Content-Type") && init?.body && !(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
   let response: Response;
@@ -172,7 +173,7 @@ export async function apiStream(path: string, init: RequestInit, handler: Stream
   if (authorization && !headers.has("Authorization")) {
     headers.set("Authorization", authorization);
   }
-  if (!headers.has("Content-Type") && init.body) {
+  if (!headers.has("Content-Type") && init.body && !(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
   headers.set("Accept", "text/event-stream");

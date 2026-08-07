@@ -14,6 +14,7 @@
 
 - PI is the project foundation. The primary focus is the Java Runtime layer, which connects to the ERP system.
 - The long-term product goal is to build an ERP digital employee on top of PI. Treat this as the baseline architectural consensus when discussing or implementing changes.
+- Java MCP Server and the AI request-forwarding Gateway are implemented in `/Users/willfordzhan/Desktop/Work/iot-framework-costManagement-mcp-erp-query/atsi-iot/atsi-iot-service/atsi-iot-app`. Investigate this module first for ERP integration, Gateway, tenant/user context, and OSS upload behavior.
 
 ## 语言与注释
 

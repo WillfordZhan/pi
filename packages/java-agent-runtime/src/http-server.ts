@@ -9,12 +9,23 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { extname, join, normalize, relative } from "node:path";
+import { processImage } from "../../coding-agent/src/utils/image-process.ts";
+import { detectSupportedImageMimeType } from "../../coding-agent/src/utils/mime.ts";
 import type { RuntimeConfig } from "./config.ts";
 import type { JavaMcpCallerContext } from "./java-mcp.ts";
 import { ManagementRequestError, PiManagementService } from "./management.ts";
-import { ConversationAccessDeniedError, ConversationNotFoundError, type PiConversationRuntime } from "./runtime.ts";
+import {
+	ConversationAccessDeniedError,
+	type ConversationInput,
+	ConversationNotFoundError,
+	type PiConversationRuntime,
+} from "./runtime.ts";
 
-const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+const MAX_JSON_REQUEST_BODY_BYTES = 1024 * 1024;
+const MAX_CONVERSATION_REQUEST_BODY_BYTES = 52 * 1024 * 1024;
+const MAX_IMAGE_COUNT = 5;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const DEFAULT_IMAGE_QUERY = "请分析这些图片";
 
 class HttpRequestError extends Error {
 	readonly statusCode: number;
@@ -94,18 +105,23 @@ function parseCallerContext(request: IncomingMessage, config: RuntimeConfig): Ja
 	return { tenantId, userId };
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<{ query: string }> {
+/** 所有会进入内存的请求体必须先经过字节上限，避免 Content-Length 缺失时无界缓冲。 */
+async function readRequestBody(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
 	const chunks: Buffer[] = [];
 	let totalBytes = 0;
 	for await (const chunk of request) {
 		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 		totalBytes += buffer.length;
-		if (totalBytes > MAX_REQUEST_BODY_BYTES) throw new HttpRequestError(413, "request body too large");
+		if (totalBytes > maxBytes) throw new HttpRequestError(413, "request body too large");
 		chunks.push(buffer);
 	}
+	return Buffer.concat(chunks);
+}
+
+async function readJsonConversationBody(request: IncomingMessage): Promise<ConversationInput> {
 	let payload: unknown;
 	try {
-		payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		payload = JSON.parse((await readRequestBody(request, MAX_JSON_REQUEST_BODY_BYTES)).toString("utf8"));
 	} catch {
 		throw new HttpRequestError(400, "invalid JSON request body");
 	}
@@ -114,7 +130,73 @@ async function readJsonBody(request: IncomingMessage): Promise<{ query: string }
 	}
 	const query = (payload as Record<string, unknown>).query;
 	if (typeof query !== "string" || !query.trim()) throw new HttpRequestError(400, "query is required");
-	return { query: query.trim() };
+	return { query: query.trim(), images: [] };
+}
+
+function isUploadedFile(value: string | File): value is File {
+	return typeof value !== "string" && typeof value.arrayBuffer === "function";
+}
+
+/**
+ * multipart 只在 Runtime 边界解析一次：Java 负责可信身份，Runtime 负责文件真实性和模型输入。
+ * 任意图片失败都会拒绝整轮，不能让用户误以为模型看到了全部附件。
+ */
+async function readMultipartConversationBody(
+	request: IncomingMessage,
+	contentType: string,
+): Promise<ConversationInput> {
+	const body = await readRequestBody(request, MAX_CONVERSATION_REQUEST_BODY_BYTES);
+	let form: FormData;
+	try {
+		form = await new Request("http://pi-runtime.local/ai/conversations", {
+			method: "POST",
+			headers: { "Content-Type": contentType },
+			body,
+		}).formData();
+	} catch {
+		throw new HttpRequestError(400, "invalid multipart request body");
+	}
+
+	const queryFields = form.getAll("query");
+	if (queryFields.length > 1 || (queryFields[0] !== undefined && typeof queryFields[0] !== "string")) {
+		throw new HttpRequestError(400, "query must be a single text field");
+	}
+	const query = typeof queryFields[0] === "string" ? queryFields[0].trim() : "";
+	const imageFields = form.getAll("images");
+	if (imageFields.length > MAX_IMAGE_COUNT) throw new HttpRequestError(413, "too many images");
+	if (imageFields.some((value) => !isUploadedFile(value))) {
+		throw new HttpRequestError(400, "images must be file fields");
+	}
+	if (!query && imageFields.length === 0) throw new HttpRequestError(400, "query or images is required");
+
+	const images: ConversationInput["images"] = [];
+	const hints: string[] = [];
+	for (const [index, file] of imageFields.entries()) {
+		if (!isUploadedFile(file)) continue;
+		if (file.size === 0) throw new HttpRequestError(400, `image ${index + 1} is empty`);
+		if (file.size > MAX_IMAGE_BYTES) throw new HttpRequestError(413, `image ${index + 1} is too large`);
+		const bytes = new Uint8Array(await file.arrayBuffer());
+		const mimeType = detectSupportedImageMimeType(bytes);
+		if (!mimeType) throw new HttpRequestError(415, `image ${index + 1} format is unsupported`);
+		const processed = await processImage(bytes, mimeType);
+		if (!processed.ok) throw new HttpRequestError(422, `image ${index + 1} could not be processed`);
+		images.push({ type: "image", data: processed.data, mimeType: processed.mimeType });
+		for (const hint of processed.hints) hints.push(`[图片 ${index + 1}] ${hint}`);
+	}
+
+	const effectiveQuery = query || DEFAULT_IMAGE_QUERY;
+	return {
+		query: hints.length > 0 ? `${effectiveQuery}\n\n${hints.join("\n")}` : effectiveQuery,
+		images,
+	};
+}
+
+async function readConversationBody(request: IncomingMessage): Promise<ConversationInput> {
+	const contentType = getHeader(request, "content-type") ?? "";
+	const normalizedContentType = contentType.split(";", 1)[0]?.trim().toLowerCase();
+	if (normalizedContentType === "application/json") return readJsonConversationBody(request);
+	if (normalizedContentType === "multipart/form-data") return readMultipartConversationBody(request, contentType);
+	throw new HttpRequestError(415, "unsupported conversation content type");
 }
 
 function writeJson(response: ServerResponse, statusCode: number, body: unknown): void {
@@ -136,7 +218,7 @@ async function streamConversation(
 	response: ServerResponse,
 	runtime: PiConversationRuntime,
 	caller: JavaMcpCallerContext,
-	query: string,
+	input: ConversationInput,
 	conversationId?: string,
 ): Promise<void> {
 	response.writeHead(200, {
@@ -145,7 +227,7 @@ async function streamConversation(
 		Connection: "keep-alive",
 	});
 	const started = runtime.startConversation(
-		query,
+		input,
 		caller,
 		!conversationId,
 		(event) => {
@@ -200,16 +282,10 @@ async function streamConversation(
 }
 
 async function readJsonObject(request: IncomingMessage): Promise<Record<string, unknown>> {
-	const chunks: Buffer[] = [];
-	let totalBytes = 0;
-	for await (const chunk of request) {
-		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-		totalBytes += buffer.length;
-		if (totalBytes > MAX_REQUEST_BODY_BYTES) throw new HttpRequestError(413, "request body too large");
-		chunks.push(buffer);
-	}
 	try {
-		const payload: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		const payload: unknown = JSON.parse(
+			(await readRequestBody(request, MAX_JSON_REQUEST_BODY_BYTES)).toString("utf8"),
+		);
 		if (typeof payload !== "object" || payload === null || Array.isArray(payload)) throw new Error("not an object");
 		return payload as Record<string, unknown>;
 	} catch {
@@ -246,12 +322,14 @@ async function proxyJava(
 	request: IncomingMessage,
 	url: URL,
 ): Promise<void> {
-	const chunks: Buffer[] = [];
-	for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 	const authorization = getHeader(request, "authorization") ?? "";
 	const cookie = getHeader(request, "cookie");
 	const method = request.method ?? "GET";
-	const requestBody = Buffer.concat(chunks);
+	// /api/ai 会承载最多五张图片；其他 Java 管理代理仍维持 1 MiB 上限，不能因图片能力放宽所有入口。
+	const requestBody = await readRequestBody(
+		request,
+		url.pathname.startsWith("/api/ai") ? MAX_CONVERSATION_REQUEST_BODY_BYTES : MAX_JSON_REQUEST_BODY_BYTES,
+	);
 	// GET/HEAD 不允许携带 body；浏览器管理台读取会话时也会走这条通用代理。
 	const accept = getHeader(request, "accept");
 	const eventStream = accept?.toLowerCase().includes("text/event-stream") ?? false;
@@ -267,6 +345,7 @@ async function proxyJava(
 			accept,
 			abortController?.signal,
 			cookie,
+			getHeader(request, "content-type"),
 		);
 		if (!eventStream || !upstream.body) {
 			const body = Buffer.from(await upstream.arrayBuffer());
@@ -403,23 +482,23 @@ export function createHttpServer(runtime: PiConversationRuntime, config: Runtime
 			requireGatewayToken(request, config);
 			const caller = parseCallerContext(request, config);
 			if (request.method === "POST" && url.pathname === "/ai/conversations") {
-				const { query } = await readJsonBody(request);
+				const input = await readConversationBody(request);
 				if (acceptsEventStream(request)) {
-					await streamConversation(response, runtime, caller, query);
+					await streamConversation(response, runtime, caller, input);
 					return;
 				}
-				const result = await runtime.createConversation(query, caller);
+				const result = await runtime.createConversation(input, caller);
 				writeJson(response, 200, { ...result, conversation_id: result.conversationId, accepted: true });
 				return;
 			}
 			const chatMatch = /^\/ai\/conversations\/([A-Za-z0-9._-]+)\/chat$/u.exec(url.pathname);
 			if (request.method === "POST" && chatMatch) {
-				const { query } = await readJsonBody(request);
+				const input = await readConversationBody(request);
 				if (acceptsEventStream(request)) {
-					await streamConversation(response, runtime, caller, query, chatMatch[1]);
+					await streamConversation(response, runtime, caller, input, chatMatch[1]);
 					return;
 				}
-				const result = await runtime.chat(chatMatch[1], query, caller);
+				const result = await runtime.chat(chatMatch[1], input, caller);
 				writeJson(response, 200, { ...result, conversation_id: result.conversationId, accepted: true });
 				return;
 			}

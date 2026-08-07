@@ -824,6 +824,52 @@ body {
   font-size: 0.75rem;
 }
 
+.live-image-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: 0.5rem;
+  max-height: 9rem;
+  overflow: auto;
+}
+
+.live-image-item {
+  display: grid;
+  grid-template-columns: 3rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem;
+  border: 0.0625rem solid var(--soft-border);
+  border-radius: 0.75rem;
+  background: var(--surface-soft);
+}
+
+.live-image-item img {
+  width: 3rem;
+  height: 3rem;
+  border-radius: 0.5rem;
+  object-fit: cover;
+  background: var(--panel-strong);
+}
+
+.live-image-meta {
+  min-width: 0;
+}
+
+.live-image-name {
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-image-size {
+  margin-top: 0.2rem;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+}
+
 .live-composer-actions {
   display: flex;
   justify-content: flex-end;
@@ -834,7 +880,44 @@ body {
 .live-composer-controls {
   display: flex;
   align-items: center;
+  gap: 0.625rem;
   flex: 0 0 auto;
+}
+
+.live-image-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.5rem;
+  padding: 0 0.875rem;
+  border: 0.0625rem solid var(--soft-border);
+  border-radius: 1.25rem;
+  color: var(--text-main);
+  background: var(--surface-soft);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.live-image-picker:hover,
+.live-image-picker:focus-within {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+}
+
+.live-image-picker.is-disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.live-image-picker input {
+  position: absolute;
+  width: 0.0625rem;
+  height: 0.0625rem;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .live-output-select {

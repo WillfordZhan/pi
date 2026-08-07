@@ -42,6 +42,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Pi JSONL 必须保留图片，模型才能在后续轮次继续引用；Java 表只是管理查询读模型，
+ * 若复制 Base64 会让同一附件占用两份持久化空间，并把时间线查询放大到数十 MiB。
+ */
+function entryForJavaStore(entry: SessionEntry): SessionEntry {
+	if (entry.type !== "message") return entry;
+	const message = entry.message;
+	if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) return entry;
+	const imageCount = message.content.filter((block) => block.type === "image").length;
+	if (imageCount === 0) return entry;
+	return {
+		...entry,
+		message: {
+			...message,
+			content: [
+				...message.content.filter((block) => block.type !== "image"),
+				{ type: "text", text: `[本轮包含 ${imageCount} 张图片，图片内容仅保存在 Pi 会话]` },
+			],
+		},
+	};
+}
+
 function entriesToSync(entries: readonly SessionEntry[]): SessionEntry[] {
 	let lastMarkerIndex = -1;
 	for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -53,7 +75,8 @@ function entriesToSync(entries: readonly SessionEntry[]): SessionEntry[] {
 	}
 	return entries
 		.slice(lastMarkerIndex + 1)
-		.filter((entry) => !(entry.type === "custom" && entry.customType === SYNC_MARKER_TYPE));
+		.filter((entry) => !(entry.type === "custom" && entry.customType === SYNC_MARKER_TYPE))
+		.map(entryForJavaStore);
 }
 
 /**
@@ -69,7 +92,8 @@ function callerFromEntries(entries: readonly SessionEntry[]): JavaMcpCallerConte
 }
 
 /**
- * Pi JSONL 是 AgentSession 的恢复真相；此客户端只复制已落盘的增量 Entry。
+ * Pi JSONL 是 AgentSession 的恢复真相；此客户端复制已落盘的增量 Entry，图片块除外。
+ * 图片只写入轻量文字占位，避免 Java 查询索引保存和返回大段 Base64。
  * 成功后由调用方写入本地 marker，失败时下次会从上一个 marker 自动重放。
  */
 export class JavaConversationStoreClient {

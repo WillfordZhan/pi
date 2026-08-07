@@ -7,7 +7,7 @@
 
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import type { Api, Model } from "../../ai/src/types.ts";
+import type { Api, ImageContent, Model } from "../../ai/src/types.ts";
 import { contentText } from "../../ai/src/utils/text.ts";
 import { getAgentDir } from "../../coding-agent/src/config.ts";
 import type { AgentSession, AgentSessionEvent } from "../../coding-agent/src/core/agent-session.ts";
@@ -23,6 +23,12 @@ import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 export interface ConversationResponse {
 	conversationId: string;
 	response: string;
+}
+
+/** HTTP 层完成安全校验和图片预处理后，Runtime 只接收 Pi 原生多模态输入。 */
+export interface ConversationInput {
+	query: string;
+	images: ImageContent[];
 }
 
 export type ConversationEventListener = (event: AgentSessionEvent) => void;
@@ -120,16 +126,20 @@ export class PiConversationRuntime {
 		return new PiConversationRuntime(config, modelRuntime, model);
 	}
 
-	async createConversation(query: string, caller: JavaMcpCallerContext): Promise<ConversationResponse> {
-		return this.startConversation(query, caller, true).result;
+	async createConversation(input: ConversationInput, caller: JavaMcpCallerContext): Promise<ConversationResponse> {
+		return this.startConversation(input, caller, true).result;
 	}
 
-	async chat(conversationId: string, query: string, caller: JavaMcpCallerContext): Promise<ConversationResponse> {
-		return this.startConversation(query, caller, false, undefined, conversationId).result;
+	async chat(
+		conversationId: string,
+		input: ConversationInput,
+		caller: JavaMcpCallerContext,
+	): Promise<ConversationResponse> {
+		return this.startConversation(input, caller, false, undefined, conversationId).result;
 	}
 
 	startConversation(
-		query: string,
+		input: ConversationInput,
 		caller: JavaMcpCallerContext,
 		create: boolean,
 		onEvent?: ConversationEventListener,
@@ -140,7 +150,7 @@ export class PiConversationRuntime {
 		const abortController = new AbortController();
 		return {
 			conversationId,
-			result: this.runConversation(conversationId, caller, query, create, onEvent, abortController.signal),
+			result: this.runConversation(conversationId, caller, input, create, onEvent, abortController.signal),
 			abort: () => abortController.abort(),
 		};
 	}
@@ -158,7 +168,7 @@ export class PiConversationRuntime {
 	private async runConversation(
 		conversationId: string,
 		caller: JavaMcpCallerContext,
-		query: string,
+		input: ConversationInput,
 		create: boolean,
 		onEvent?: ConversationEventListener,
 		signal?: AbortSignal,
@@ -184,7 +194,12 @@ export class PiConversationRuntime {
 				if (signal?.aborted) throw new ConversationAbortedError();
 				let promptFailure: unknown;
 				try {
-					await session.prompt(query, { source: "rpc" });
+					// 图片已由 HTTP 边界统一完成格式识别和压缩；这里直接使用 Pi 原生 images 参数，
+					// 保证模型调用、会话 JSONL 和后续追问都沿用 AgentSession 的标准消息结构。
+					await session.prompt(input.query, {
+						source: "rpc",
+						images: input.images.length > 0 ? input.images : undefined,
+					});
 				} catch (error) {
 					promptFailure = error;
 				}

@@ -404,8 +404,12 @@ export class PiManagementService {
 		accept?: string,
 		signal?: AbortSignal,
 		cookie?: string,
+		requestContentType?: string,
 	): Promise<Response> {
-		const headers: Record<string, string> = { "Content-Type": "application/json" };
+		const headers: Record<string, string> = {};
+		// 管理台在线调试会携带浏览器生成的 multipart boundary；若在代理层改写 Content-Type，
+		// Java 与 Runtime 都无法重新解析图片字段。普通 JSON 请求没有显式类型时仍沿用原默认值。
+		if (body) headers["Content-Type"] = requestContentType || "application/json";
 		if (authorization) headers.Authorization = authorization;
 		// Java 管理台可能将登录态写入 Cookie；Pi 作为同源反向代理时必须完整转交。
 		if (cookie) headers.Cookie = cookie;
