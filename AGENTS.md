@@ -16,6 +16,11 @@
 - The long-term product goal is to build an ERP digital employee on top of PI. Treat this as the baseline architectural consensus when discussing or implementing changes.
 - Java MCP Server and the AI request-forwarding Gateway are implemented in `/Users/willfordzhan/Desktop/Work/iot-framework-costManagement-mcp-erp-query/atsi-iot/atsi-iot-service/atsi-iot-app`. Investigate this module first for ERP integration, Gateway, tenant/user context, and OSS upload behavior.
 
+## Pi 教学式开发
+
+- 涉及 Pi 或 Java Runtime 的功能讨论、源码分析、功能设计、定制开发、问题诊断或代码评审时，必须使用 `$learn-pi-by-doing`。
+- 定制开发与理解 Pi 同等重要；所有讲解必须基于当前代码事实，并按 Skill 要求选择 B 或 B+C 深度。
+
 ## 语言与注释
 
 - `AGENTS.md`、各类项目文档和规格说明（spec）均使用中文。
