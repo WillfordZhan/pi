@@ -27,6 +27,7 @@ import {
   AppstoreOutlined,
   BulbOutlined,
   DeleteOutlined,
+  AudioOutlined,
   LinkOutlined,
   LoginOutlined,
   LogoutOutlined,
@@ -56,8 +57,6 @@ import type {
   DeptOption,
   EventDetailResponse,
   EventItem,
-  EffectiveOutputMode,
-  RequestOutputMode,
   ReplayTurn,
   SessionPayload,
   TimelineMessage,
@@ -582,14 +581,15 @@ export default function App() {
     liveInput,
     liveImages,
     liveActionLoading,
+    liveRecording,
+    liveRecordingSeconds,
+    liveVoiceActionLoading,
     liveAwaitingTerminal,
     livePollStatus,
-    liveOutputMode,
-    liveActiveOutputMode,
     setLiveInput,
     addLiveImages,
     removeLiveImage,
-    setLiveOutputMode,
+    toggleLiveRecording,
     openLiveConversation,
     resetLiveTransport,
     handleLivePrimaryAction,
@@ -929,10 +929,11 @@ export default function App() {
                     liveInput={liveInput}
                     liveImages={liveImages}
                     liveActionLoading={liveActionLoading}
+                    liveRecording={liveRecording}
+                    liveRecordingSeconds={liveRecordingSeconds}
+                    liveVoiceActionLoading={liveVoiceActionLoading}
                     liveAwaitingTerminal={liveAwaitingTerminal}
                     livePollStatus={livePollStatus}
-                    liveOutputMode={liveOutputMode}
-                    liveActiveOutputMode={liveActiveOutputMode}
                     liveConversationLoading={liveConversationLoading}
                     liveConversations={liveConversations}
                     filteredLiveConversations={filteredLiveConversations}
@@ -944,7 +945,6 @@ export default function App() {
                     toolProviders={toolProviders}
                     toolFilter={toolFilter}
                     toolSearch={toolSearch}
-                    onLiveOutputModeChange={setLiveOutputMode}
                     onLiveConversationKeywordChange={setLiveConversationKeyword}
                     onLiveConversationDatePresetChange={setLiveConversationDatePreset}
                     onLiveConversationDateRangeChange={setLiveConversationDateRange}
@@ -965,6 +965,7 @@ export default function App() {
                     onInputChange={setLiveInput}
                     onImagesAdd={addLiveImages}
                     onImageRemove={removeLiveImage}
+                    onToggleLiveRecording={() => void toggleLiveRecording()}
                     onPrimaryAction={() => void handleLivePrimaryAction()}
                     onSelectAssistantMessage={(item) => {
                       if (liveConversationId && item.turn_index) {
@@ -1124,10 +1125,11 @@ function LiveDebugView({
   liveInput,
   liveImages,
   liveActionLoading,
+  liveRecording,
+  liveRecordingSeconds,
+  liveVoiceActionLoading,
   liveAwaitingTerminal,
   livePollStatus,
-  liveOutputMode,
-  liveActiveOutputMode,
   liveConversationLoading,
   liveConversations,
   filteredLiveConversations,
@@ -1139,7 +1141,6 @@ function LiveDebugView({
   toolProviders,
   toolFilter,
   toolSearch,
-  onLiveOutputModeChange,
   onLiveConversationKeywordChange,
   onLiveConversationDatePresetChange,
   onLiveConversationDateRangeChange,
@@ -1153,6 +1154,7 @@ function LiveDebugView({
   onInputChange,
   onImagesAdd,
   onImageRemove,
+  onToggleLiveRecording,
   onPrimaryAction,
   onSelectAssistantMessage,
   onSelectLiveEvent,
@@ -1166,10 +1168,11 @@ function LiveDebugView({
   liveInput: string;
   liveImages: File[];
   liveActionLoading: boolean;
+  liveRecording: boolean;
+  liveRecordingSeconds: number;
+  liveVoiceActionLoading: boolean;
   liveAwaitingTerminal: boolean;
   livePollStatus: "idle" | "connecting" | "connected" | "error";
-  liveOutputMode: RequestOutputMode;
-  liveActiveOutputMode: EffectiveOutputMode;
   liveConversationLoading: boolean;
   liveConversations: ConversationItem[];
   filteredLiveConversations: ConversationItem[];
@@ -1181,7 +1184,6 @@ function LiveDebugView({
   toolProviders: ToolProvider[];
   toolFilter: ToolFilter;
   toolSearch: string;
-  onLiveOutputModeChange: (value: RequestOutputMode) => void;
   onLiveConversationKeywordChange: (value: string) => void;
   onLiveConversationDatePresetChange: (value: DatePreset) => void;
   onLiveConversationDateRangeChange: (value: [any, any] | null) => void;
@@ -1195,6 +1197,7 @@ function LiveDebugView({
   onInputChange: (value: string) => void;
   onImagesAdd: (files: File[]) => void;
   onImageRemove: (index: number) => void;
+  onToggleLiveRecording: () => void;
   onPrimaryAction: () => void;
   onSelectAssistantMessage: (item: TimelineMessage) => void;
   onSelectLiveEvent: (item: EventItem) => void;
@@ -1203,6 +1206,8 @@ function LiveDebugView({
   const liveMessages = liveTimeline?.messages || [];
   const previewMessages = buildPreviewMessages(liveMessages);
   const liveConversationEmptyText = !liveConversations.length ? "当前用户最近 7 日暂无会话" : "没有匹配到会话";
+  const recordingMinutes = Math.floor(liveRecordingSeconds / 60).toString().padStart(2, "0");
+  const recordingSeconds = (liveRecordingSeconds % 60).toString().padStart(2, "0");
 
   return (
     <div className="main-grid live-main-grid">
@@ -1437,15 +1442,15 @@ function LiveDebugView({
           <div className="live-composer">
             <div className="live-composer-hint">
               当前上下文：{session.current_dept?.deptName || "全部工厂"} / {session.user.username || "-"} /{" "}
-              {liveConversationId || "未创建"} / {pollStatusText(livePollStatus, liveActiveOutputMode)}
+              {liveConversationId || "未创建"} / {pollStatusText(livePollStatus)}
             </div>
             <Input.TextArea
               value={liveInput}
               autoSize={{ minRows: 3, maxRows: 5 }}
-              placeholder="输入文字，或点击/粘贴图片，Enter 发送，Shift + Enter 换行"
+              placeholder="输入文字、录音转文字，或点击/粘贴图片，Enter 发送，Shift + Enter 换行"
               onChange={(event) => onInputChange(event.target.value)}
               onPaste={(event) => {
-                if (liveActionLoading) {
+                if (liveActionLoading || liveRecording || liveVoiceActionLoading) {
                   return;
                 }
                 const clipboardImages = Array.from(event.clipboardData.files).filter((file) =>
@@ -1482,7 +1487,7 @@ function LiveDebugView({
               <div className="live-composer-controls">
                 <label
                   className={`live-image-picker ${
-                    liveActionLoading || liveImages.length >= MAX_LIVE_IMAGE_COUNT ? "is-disabled" : ""
+                    liveActionLoading || liveRecording || liveVoiceActionLoading || liveImages.length >= MAX_LIVE_IMAGE_COUNT ? "is-disabled" : ""
                   }`}
                 >
                   <PaperClipOutlined />
@@ -1491,7 +1496,7 @@ function LiveDebugView({
                     type="file"
                     multiple
                     accept="image/jpeg,image/png,image/gif,image/webp,image/bmp"
-                    disabled={liveActionLoading || liveImages.length >= MAX_LIVE_IMAGE_COUNT}
+                    disabled={liveActionLoading || liveRecording || liveVoiceActionLoading || liveImages.length >= MAX_LIVE_IMAGE_COUNT}
                     onChange={(event) => {
                       onImagesAdd(Array.from(event.target.files || []));
                       // 清空 input 才能再次选择同一个文件，实际附件状态由 liveImages 单独管理。
@@ -1499,16 +1504,23 @@ function LiveDebugView({
                     }}
                   />
                 </label>
-                <Select
-                  className="live-output-select"
-                  size="large"
-                  value={liveOutputMode}
-                  options={REQUEST_OUTPUT_MODE_OPTIONS}
-                  onChange={(value) => onLiveOutputModeChange(value)}
+                <Button
+                  icon={<AudioOutlined />}
+                  danger={liveRecording}
+                  loading={liveVoiceActionLoading}
                   disabled={liveActionLoading}
-                />
+                  onClick={onToggleLiveRecording}
+                >
+                  {liveRecording ? `结束录音 ${recordingMinutes}:${recordingSeconds}` : "语音输入"}
+                </Button>
               </div>
-              <Button size="large" type="primary" loading={liveActionLoading} onClick={onPrimaryAction}>
+              <Button
+                size="large"
+                type="primary"
+                disabled={liveRecording || liveVoiceActionLoading}
+                loading={liveActionLoading}
+                onClick={onPrimaryAction}
+              >
                 {liveAwaitingTerminal ? "中断执行" : "发送"}
               </Button>
             </div>
@@ -1833,18 +1845,14 @@ function MetricPill({ label, value }: { label: string; value: string }) {
   );
 }
 
-function pollStatusText(
-  status: "idle" | "connecting" | "connected" | "error",
-  outputMode: EffectiveOutputMode
-) {
-  const modeLabel = outputMode === "sse" ? "SSE" : "Block";
+function pollStatusText(status: "idle" | "connecting" | "connected" | "error") {
   switch (status) {
     case "connecting":
-      return `${modeLabel} 连接中`;
+      return "SSE 连接中";
     case "connected":
-      return outputMode === "sse" ? "SSE 增量输出中" : "Block 轮询已拿到增量";
+      return "SSE 增量输出中";
     case "error":
-      return `${modeLabel} 请求异常`;
+      return "SSE 请求异常";
     default:
       return "空闲";
   }
@@ -1882,8 +1890,3 @@ function shouldRetryLatestTurnProjection(options: {
 async function waitForLiveTimelineProjection(): Promise<void> {
   await new Promise((resolve) => window.setTimeout(resolve, 250));
 }
-
-const REQUEST_OUTPUT_MODE_OPTIONS: Array<{ label: string; value: RequestOutputMode }> = [
-  { label: "SSE", value: "sse" },
-  { label: "Block", value: "block" },
-];

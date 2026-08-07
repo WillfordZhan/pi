@@ -1,14 +1,5 @@
 // 模块说明：管理台前端共享类型，统一在线调试与会话回放两套视图的数据契约。
 
-// 在线调试页只保留“当前发送模式”这一层选择：
-// 用户在输入框旁直接选 SSE / Block，本次和后续发送都按当前选择执行，
-// 不再额外维护“默认模式 + 下一次请求覆盖”两套状态。
-export type OutputMode = "sse" | "block";
-
-export type RequestOutputMode = OutputMode;
-
-export type EffectiveOutputMode = "sse" | "block";
-
 export type ManageUser = {
   userId?: string;
   username?: string;
@@ -137,10 +128,6 @@ export type LiveMessagesResponse = {
   messages: LiveMessage[];
 };
 
-export type CreateConversationResponse = {
-  conversation_id: string;
-};
-
 export type SseConversationEventName =
   | "conversation_started"
   | "answer_delta"
@@ -154,11 +141,6 @@ export type SseConversationEvent = {
   event: SseConversationEventName | string;
   data: Record<string, unknown> | null;
   rawData: string;
-};
-
-export type ConversationInputResponse = {
-  conversation_id: string;
-  accepted: boolean;
 };
 
 export type ConversationInterruptResponse = {

@@ -27,15 +27,17 @@ Pi 在新会话 JSONL 中追加 `java_gateway_context` 自定义条目，仅保�
 - Pi 透明代理 Java 登录、用户、工厂和外部 AI Gateway 请求，并透传浏览器 Authorization。
 - Pi 管理 API 将原生 Session Entry 投影为旧页面需要的 conversations、timeline、turns 和 events。
 - Tool 目录只展示 Java MCP Tool 与 Pi Session Runtime 信息。
-- 在线调试支持 Block 与 SSE。SSE 直接投影 Pi AgentSession 的文本增量和 Tool 生命周期事件，经 Java 既有 SSE Gateway 转发；不恢复旧 Python 轮询事件流或中断状态机。
+- 在线调试固定使用 SSE，直接投影 Pi AgentSession 的文本增量和 Tool 生命周期事件，经 Java 既有 SSE Gateway 转发；页面不再提供 Block/SSE 模式选择，也不恢复旧 Python 轮询事件流或中断状态机。
+- Runtime 与 Java Gateway 的 Block HTTP API 继续保留，供管理台之外的 Java 或其他调用方兼容使用。
 
 ## 前端迁移
 
-迁入原 React 源码与固定版本依赖，Pi 构建至 `packages/java-agent-runtime/static/manage-console` 并托管 `/ai/management/console/`。在线调试 UI 提供 Block 与 SSE，由 Pi 原生 AgentSession 事件驱动。
+迁入原 React 源码与固定版本依赖，Pi 构建至 `packages/java-agent-runtime/static/manage-console` 并托管 `/ai/management/console/`。在线调试 UI 不展示传输模式选择器，所有发送统一进入 Pi 原生 AgentSession 事件驱动的 SSE 链路。
 
 ## 验证
 
 - 管理 Runtime 单测：Session 元数据、会话投影、Tool 目录与网关鉴权。
 - 管理台前端构建。
 - Pi 全仓 `npm run check`。
+- 在线调试页不显示 Block/SSE 选择器，发送请求携带 `Accept: text/event-stream` 并能持续展示文本增量。
 - 本地登录后执行生产计划查询，确认 Tool 调用和会话回放一致。

@@ -1,22 +1,18 @@
-// 模块说明：在线调试使用 Pi 的 Block / SSE 会话接口，SSE 只消费 Pi AgentSession 原生事件。
+// 模块说明：在线调试统一使用 SSE 会话接口，并直接消费 Pi AgentSession 原生事件。
 
 import type { MessageInstance } from "antd/es/message/interface";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { apiFetch, apiStream } from "./api";
-import type {
-  ConversationInputResponse,
-  CreateConversationResponse,
-  EffectiveOutputMode,
-  RequestOutputMode,
-  SseConversationEvent,
-  TimelineMessage,
-} from "./types";
+import type { SseConversationEvent, TimelineMessage } from "./types";
 
 type PollStatus = "idle" | "connecting" | "connected" | "error";
 
 export const MAX_LIVE_IMAGE_COUNT = 5;
 export const MAX_LIVE_IMAGE_BYTES = 10 * 1024 * 1024;
+// 百炼要求 Base64 Data URI 不超过 10 MiB；7 MiB 原音频编码后仍保留 JSON 与协议开销余量。
+export const MAX_LIVE_AUDIO_BYTES = 7 * 1024 * 1024;
+export const MAX_LIVE_RECORDING_MS = 5 * 60 * 1000;
 
 type UseLiveDebugTransportArgs = {
   message: MessageInstance;
@@ -28,14 +24,15 @@ type UseLiveDebugTransportResult = {
   liveInput: string;
   liveImages: File[];
   liveActionLoading: boolean;
+  liveRecording: boolean;
+  liveRecordingSeconds: number;
+  liveVoiceActionLoading: boolean;
   liveAwaitingTerminal: boolean;
   livePollStatus: PollStatus;
-  liveOutputMode: RequestOutputMode;
-  liveActiveOutputMode: EffectiveOutputMode;
   setLiveInput: (value: string) => void;
   addLiveImages: (files: File[]) => void;
   removeLiveImage: (index: number) => void;
-  setLiveOutputMode: (value: RequestOutputMode) => void;
+  toggleLiveRecording: () => Promise<void>;
   openLiveConversation: (conversationId: string) => void;
   resetLiveTransport: () => void;
   handleLivePrimaryAction: () => Promise<void>;
@@ -47,13 +44,38 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
   const [liveInput, setLiveInput] = useState("");
   const [liveImages, setLiveImages] = useState<File[]>([]);
   const [liveActionLoading, setLiveActionLoading] = useState(false);
+  const [liveRecording, setLiveRecording] = useState(false);
+  const [liveRecordingSeconds, setLiveRecordingSeconds] = useState(0);
+  const [liveVoiceActionLoading, setLiveVoiceActionLoading] = useState(false);
   const [livePollStatus, setLivePollStatus] = useState<PollStatus>("idle");
-  const [liveOutputMode, setLiveOutputMode] = useState<RequestOutputMode>("sse");
-  const [liveActiveOutputMode, setLiveActiveOutputMode] = useState<EffectiveOutputMode>("sse");
   const [liveStreamingAnswer, setLiveStreamingAnswer] = useState("");
   const [livePendingUserMessage, setLivePendingUserMessage] = useState("");
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<number | null>(null);
+  const recordingDeadlineRef = useRef<number | null>(null);
+  const recordingStartedAtRef = useRef(0);
+  const disposedRef = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      // 卸载页面时不能继续把录音提交给后端；同时主动释放麦克风，避免浏览器仍显示“正在使用”。
+      disposedRef.current = true;
+      clearRecordingTimers();
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.onstop = null;
+        recorder.stop();
+      }
+      stopMicrophoneTracks();
+    };
+  }, []);
 
   async function handleLivePrimaryAction() {
+    if (liveRecording || liveVoiceActionLoading) {
+      message.warning("请先完成当前录音和转写，再发送给 Pi");
+      return;
+    }
     const query = liveInput.trim();
     if (!query && liveImages.length === 0) return;
 
@@ -65,7 +87,6 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
 
     setLiveActionLoading(true);
     setLivePollStatus("connecting");
-    setLiveActiveOutputMode(liveOutputMode);
     setLiveStreamingAnswer("");
     // Pi 的持久化消息要等本轮结束后才能重新投影；先展示本次输入，避免用户误以为 Enter 未发送。
     setLivePendingUserMessage(pendingText);
@@ -73,11 +94,8 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
     setLiveInput("");
     setLiveImages([]);
     try {
-      if (liveOutputMode === "sse") {
-        await runSse(query, images);
-      } else {
-        await runBlock(query, images);
-      }
+      // Management Console 只有一条在线调试链路，统一使用 SSE 获取文本增量和 Tool 生命周期事件。
+      await runSse(query, images);
       setLivePollStatus("idle");
     } catch (error) {
       setLivePollStatus("error");
@@ -87,16 +105,6 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
       setLivePendingUserMessage("");
       setLiveActionLoading(false);
     }
-  }
-
-  async function runBlock(query: string, images: File[]) {
-    const path = liveConversationId ? `/api/ai/conversations/${liveConversationId}/chat` : "/api/ai/conversations";
-    const payload = await apiFetch<CreateConversationResponse | ConversationInputResponse>(path, {
-      method: "POST",
-      body: buildConversationBody(query, images),
-    });
-    setLiveConversationId(payload.conversation_id);
-    await refreshLiveTimeline(payload.conversation_id, true);
   }
 
   async function runSse(query: string, images: File[]) {
@@ -146,10 +154,11 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
     liveInput,
     liveImages,
     liveActionLoading,
+    liveRecording,
+    liveRecordingSeconds,
+    liveVoiceActionLoading,
     liveAwaitingTerminal: false,
     livePollStatus,
-    liveOutputMode,
-    liveActiveOutputMode,
     setLiveInput,
     addLiveImages: (files) => {
       // 浏览器校验只负责即时反馈；Runtime 会基于真实字节再次执行相同上限，不能依赖前端作为安全边界。
@@ -169,9 +178,10 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
       setLiveImages((current) => [...current, ...files]);
     },
     removeLiveImage: (index) => setLiveImages((current) => current.filter((_, itemIndex) => itemIndex !== index)),
-    setLiveOutputMode,
+    toggleLiveRecording,
     openLiveConversation: setLiveConversationId,
     resetLiveTransport: () => {
+      discardLiveRecording();
       setLiveConversationId("");
       setLiveInput("");
       setLiveImages([]);
@@ -182,6 +192,172 @@ export function useLiveDebugTransport({ message, refreshLiveTimeline }: UseLiveD
     handleLivePrimaryAction,
     buildPreviewMessages: (messages) => buildLivePreviewMessages(messages, livePendingUserMessage, liveStreamingAnswer, liveActionLoading),
   };
+
+  async function toggleLiveRecording() {
+    if (liveRecording) {
+      stopLiveRecording();
+      return;
+    }
+    if (liveActionLoading || liveVoiceActionLoading) {
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      message.error("当前浏览器不支持录音，请使用 Chromium 浏览器");
+      return;
+    }
+
+    setLiveVoiceActionLoading(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (disposedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      const mimeType = chooseSupportedRecordingMimeType();
+      if (!mimeType) {
+        stream.getTracks().forEach((track) => track.stop());
+        message.error("当前浏览器没有可供转写的录音格式");
+        return;
+      }
+      const chunks: BlobPart[] = [];
+      // 先登记 stream，确保 MediaRecorder 初始化异常时 catch 分支也能释放麦克风。
+      streamRef.current = stream;
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        recorderRef.current = null;
+        clearRecordingTimers();
+        stopMicrophoneTracks();
+        if (disposedRef.current) {
+          return;
+        }
+        setLiveRecording(false);
+        void transcribeRecordedChunks(chunks, recorder.mimeType || mimeType);
+      };
+      recorder.start();
+      recordingStartedAtRef.current = Date.now();
+      setLiveRecordingSeconds(0);
+      setLiveRecording(true);
+      recordingTimerRef.current = window.setInterval(() => {
+        setLiveRecordingSeconds(Math.floor((Date.now() - recordingStartedAtRef.current) / 1000));
+      }, 1000);
+      recordingDeadlineRef.current = window.setTimeout(() => {
+        if (recorderRef.current === recorder && recorder.state !== "inactive") {
+          message.info("已达到 5 分钟录音上限，正在开始转写");
+          stopLiveRecording();
+        }
+      }, MAX_LIVE_RECORDING_MS);
+    } catch (error) {
+      stopMicrophoneTracks();
+      message.error(`无法开始录音: ${getMediaErrorMessage(error)}`);
+    } finally {
+      if (!disposedRef.current) {
+        setLiveVoiceActionLoading(false);
+      }
+    }
+  }
+
+  function stopLiveRecording() {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === "inactive") {
+      return;
+    }
+    clearRecordingTimers();
+    recorder.stop();
+  }
+
+  async function transcribeRecordedChunks(chunks: BlobPart[], mimeType: string) {
+    const blob = new Blob(chunks, { type: mimeType });
+    if (blob.size === 0) {
+      message.error("录音内容为空，请重新录制");
+      return;
+    }
+    if (blob.size > MAX_LIVE_AUDIO_BYTES) {
+      message.error("录音超过 7 MiB 限制，请缩短后重试");
+      return;
+    }
+
+    setLiveVoiceActionLoading(true);
+    try {
+      const suffix = recordingFileSuffix(mimeType);
+      const audio = new File([blob], `recording.${suffix}`, { type: mimeType });
+      const formData = new FormData();
+      formData.append("audio", audio, audio.name);
+      // 转写接口不会创建 Pi 会话；成功后只写回编辑框，发送仍由用户显式触发。
+      const response = await apiFetch<{ text: string }>("/api/ai/asr/transcriptions", {
+        method: "POST",
+        body: formData,
+      });
+      const text = response.text.trim();
+      if (!text) {
+        throw new Error("没有识别到可用文字");
+      }
+      setLiveInput((current) => (current.trim() ? `${current}\n${text}` : text));
+      message.success("转写完成，确认文字后再发送");
+    } catch (error) {
+      message.error(`转写失败: ${getMediaErrorMessage(error)}`);
+    } finally {
+      if (!disposedRef.current) {
+        setLiveVoiceActionLoading(false);
+      }
+    }
+  }
+
+  function discardLiveRecording() {
+    clearRecordingTimers();
+    const recorder = recorderRef.current;
+    recorderRef.current = null;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.onstop = null;
+      recorder.stop();
+    }
+    stopMicrophoneTracks();
+    setLiveRecording(false);
+    setLiveRecordingSeconds(0);
+    setLiveVoiceActionLoading(false);
+  }
+
+  function clearRecordingTimers() {
+    if (recordingTimerRef.current !== null) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (recordingDeadlineRef.current !== null) {
+      window.clearTimeout(recordingDeadlineRef.current);
+      recordingDeadlineRef.current = null;
+    }
+  }
+
+  function stopMicrophoneTracks() {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  }
+}
+
+function chooseSupportedRecordingMimeType(): string {
+  const candidates = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"];
+  return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
+}
+
+function recordingFileSuffix(mimeType: string): string {
+  if (mimeType.startsWith("audio/mp4")) return "m4a";
+  if (mimeType.startsWith("audio/ogg")) return "ogg";
+  return "webm";
+}
+
+function getMediaErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.name === "NotAllowedError") {
+    return "未获得麦克风权限，请在浏览器中允许后重试";
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return "请检查麦克风和网络后重试";
 }
 
 /** 有图片时使用 multipart；纯文字继续走原 JSON 协议，避免无意义地改变现有调用链。 */
@@ -191,10 +367,6 @@ function buildConversationBody(query: string, images: File[]): BodyInit {
   if (query) formData.append("query", query);
   for (const image of images) formData.append("images", image, image.name);
   return formData;
-}
-
-export function resolveEffectiveOutputMode(outputMode: RequestOutputMode): EffectiveOutputMode {
-  return outputMode;
 }
 
 export function buildLivePreviewMessages(

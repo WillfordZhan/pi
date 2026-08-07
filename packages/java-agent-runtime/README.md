@@ -50,4 +50,24 @@ Runtime 提供：
 
 两个聊天接口均返回 `{ "conversationId": "...", "response": "..." }`。Java 请求必须携带既有 `X-AI-GW-TOKEN` 与 `X-AI-BIZ-CONTEXT`；Pi 会验证既有 HMAC 上下文签名与有效期，只提取 `tenantId`、`userId` 并在调用 Java MCP Tool 时附带它们。Pi Session JSONL 保留处理后的图片以支持后续追问；Java 管理查询索引只保存图片数量占位，不复制 Base64。
 
-管理台支持 Block 与 SSE：浏览器请求 `/api/ai/**` 经 Java Gateway 回到 Pi；SSE 直接投影 Pi AgentSession 的文本增量和 Tool 生命周期事件。Pi 管理 API 读取同一份 JSONL，投影会话、消息、Tool 调用和结果；不会恢复旧 Python 运行时或事件库。
+管理台固定使用 SSE：浏览器请求 `/api/ai/**` 经 Java Gateway 回到 Pi，并直接投影 Pi AgentSession 的文本增量和 Tool 生命周期事件。管理台不再提供 Block/SSE 选择器；Runtime 与 Java Gateway 的 Block HTTP API 仍保留给其他调用方。Pi 管理 API 读取同一份 JSONL，投影会话、消息、Tool 调用和结果；不会恢复旧 Python 运行时或事件库。
+
+## 管理台语音转文字
+
+管理台的“语音输入”采用浏览器录音、Java Gateway 调用阿里云百炼非实时 ASR 的方式。录音结束后，Java 的 `POST /api/ai/asr/transcriptions` 只返回转写文字；管理台将文字填入输入框，用户修改并确认后，才会走上述 SSE 对话链路。音频不会发送给 Pi Runtime，也不会写进 Pi 会话 JSONL。
+
+阿里云配置属于 Java Gateway 的部署配置，不属于本目录的 Pi `.env`。在 Java 的 Nacos 配置或部署环境变量中提供：
+
+```yaml
+ai:
+  asr:
+    # 建议使用当前百炼 Workspace 的北京专属推理地址；旧 dashscope 域名也可兼容。
+    endpoint: https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+    api-key: ${AI_ASR_API_KEY}
+    model: fun-asr-flash-2026-06-15
+    connect-timeout-ms: 5000
+    read-timeout-ms: 30000
+    max-audio-bytes: 7340032
+```
+
+`AI_ASR_API_KEY` 只能配置在 Java 部署环境或 Nacos 密钥中，不能放入浏览器、Pi `.env` 或仓库。第一版录音最长 5 分钟，原始录音最大 7 MiB；该限制为 Base64 编码后的百炼 10 MiB 输入上限保留了传输余量。

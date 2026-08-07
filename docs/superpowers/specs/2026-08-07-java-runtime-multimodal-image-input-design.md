@@ -63,6 +63,7 @@ Runtime 内部的 `/ai/conversations` 与 `/ai/conversations/{conversationId}/ch
 
 在线调试输入区增加原生多文件选择能力，不增加前端依赖：
 
+- Management Console 固定使用 SSE，不展示 Block/SSE 模式选择器；这不改变 Runtime 与 Java Gateway 对 Block API 的兼容支持。
 - 使用隐藏的 `<input type="file" multiple accept="image/*">` 和现有按钮样式。
 - 消息输入框聚焦时支持直接粘贴剪贴板图片；页面其他区域不监听粘贴事件，避免复制页面内容时误添加附件。
 - 粘贴图片直接复用文件选择入口的 `addLiveImages`，数量、单图大小与空文件校验只有一套实现。
@@ -180,7 +181,7 @@ SSE 在响应头尚未发送前发生的输入错误使用普通 JSON 错误响�
 - 输入框聚焦时粘贴截图，确认图片进入同一个待发送预览列表；输入框未聚焦时不添加图片。
 - 粘贴纯文字时保持原输入行为；剪贴板同时含文字和图片时，两类内容都得到保留。
 - 删除待发送图片、重复选择图片以及选择超大图片时提示正确。
-- 分别使用 Block 与 SSE，确认模型回复、Tool 调用和同一会话续聊正常。
+- 使用 SSE 确认模型增量回复、Tool 调用和同一会话续聊正常，并确认页面不再显示 Block/SSE 选择器。
 - 刷新历史会话后确认显示文字和图片数量占位，不产生 Base64 页面响应。
 
 代码实现完成后运行受影响的聚焦测试与仓库要求的 `npm run check`。Management Console 的真实模型验证使用当前 `qwen3.7-plus`，不调用付费测试提供方编写自动化测试。
