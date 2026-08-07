@@ -16,7 +16,7 @@ describe("JavaConversationStoreClient", () => {
 			new Response(
 				JSON.stringify({
 					code: 200,
-					data: { conversationId: "conversation-1", acceptedEntryIds: ["entry-1"], latestEntryOrder: 1 },
+					data: { conversationId: "conversation-1", acceptedEntryIds: ["entry-1"] },
 				}),
 				{ status: 200 },
 			),
@@ -66,7 +66,7 @@ describe("JavaConversationStoreClient", () => {
 			new Response(
 				JSON.stringify({
 					code: 200,
-					data: { conversationId: "conversation-1", acceptedEntryIds: ["entry-1"], latestEntryOrder: 1 },
+					data: { conversationId: "conversation-1", acceptedEntryIds: ["entry-1"] },
 				}),
 				{ status: 200 },
 			),

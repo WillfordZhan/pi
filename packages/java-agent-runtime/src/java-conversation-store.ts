@@ -16,7 +16,6 @@ interface JavaStoreEnvelope<T> {
 interface JavaStoreSyncResponse {
 	conversationId: string;
 	acceptedEntryIds: string[];
-	latestEntryOrder: number | null;
 }
 
 /** Java 会话库的 HTTP 失败需要保留状态码，调用方才能区分权限拒绝与服务故障。 */
