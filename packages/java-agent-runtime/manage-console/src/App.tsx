@@ -1442,8 +1442,22 @@ function LiveDebugView({
             <Input.TextArea
               value={liveInput}
               autoSize={{ minRows: 3, maxRows: 5 }}
-              placeholder="输入文字或添加图片，Enter 发送，Shift + Enter 换行"
+              placeholder="输入文字，或点击/粘贴图片，Enter 发送，Shift + Enter 换行"
               onChange={(event) => onInputChange(event.target.value)}
+              onPaste={(event) => {
+                if (liveActionLoading) {
+                  return;
+                }
+                const clipboardImages = Array.from(event.clipboardData.files).filter((file) =>
+                  file.type.startsWith("image/")
+                );
+                if (!clipboardImages.length) {
+                  return;
+                }
+                // 粘贴与文件选择复用同一个入口，确保五张、10 MiB 和空文件校验不会出现两套规则。
+                // 这里不阻止浏览器默认粘贴，因此剪贴板同时含文字和图片时，文字仍会正常进入输入框。
+                onImagesAdd(clipboardImages);
+              }}
               onPressEnter={(event) => {
                 if (event.shiftKey) {
                   return;
