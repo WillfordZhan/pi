@@ -1,4 +1,0 @@
-interface:
-  display_name: "Pi 教学式开发"
-  short_description: "基于当前源码讲解 Pi 与 Java Runtime 的实现链路"
-  default_prompt: "使用 $learn-pi-by-doing 基于当前源码讲解这个 Pi 任务。"

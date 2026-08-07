@@ -6,15 +6,15 @@
 
 ## 方案
 
-新增仓库级 `learn-pi-by-doing` Skill，并在根目录 `AGENTS.md` 中保留简短的强制触发规则：
+新增用户级 Codex `learn-pi-by-doing` Skill，并在 Pi 根目录 `AGENTS.md` 中保留简短的强制触发规则：
 
 ```text
 AGENTS.md
-.agents/skills/learn-pi-by-doing/SKILL.md
-.agents/skills/learn-pi-by-doing/agents/openai.yaml
+~/.codex/skills/learn-pi-by-doing/SKILL.md
+~/.codex/skills/learn-pi-by-doing/agents/openai.yaml
 ```
 
-`AGENTS.md` 只负责规定何时必须使用 Skill，不复制具体教学流程。Skill 负责代码取证、讲解深度选择和输出结构，避免项目规则继续膨胀。
+`AGENTS.md` 只负责规定何时必须使用 Skill，不复制具体教学流程。用户级 Skill 负责代码取证、讲解深度选择和输出结构，避免项目规则继续膨胀；该 Skill 不随 Pi 仓库分发。
 
 ## 触发范围
 
