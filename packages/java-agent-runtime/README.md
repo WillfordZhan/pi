@@ -46,6 +46,80 @@ Runtime 提供：
 - `GET /healthz`
 - `GET /ai/management/console/`，Pi 托管的原管理台页面
 
+## Docker 部署到 Star2 DEV
+
+Docker 构建分为两个阶段：`builder` 在 Linux 环境安装依赖并构建全部 Pi workspace 与管理台；`runtime` 只复制生产依赖和构建产物，并以非 root 用户启动 `dist/main.js`。镜像固定构建为 `linux/amd64`，与 Star2 的 `x86_64` 架构一致。
+
+### 1. 本地构建并导出镜像
+
+以下命令必须在仓库根目录执行，因为 Java Runtime 会复用 monorepo 内的 Pi 包：
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --file packages/java-agent-runtime/Dockerfile \
+  --tag pi-java-agent-runtime:dev \
+  --load \
+  .
+
+docker image inspect pi-java-agent-runtime:dev --format '{{.Architecture}}'
+docker save pi-java-agent-runtime:dev | gzip > /tmp/pi-java-agent-runtime-dev.tar.gz
+```
+
+架构检查必须输出 `amd64`。然后把镜像和 Compose 文件传到 Star2：
+
+```bash
+ssh iot@vpc-star-2.allthinkstars.com 'mkdir -p /home/iot/app/python/pi-runtime'
+scp /tmp/pi-java-agent-runtime-dev.tar.gz \
+  iot@vpc-star-2.allthinkstars.com:/home/iot/app/python/pi-runtime/
+scp packages/java-agent-runtime/docker-compose.yml \
+  packages/java-agent-runtime/.env.star2.example \
+  iot@vpc-star-2.allthinkstars.com:/home/iot/app/python/pi-runtime/
+```
+
+### 2. 准备宿主机配置和持久化目录
+
+登录 Star2 后执行：
+
+```bash
+cd /home/iot/app/python/pi-runtime
+mkdir -p config data/agent data/sessions data/workspace
+cp .env.star2.example .env
+chmod 600 .env
+```
+
+编辑 `.env`，把三个 `replace-me` 替换成 Java iot-app 当前使用的相同密钥。把 DashScope Key 写入 `config/apikey.txt`，并限制文件权限：
+
+```bash
+chmod 700 config data data/agent data/sessions data/workspace
+chmod 600 config/apikey.txt
+```
+
+`.env`、`config/apikey.txt` 和 `data/` 只保存在 Star2，不进入镜像，也不提交 Git。Runtime 会把 Pi 会话写入 `data/sessions`，容器重建后仍可恢复。
+
+### 3. 导入并启动
+
+```bash
+cd /home/iot/app/python/pi-runtime
+gzip -dc pi-java-agent-runtime-dev.tar.gz | docker load
+docker compose config --quiet
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:8000/healthz
+```
+
+Compose 通过 `127.0.0.1:8000:8000` 只向 Star2 本机暴露 Runtime。Nginx 继续代理 `127.0.0.1:8000`；Pi 容器通过 `host.docker.internal:10002` 调用现有 Java iot-app。
+
+### 4. 后续更新
+
+代码变化后重新构建、传输并 `docker load` 镜像。如果 `docker-compose.yml` 同时有变化，也要覆盖服务器上的旧文件；Docker 拉取或导入镜像不会自动更新 Compose。最后再次执行：
+
+```bash
+docker compose up -d
+```
+
+Compose 会在镜像或启动配置变化时重建 Pi 容器，不会删除宿主机的 `.env`、Key 和 `data/`。
+
 两个聊天接口同时接受纯文字 JSON `{ "query": "..." }`，以及包含可选 `query`、最多五个重复 `images` 文件字段的 `multipart/form-data`。单张原图不能超过 10 MiB；仅上传图片时 Runtime 自动使用“请分析这些图片”。图片会先经过 Pi `processImage` 的格式识别、方向处理、缩放与压缩，再与文字共同发送给模型。
 
 两个聊天接口均返回 `{ "conversationId": "...", "response": "..." }`。Java 请求必须携带既有 `X-AI-GW-TOKEN` 与 `X-AI-BIZ-CONTEXT`；Pi 会验证既有 HMAC 上下文签名与有效期，只提取 `tenantId`、`userId` 并在调用 Java MCP Tool 时附带它们。Pi Session JSONL 保留处理后的图片以支持后续追问；Java 管理查询索引只保存图片数量占位，不复制 Base64。

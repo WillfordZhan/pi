@@ -1,0 +1,21 @@
+# Docker 构建只需要源码和锁文件；本机依赖与构建产物必须在 Linux 构建阶段重新生成。
+.git
+.codex
+.github
+.artifacts
+node_modules
+**/node_modules
+**/dist
+coverage
+**/coverage
+packages/java-agent-runtime/static
+
+# 部署配置、模型密钥和会话数据只能留在宿主机，不能进入镜像构建上下文。
+.env
+**/.env
+packages/java-agent-runtime/config
+sessions
+**/sessions
+*.log
+*.cpuprofile
+

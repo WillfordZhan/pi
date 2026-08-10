@@ -1,0 +1,55 @@
+services:
+  pi-runtime:
+    # 第一版通过 docker load 导入本地镜像；禁止 Compose 因找不到镜像而访问公共仓库。
+    image: ${PI_RUNTIME_IMAGE:-pi-java-agent-runtime:dev}
+    pull_policy: never
+    platform: linux/amd64
+    restart: always
+
+    # 仅把 Runtime 暴露给 Star2 本机 Nginx，不直接开放到 VPC 或 WireGuard 网络。
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    # Linux 容器通过该固定名称访问使用 host network 的 Java iot-app。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    environment:
+      PI_RUNTIME_PORT: "8000"
+      PI_RUNTIME_CWD: /data/workspace
+      PI_RUNTIME_SESSION_DIR: /data/sessions
+      PI_CODING_AGENT_DIR: /data/agent
+
+      MCP_BASE_URL: http://host.docker.internal:10002/epservice/ai/mcp
+      JAVA_GATEWAY_BASE_URL: http://host.docker.internal:10002/epservice
+      MCP_API_TOKEN: ${MCP_API_TOKEN:?请在 .env 中配置 MCP_API_TOKEN}
+      MCP_TIMEOUT_SECONDS: "10"
+
+      AI_GATEWAY_INTERNAL_TOKEN: ${AI_GATEWAY_INTERNAL_TOKEN:?请在 .env 中配置 AI_GATEWAY_INTERNAL_TOKEN}
+      AI_GATEWAY_CONTEXT_SIGN_SECRET: ${AI_GATEWAY_CONTEXT_SIGN_SECRET:?请在 .env 中配置 AI_GATEWAY_CONTEXT_SIGN_SECRET}
+      AI_GATEWAY_CLOCK_SKEW_SECONDS: "30"
+
+      QWEN_MODEL: ${QWEN_MODEL:-qwen-plus}
+      QWEN_API_KEY_FILE: /run/secrets/qwen-api-key
+      QWEN_API_BASE: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+    volumes:
+      # create_host_path=false 可以在目录或密钥漏传时立即失败，避免 Docker 创建 root 权限的错误目录。
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/apikey.txt
+        target: /run/secrets/qwen-api-key
+        read_only: true
+        bind:
+          create_host_path: false
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
