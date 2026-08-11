@@ -17,11 +17,7 @@ import { createAgentSession } from "../../coding-agent/src/core/sdk.ts";
 import { type SessionEntry, SessionManager } from "../../coding-agent/src/core/session-manager.ts";
 import type { RuntimeConfig } from "./config.ts";
 
-import {
-	JavaConversationStoreClient,
-	JavaConversationStoreError,
-	restoreConversationSession,
-} from "./java-conversation-store.ts";
+import { JavaConversationStoreClient } from "./java-conversation-store.ts";
 import type { ToolPresentation } from "./java-mcp.ts";
 import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 
@@ -314,31 +310,9 @@ export class PiConversationRuntime {
 	private async openExistingSession(conversationId: string, caller: JavaMcpCallerContext): Promise<SessionManager> {
 		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
 		const target = sessions.find((session) => session.id === conversationId);
-		if (target) {
-			const session = SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
-			assertConversationCaller(session.getEntries(), caller);
-			return session;
-		}
-
-		// 容器迁移或本地会话卷丢失时，Java 镜像只作为一次性恢复来源；恢复完成后仍由
-		// Pi JSONL 和 SessionManager 承担后续上下文建树、追加与 agent loop 生命周期。
-		let entries: SessionEntry[];
-		try {
-			entries = await this.javaConversationStore.listEntries(conversationId, caller);
-		} catch (error) {
-			if (error instanceof JavaConversationStoreError && error.statusCode === 404) {
-				throw new ConversationNotFoundError(conversationId);
-			}
-			throw error;
-		}
-		if (entries.length === 0) throw new ConversationNotFoundError(conversationId);
-		assertConversationCaller(entries, caller);
-
-		const session = restoreConversationSession(this.config, conversationId, entries);
-		session.appendCustomEntry(
-			JavaConversationStoreClient.syncMarkerType,
-			this.javaConversationStore.markSynced(entries),
-		);
+		if (!target) throw new ConversationNotFoundError(conversationId);
+		const session = SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
+		assertConversationCaller(session.getEntries(), caller);
 		return session;
 	}
 }
