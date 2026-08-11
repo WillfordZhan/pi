@@ -17,7 +17,12 @@ import { createAgentSession } from "../../coding-agent/src/core/sdk.ts";
 import { type SessionEntry, SessionManager } from "../../coding-agent/src/core/session-manager.ts";
 import type { RuntimeConfig } from "./config.ts";
 
-import { JavaConversationStoreClient } from "./java-conversation-store.ts";
+import {
+	JavaConversationStoreClient,
+	JavaConversationStoreError,
+	restoreConversationSession,
+} from "./java-conversation-store.ts";
+import type { ToolPresentation } from "./java-mcp.ts";
 import { type JavaMcpCallerContext, JavaMcpClient } from "./java-mcp.ts";
 
 export interface ConversationResponse {
@@ -42,11 +47,13 @@ export interface StartedConversation {
 interface OpenedConversationSession {
 	session: AgentSession;
 	sessionManager: SessionManager;
+	presentations: Record<string, ToolPresentation>;
 }
 
 interface RunningConversation {
 	session: AgentSession;
 	caller: JavaMcpCallerContext;
+	presentations: Record<string, ToolPresentation>;
 }
 
 export class ConversationNotFoundError extends Error {
@@ -71,6 +78,19 @@ export class ConversationAbortedError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const TOOL_PRESENTATION_ENTRY = "java_tool_presentations";
+
+/** 只比较 JSON 兼容的展示快照；目录未变化时不重复增加会话 Entry。 */
+function lastToolPresentationCatalog(entries: readonly SessionEntry[]): Record<string, unknown> | undefined {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.type === "custom" && entry.customType === TOOL_PRESENTATION_ENTRY && isRecord(entry.data)) {
+			return entry.data;
+		}
+	}
+	return undefined;
 }
 
 /**
@@ -165,6 +185,15 @@ export class PiConversationRuntime {
 		return true;
 	}
 
+	toolPresentation(conversationId: string, toolName: string): ToolPresentation {
+		return (
+			this.runningConversations.get(conversationId)?.presentations[toolName] ?? {
+				progressText: "正在处理业务请求",
+				successText: "业务处理已完成",
+			}
+		);
+	}
+
 	private async runConversation(
 		conversationId: string,
 		caller: JavaMcpCallerContext,
@@ -185,11 +214,11 @@ export class PiConversationRuntime {
 
 		try {
 			const opened = await this.openSession(conversationId, caller, create);
-			const { session, sessionManager } = opened;
+			const { session, sessionManager, presentations } = opened;
 			const abortSession = () => void session.abort();
 			signal?.addEventListener("abort", abortSession, { once: true });
 			const unsubscribe = onEvent ? session.subscribe(onEvent) : undefined;
-			this.runningConversations.set(conversationId, { session, caller });
+			this.runningConversations.set(conversationId, { session, caller, presentations });
 			try {
 				if (signal?.aborted) throw new ConversationAbortedError();
 				let promptFailure: unknown;
@@ -245,6 +274,12 @@ export class PiConversationRuntime {
 			sessionManager.appendCustomEntry("java_gateway_context", caller);
 		}
 		const customTools = await this.javaMcp.createTools({ conversationId, caller });
+		const presentationCatalog = this.javaMcp.getPresentationCatalog(customTools);
+		const previousCatalog = lastToolPresentationCatalog(sessionManager.getEntries());
+		if (JSON.stringify(previousCatalog) !== JSON.stringify(presentationCatalog)) {
+			// 会话历史只保存业务展示文案，Tool schema、调用参数和结果继续留在原生 Tool Entry 中。
+			sessionManager.appendCustomEntry(TOOL_PRESENTATION_ENTRY, presentationCatalog);
+		}
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: this.config.workingDirectory,
 			agentDir: getAgentDir(),
@@ -260,7 +295,7 @@ export class PiConversationRuntime {
 			customTools,
 			noTools: "builtin",
 		});
-		return { session, sessionManager };
+		return { session, sessionManager, presentations: presentationCatalog };
 	}
 
 	private async syncConversation(
@@ -279,9 +314,31 @@ export class PiConversationRuntime {
 	private async openExistingSession(conversationId: string, caller: JavaMcpCallerContext): Promise<SessionManager> {
 		const sessions = await SessionManager.list(this.config.workingDirectory, this.config.sessionDirectory);
 		const target = sessions.find((session) => session.id === conversationId);
-		if (!target) throw new ConversationNotFoundError(conversationId);
-		const session = SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
-		assertConversationCaller(session.getEntries(), caller);
+		if (target) {
+			const session = SessionManager.open(target.path, this.config.sessionDirectory, this.config.workingDirectory);
+			assertConversationCaller(session.getEntries(), caller);
+			return session;
+		}
+
+		// 容器迁移或本地会话卷丢失时，Java 镜像只作为一次性恢复来源；恢复完成后仍由
+		// Pi JSONL 和 SessionManager 承担后续上下文建树、追加与 agent loop 生命周期。
+		let entries: SessionEntry[];
+		try {
+			entries = await this.javaConversationStore.listEntries(conversationId, caller);
+		} catch (error) {
+			if (error instanceof JavaConversationStoreError && error.statusCode === 404) {
+				throw new ConversationNotFoundError(conversationId);
+			}
+			throw error;
+		}
+		if (entries.length === 0) throw new ConversationNotFoundError(conversationId);
+		assertConversationCaller(entries, caller);
+
+		const session = restoreConversationSession(this.config, conversationId, entries);
+		session.appendCustomEntry(
+			JavaConversationStoreClient.syncMarkerType,
+			this.javaConversationStore.markSynced(entries),
+		);
 		return session;
 	}
 }

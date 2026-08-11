@@ -239,20 +239,23 @@ async function streamConversation(
 				return;
 			}
 			if (event.type === "tool_execution_start") {
+				const presentation = runtime.toolPresentation(started.conversationId, event.toolName);
 				writeSse(response, "tool_call", {
 					conversation_id: started.conversationId,
 					tool_call_id: event.toolCallId,
-					name: event.toolName,
-					arguments: event.args,
+					display_text: presentation.progressText,
+					success_text: presentation.successText,
+					is_error: false,
 				});
 				return;
 			}
 			if (event.type === "tool_execution_end") {
+				const presentation = runtime.toolPresentation(started.conversationId, event.toolName);
 				writeSse(response, "tool_result", {
 					conversation_id: started.conversationId,
 					tool_call_id: event.toolCallId,
-					name: event.toolName,
 					is_error: event.isError,
+					display_text: event.isError ? "本次业务处理未完成" : presentation.successText,
 				});
 			}
 		},

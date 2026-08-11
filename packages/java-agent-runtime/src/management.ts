@@ -29,15 +29,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function eventSummary(type: string, data: Record<string, unknown>): string {
 	if (type === "user_message" || type === "assistant_message") return String(data.content ?? "").slice(0, 160);
-	if (type === "tool_call") return `调用工具 ${String(data.name ?? "")}`;
-	if (type === "tool_result") return `工具返回 ${String(data.toolName ?? "")}`;
+	if (type === "tool_call" || type === "tool_result") return String(data.display_text ?? "");
 	return type;
 }
 
 export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 	const events: SessionEvent[] = [];
+	let presentations: Record<string, Record<string, unknown>> = {};
 	let turnIndex = 0;
 	for (const entry of entries) {
+		if (entry.type === "custom" && entry.customType === "java_tool_presentations" && isRecord(entry.data)) {
+			// 目录快照只影响它之后产生的 Tool Entry，避免文案更新穿越改写历史轮次。
+			presentations = Object.fromEntries(
+				Object.entries(entry.data).filter((item): item is [string, Record<string, unknown>] => isRecord(item[1])),
+			);
+			continue;
+		}
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message.role === "user") {
@@ -56,7 +63,14 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 			continue;
 		}
 		if (message.role === "toolResult") {
-			const data = { toolName: message.toolName, content: contentText(message.content, "") };
+			const presentation = presentations[message.toolName];
+			const data = {
+				tool_call_id: message.toolCallId,
+				display_text: message.isError
+					? "本次业务处理未完成"
+					: String(presentation?.successText ?? "业务处理已完成"),
+				is_error: message.isError,
+			};
 			events.push({
 				id: events.length + 1,
 				event_type: "tool_result",
@@ -64,7 +78,7 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 				created_at: entry.timestamp,
 				data,
 				summary: eventSummary("tool_result", data),
-				visible_in_messages: false,
+				visible_in_messages: true,
 				include_in_context: true,
 			});
 			continue;
@@ -72,7 +86,13 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 		if (message.role !== "assistant") continue;
 		for (const block of message.content) {
 			if (block.type === "toolCall") {
-				const data = { id: block.id, name: block.name, arguments: block.arguments };
+				const presentation = presentations[block.name];
+				const data = {
+					tool_call_id: block.id,
+					display_text: String(presentation?.progressText ?? "正在处理业务请求"),
+					success_text: String(presentation?.successText ?? "业务处理已完成"),
+					is_error: false,
+				};
 				events.push({
 					id: events.length + 1,
 					event_type: "tool_call",
@@ -80,7 +100,7 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 					created_at: entry.timestamp,
 					data,
 					summary: eventSummary("tool_call", data),
-					visible_in_messages: false,
+					visible_in_messages: true,
 					include_in_context: true,
 				});
 			}
@@ -99,6 +119,20 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 				include_in_context: true,
 			});
 		}
+	}
+	const completed = new Set(
+		events
+			.filter((event) => event.event_type === "tool_result" && isRecord(event.data))
+			.map((event) => String((event.data as Record<string, unknown>).tool_call_id ?? "")),
+	);
+	for (const event of events) {
+		if (event.event_type !== "tool_call" || !isRecord(event.data)) continue;
+		const toolCallId = String(event.data.tool_call_id ?? "");
+		if (completed.has(toolCallId)) continue;
+		// 仅凭持久化历史无法判断写操作是否提交，不能依赖当前请求所在 Pi 实例的内存运行态。
+		event.event_type = "tool_result";
+		event.data = { tool_call_id: toolCallId, display_text: "业务处理结果未知，请勿重复操作", is_error: true };
+		event.summary = "业务处理结果未知，请勿重复操作";
 	}
 	return events;
 }
@@ -293,7 +327,7 @@ export class PiManagementService {
 				message_id: event.id,
 				turn_index: event.turn_index,
 				role: event.event_type === "user_message" ? "user" : "assistant",
-				content: isRecord(event.data) ? (event.data.content ?? "") : "",
+				content: isRecord(event.data) ? (event.data.content ?? event.data.display_text ?? "") : "",
 				created_at: event.created_at,
 				status: "final",
 				anchor_event_id: event.id,
@@ -312,9 +346,14 @@ export class PiManagementService {
 			.map((event) => ({
 				id: event.id,
 				conversation_id: conversationId,
-				message_type: event.event_type === "assistant_message" ? "final" : "user_message",
+				message_type:
+					event.event_type === "assistant_message"
+						? "final"
+						: event.event_type === "user_message"
+							? "user_message"
+							: event.event_type,
 				role: event.event_type === "user_message" ? "user" : "assistant",
-				content: isRecord(event.data) ? (event.data.content ?? "") : "",
+				content: isRecord(event.data) ? (event.data.content ?? event.data.display_text ?? "") : "",
 				data: event.data ?? {},
 				created_at: event.created_at,
 			}));

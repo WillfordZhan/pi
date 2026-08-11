@@ -23,6 +23,8 @@ describe("JavaMcpClient", () => {
 								{
 									name: "plan_search",
 									description: "Search plans",
+									progressText: "正在查询生产计划",
+									successText: "已查询生产计划",
 									inputSchema: {
 										type: "object",
 										properties: { keyword: { type: "string" } },
@@ -50,14 +52,21 @@ describe("JavaMcpClient", () => {
 			internalToken: "mcp-token",
 			timeoutMs: 1000,
 		});
-		const [tool] = await client.createTools({
+		const tools = await client.createTools({
 			conversationId: "conversation-1",
 			caller: { tenantId: "100", userId: "7" },
 		});
+		const [tool] = tools;
 
 		const result = await tool.execute("tool-call-1", { keyword: "today" }, undefined, undefined, {} as never);
 
 		expect(result.content).toEqual([{ type: "text", text: '{"preview":"found one plan","payload":{"count":1}}' }]);
+		expect(result.details).toMatchObject({
+			presentation: { progressText: "正在查询生产计划", successText: "已查询生产计划" },
+		});
+		expect(client.getPresentationCatalog(tools)).toEqual({
+			plan_search: { progressText: "正在查询生产计划", successText: "已查询生产计划" },
+		});
 		expect(receivedCall).toMatchObject({
 			conversationId: "conversation-1",
 			toolCallId: "tool-call-1",

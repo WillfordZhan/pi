@@ -16,7 +16,15 @@ export interface JavaMcpCallerContext {
 interface JavaMcpToolDescriptor {
 	name: string;
 	description?: string;
+	progressText?: string;
+	successText?: string;
 	inputSchema?: unknown;
+}
+
+/** Tool 展示文案由 Java 业务定义提供，Pi 和前端都不根据工具名猜测业务语义。 */
+export interface ToolPresentation {
+	progressText: string;
+	successText: string;
 }
 
 interface JavaMcpEnvelope<T> {
@@ -80,6 +88,7 @@ export class JavaMcpClient {
 	private readonly internalToken: string;
 	private readonly timeoutMs: number;
 	private readonly fetchImpl: typeof fetch;
+	private readonly presentationCatalogs = new WeakMap<ToolDefinition[], Record<string, ToolPresentation>>();
 
 	constructor(options: JavaMcpClientOptions) {
 		this.baseUrl = options.baseUrl;
@@ -90,13 +99,23 @@ export class JavaMcpClient {
 
 	async createTools(options: CreateJavaMcpToolsOptions): Promise<ToolDefinition[]> {
 		const response = await this.post<JavaMcpListPayload>("/tools/list", {});
-		return (response.tools ?? [])
-			.filter((tool) => tool.name.trim().length > 0)
-			.map((tool) => this.toPiTool(tool, options));
+		const descriptors = (response.tools ?? []).filter((tool) => tool.name.trim().length > 0);
+		const tools = descriptors.map((tool) => this.toPiTool(tool, options));
+		this.presentationCatalogs.set(
+			tools,
+			Object.fromEntries(descriptors.map((tool) => [tool.name, toolPresentation(tool)])),
+		);
+		return tools;
+	}
+
+	/** 返回可安全写入会话 Entry 的紧凑快照，不包含 Tool schema、参数或执行结果。 */
+	getPresentationCatalog(tools: ToolDefinition[]): Record<string, ToolPresentation> {
+		return this.presentationCatalogs.get(tools) ?? {};
 	}
 
 	private toPiTool(tool: JavaMcpToolDescriptor, options: CreateJavaMcpToolsOptions): ToolDefinition {
 		const client = this;
+		const presentation = toolPresentation(tool);
 		return {
 			name: tool.name,
 			label: tool.name,
@@ -118,7 +137,7 @@ export class JavaMcpClient {
 				if (response.ok === false) throw new JavaMcpRequestError(formatToolResult(response));
 				return {
 					content: [{ type: "text", text: formatToolResult(response) }],
-					details: response,
+					details: { ...response, presentation },
 				};
 			},
 		};
@@ -161,4 +180,11 @@ export class JavaMcpClient {
 		if (envelope.data === undefined) throw new JavaMcpRequestError("Java MCP response data is missing");
 		return envelope.data;
 	}
+}
+
+function toolPresentation(tool: JavaMcpToolDescriptor): ToolPresentation {
+	return {
+		progressText: tool.progressText?.trim() || "正在处理业务请求",
+		successText: tool.successText?.trim() || "业务处理已完成",
+	};
 }
