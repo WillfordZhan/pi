@@ -266,6 +266,9 @@ function writeSse(response: ServerResponse, event: string, data: Record<string, 
 	response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+/** 心跳只维持各层空闲连接，不参与会话状态机，前端可以安全忽略。 */
+const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
+
 async function streamConversation(
 	response: ServerResponse,
 	runtime: PiConversationRuntime,
@@ -307,6 +310,7 @@ async function streamConversation(
 					conversation_id: started.conversationId,
 					tool_call_id: event.toolCallId,
 					is_error: event.isError,
+					failure_kind: event.isError ? "business" : undefined,
 					display_text: event.isError ? "本次业务处理未完成" : presentation.successText,
 				});
 			}
@@ -314,6 +318,11 @@ async function streamConversation(
 		conversationId,
 	);
 	let clientDisconnected = false;
+	// 模型长时间思考或 Tool 阻塞时仍需产生字节，避免 Java、Nginx 或移动网络按空闲连接回收 SSE。
+	const heartbeat = setInterval(() => {
+		writeSse(response, "ping", { timestamp: new Date().toISOString() });
+	}, SSE_HEARTBEAT_INTERVAL_MS);
+	heartbeat.unref();
 	const abortOnClose = () => {
 		clientDisconnected = true;
 		started.abort();
@@ -331,6 +340,7 @@ async function streamConversation(
 			});
 		}
 	} finally {
+		clearInterval(heartbeat);
 		response.off("close", abortOnClose);
 		if (!clientDisconnected) response.end();
 	}

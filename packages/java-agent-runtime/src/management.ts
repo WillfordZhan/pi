@@ -37,6 +37,7 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 	const events: SessionEvent[] = [];
 	let presentations: Record<string, Record<string, unknown>> = {};
 	let turnIndex = 0;
+	let pendingFailedToolResultIndex: number | undefined;
 	for (const entry of entries) {
 		if (entry.type === "custom" && entry.customType === "java_tool_presentations" && isRecord(entry.data)) {
 			// 目录快照只影响它之后产生的 Tool Entry，避免文案更新穿越改写历史轮次。
@@ -48,6 +49,7 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message.role === "user") {
+			pendingFailedToolResultIndex = undefined;
 			turnIndex += 1;
 			const data = { content: contentText(message.content, "") };
 			events.push({
@@ -81,9 +83,23 @@ export function projectEntries(entries: SessionEntry[]): SessionEvent[] {
 				visible_in_messages: true,
 				include_in_context: true,
 			});
+			// Pi 会在紧邻的 assistant aborted Entry 中给出结构化终态；先记住候选，避免依赖错误文本匹配。
+			pendingFailedToolResultIndex = message.isError ? events.length - 1 : undefined;
 			continue;
 		}
 		if (message.role !== "assistant") continue;
+		if (message.stopReason === "aborted" && pendingFailedToolResultIndex !== undefined) {
+			const interrupted = events[pendingFailedToolResultIndex];
+			const toolCallId = isRecord(interrupted?.data) ? interrupted.data.tool_call_id : "";
+			interrupted.data = {
+				tool_call_id: toolCallId,
+				display_text: "连接中断，业务处理结果未知，请勿重复操作",
+				is_error: true,
+				failure_kind: "interrupted",
+			};
+			interrupted.summary = "连接中断，业务处理结果未知，请勿重复操作";
+		}
+		pendingFailedToolResultIndex = undefined;
 		for (const block of message.content) {
 			if (block.type === "toolCall") {
 				const presentation = presentations[block.name];

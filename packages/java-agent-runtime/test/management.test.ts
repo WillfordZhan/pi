@@ -193,4 +193,46 @@ describe("projectEntries", () => {
 		});
 		expect(JSON.stringify(event)).not.toContain("raw");
 	});
+
+	it("distinguishes an aborted tool from an ordinary business failure", () => {
+		const entries = [
+			{
+				type: "message",
+				id: "tool-result-1",
+				parentId: null,
+				timestamp: "2026-08-12T08:20:19.498Z",
+				message: {
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "query_stock",
+					content: [{ type: "text", text: "This operation was aborted" }],
+					isError: true,
+					timestamp: 1,
+				},
+			},
+			{
+				type: "message",
+				id: "assistant-1",
+				parentId: "tool-result-1",
+				timestamp: "2026-08-12T08:20:19.500Z",
+				message: {
+					role: "assistant",
+					content: [],
+					stopReason: "aborted",
+					errorMessage: "Request aborted",
+				},
+			},
+		] as unknown as SessionEntry[];
+
+		const [event] = projectEntries(entries);
+		expect(event).toMatchObject({
+			event_type: "tool_result",
+			data: {
+				tool_call_id: "call-1",
+				display_text: "连接中断，业务处理结果未知，请勿重复操作",
+				is_error: true,
+				failure_kind: "interrupted",
+			},
+		});
+	});
 });
