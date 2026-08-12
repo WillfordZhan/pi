@@ -46,6 +46,23 @@ Runtime 提供：
 - `GET /healthz`
 - `GET /ai/management/console/`，Pi 托管的原管理台页面
 
+## 企业微信测试 Channel
+
+Runtime 可以复用同一个 `PiConversationRuntime` 实例连接企业微信智能机器人。该能力默认关闭；只有同时配置 BotID 与 Secret 时才建立 WebSocket 长连接：
+
+```bash
+WECOM_BOT_ID=<企业微信机器人 BotID>
+WECOM_BOT_SECRET=<企业微信机器人 Secret>
+WECOM_ALLOWED_USER_ID=<允许联调的企业微信 userid>
+WECOM_TEST_ERP_USER_ID=<固定测试 ERP userId>
+WECOM_TEST_DEPT_ID=<固定测试工厂 deptId>
+WECOM_TEST_DEPT_NAME=<固定测试工厂名称>
+```
+
+首次联调时将 `WECOM_ALLOWED_USER_ID` 留空。机器人只回复发送人的企业微信 `userid`，不会创建 Pi 会话、调用模型或执行 ERP Tool；确认该 ID 后填入配置并重启 Runtime。测试 Channel 只接受该用户的单聊文字，使用固定 ERP 身份和工厂语义调用现有 Pi AgentSession 与 Java MCP Tool。
+
+固定身份和进程内会话映射只用于联调。扩大机器人可见范围前，必须改为由 Java Gateway 将企业微信用户映射到真实 ERP 用户和当前工厂。Bot Secret 只能存放在本地 `.env` 或部署密钥中，不能提交仓库。
+
 ## Docker 部署到 Star2 DEV
 
 Docker 构建分为两个阶段：`builder` 在 Linux 环境安装依赖并构建全部 Pi workspace 与管理台；`runtime` 只复制生产依赖和构建产物，并以非 root 用户启动 `dist/main.js`。镜像固定构建为 `linux/amd64`，与 Star2 的 `x86_64` 架构一致。

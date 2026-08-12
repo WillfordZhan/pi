@@ -33,6 +33,14 @@ services:
       QWEN_API_KEY_FILE: /run/secrets/qwen-api-key
       QWEN_API_BASE: https://dashscope.aliyuncs.com/compatible-mode/v1
 
+      # 测试 Channel 使用固定 ERP 身份；白名单为空时只回显企微 userid，不调用 Pi。
+      WECOM_BOT_ID: ${WECOM_BOT_ID:-}
+      WECOM_BOT_SECRET: ${WECOM_BOT_SECRET:-}
+      WECOM_ALLOWED_USER_ID: ${WECOM_ALLOWED_USER_ID:-}
+      WECOM_TEST_ERP_USER_ID: ${WECOM_TEST_ERP_USER_ID:-}
+      WECOM_TEST_DEPT_ID: ${WECOM_TEST_DEPT_ID:-}
+      WECOM_TEST_DEPT_NAME: ${WECOM_TEST_DEPT_NAME:-}
+
     volumes:
       # create_host_path=false 可以在目录或密钥漏传时立即失败，避免 Docker 创建 root 权限的错误目录。
       - type: bind
@@ -52,4 +60,3 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-

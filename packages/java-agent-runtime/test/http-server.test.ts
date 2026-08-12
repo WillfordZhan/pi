@@ -120,7 +120,17 @@ describe("SSE conversation", () => {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const { port } = server.address() as AddressInfo;
 		const contextPayload = Buffer.from(
-			JSON.stringify({ tenantId: "100", userId: "7", exp: Math.floor(Date.now() / 1000) + 60 }),
+			JSON.stringify({
+				tenantId: "100",
+				userId: "7",
+				conversationContext: {
+					userId: "7",
+					tenantDeptId: "100",
+					deptName: "一号工厂",
+					furnaces: [{ fnCode: "1号炉" }],
+				},
+				exp: Math.floor(Date.now() / 1000) + 60,
+			}),
 		).toString("base64url");
 		const signature = createHmac("sha256", config.contextSignSecret).update(contextPayload).digest("base64url");
 		const client = httpRequest({
@@ -178,7 +188,17 @@ describe("multipart conversation", () => {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const { port } = server.address() as AddressInfo;
 		const contextPayload = Buffer.from(
-			JSON.stringify({ tenantId: "100", userId: "7", exp: Math.floor(Date.now() / 1000) + 60 }),
+			JSON.stringify({
+				tenantId: "100",
+				userId: "7",
+				conversationContext: {
+					userId: "7",
+					tenantDeptId: "100",
+					deptName: "一号工厂",
+					furnaces: [{ fnCode: "1号炉" }],
+				},
+				exp: Math.floor(Date.now() / 1000) + 60,
+			}),
 		).toString("base64url");
 		const signature = createHmac("sha256", config.contextSignSecret).update(contextPayload).digest("base64url");
 		const formData = new FormData();
@@ -197,6 +217,12 @@ describe("multipart conversation", () => {
 		expect(capturedInput).toMatchObject({
 			query: "请分析这些图片",
 			images: [{ type: "image", mimeType: "image/png", data: TINY_PNG_BASE64 }],
+			businessContext: {
+				userId: "7",
+				tenantDeptId: "100",
+				deptName: "一号工厂",
+				furnaces: [{ fnCode: "1号炉" }],
+			},
 		});
 	});
 

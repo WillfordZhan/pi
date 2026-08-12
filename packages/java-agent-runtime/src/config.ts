@@ -25,6 +25,17 @@ export interface RuntimeConfig {
 	qwenApiKey?: string;
 	qwenApiKeyFile?: string;
 	qwenApiBase: string;
+	weCom?: WeComChannelConfig;
+}
+
+/** 企业微信测试 Channel 只保存部署配置，不在 Runtime 内推导或查询 ERP 身份。 */
+export interface WeComChannelConfig {
+	botId: string;
+	botSecret: string;
+	allowedUserId?: string;
+	testErpUserId: string;
+	testDeptId: string;
+	testDeptName: string;
 }
 
 function requiredEnvironment(name: string, environment: NodeJS.ProcessEnv): string {
@@ -49,6 +60,31 @@ function parsePositiveNumber(name: string, value: string | undefined, fallback: 
 
 function trimTrailingSlash(value: string): string {
 	return value.replace(/\/+$/u, "");
+}
+
+function decimalId(name: string, value: string | undefined): string {
+	const normalized = value?.trim() ?? "";
+	if (!/^[1-9]\d*$/u.test(normalized)) throw new Error(`${name} must be a positive decimal integer`);
+	return normalized;
+}
+
+/**
+ * BotID 与 Secret 必须成对出现；完全不配置时保持现有纯 HTTP Runtime 行为。
+ * 固定 ERP 身份仅用于单人白名单联调，正式接入应由 Java Gateway 动态解析。
+ */
+function loadWeComChannelConfig(environment: NodeJS.ProcessEnv): WeComChannelConfig | undefined {
+	const botId = environment.WECOM_BOT_ID?.trim() ?? "";
+	const botSecret = environment.WECOM_BOT_SECRET?.trim() ?? "";
+	if (!botId && !botSecret) return undefined;
+	if (!botId || !botSecret) throw new Error("WECOM_BOT_ID and WECOM_BOT_SECRET must be configured together");
+	return {
+		botId,
+		botSecret,
+		allowedUserId: environment.WECOM_ALLOWED_USER_ID?.trim() || undefined,
+		testErpUserId: decimalId("WECOM_TEST_ERP_USER_ID", environment.WECOM_TEST_ERP_USER_ID),
+		testDeptId: decimalId("WECOM_TEST_DEPT_ID", environment.WECOM_TEST_DEPT_ID),
+		testDeptName: requiredEnvironment("WECOM_TEST_DEPT_NAME", environment),
+	};
 }
 
 function resolveKeyFile(
@@ -99,5 +135,6 @@ export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env):
 		qwenApiKey: environment.QWEN_API_KEY?.trim() || undefined,
 		qwenApiKeyFile: resolveKeyFile(environment.QWEN_API_KEY_FILE, environment, workingDirectory),
 		qwenApiBase: environment.QWEN_API_BASE?.trim() || "https://dashscope.aliyuncs.com/compatible-mode/v1",
+		weCom: loadWeComChannelConfig(environment),
 	};
 }

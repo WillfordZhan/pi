@@ -29,5 +29,31 @@ describe("loadRuntimeConfig", () => {
 		});
 		expect(config.sessionDirectory).toBe("/tmp/pi-runtime/sessions");
 		expect(config.manageConsoleDirectory).toContain("packages/java-agent-runtime/static/manage-console");
+		expect(config.weCom).toBeUndefined();
+	});
+
+	it("loads the optional WeCom test channel without converting large ERP IDs to numbers", () => {
+		const config = loadRuntimeConfig({
+			PI_RUNTIME_CWD: "/tmp/pi-runtime",
+			AI_GATEWAY_INTERNAL_TOKEN: "gateway-token",
+			AI_GATEWAY_CONTEXT_SIGN_SECRET: "context-secret",
+			MCP_BASE_URL: "http://127.0.0.1:10002/epservice/ai/mcp",
+			MCP_API_TOKEN: "mcp-token",
+			WECOM_BOT_ID: "bot-id",
+			WECOM_BOT_SECRET: "bot-secret",
+			WECOM_ALLOWED_USER_ID: "wecom-user",
+			WECOM_TEST_ERP_USER_ID: "1942403262651006977",
+			WECOM_TEST_DEPT_ID: "1955839459465793537",
+			WECOM_TEST_DEPT_NAME: "ERP开发工厂",
+		});
+
+		expect(config.weCom).toEqual({
+			botId: "bot-id",
+			botSecret: "bot-secret",
+			allowedUserId: "wecom-user",
+			testErpUserId: "1942403262651006977",
+			testDeptId: "1955839459465793537",
+			testDeptName: "ERP开发工厂",
+		});
 	});
 });

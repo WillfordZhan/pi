@@ -16,6 +16,7 @@ import type { JavaMcpCallerContext } from "./java-mcp.ts";
 import { ManagementRequestError, PiManagementService } from "./management.ts";
 import {
 	ConversationAccessDeniedError,
+	type ConversationBusinessContext,
 	type ConversationInput,
 	ConversationNotFoundError,
 	type PiConversationRuntime,
@@ -25,6 +26,8 @@ const MAX_JSON_REQUEST_BODY_BYTES = 1024 * 1024;
 const MAX_CONVERSATION_REQUEST_BODY_BYTES = 52 * 1024 * 1024;
 const MAX_IMAGE_COUNT = 5;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_CONTEXT_TEXT_LENGTH = 200;
+const MAX_CONTEXT_FURNACES = 100;
 const DEFAULT_IMAGE_QUERY = "请分析这些图片";
 
 class HttpRequestError extends Error {
@@ -68,7 +71,54 @@ export function normalizeUserId(value: unknown): string {
 	return "";
 }
 
-function parseCallerContext(request: IncomingMessage, config: RuntimeConfig): JavaMcpCallerContext {
+interface SignedCallerContext {
+	caller: JavaMcpCallerContext;
+	businessContext?: ConversationBusinessContext;
+}
+
+/** 只接收与签名调用人一致的业务上下文，防止跨用户或跨工厂语义被写入会话。 */
+function parseConversationBusinessContext(
+	value: unknown,
+	caller: JavaMcpCallerContext,
+): ConversationBusinessContext | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new HttpRequestError(401, "invalid conversation context");
+	}
+	const data = value as Record<string, unknown>;
+	const userId = normalizeUserId(data.userId);
+	const tenantDeptId = normalizeTenantId(data.tenantDeptId);
+	if (userId !== caller.userId || tenantDeptId !== caller.tenantId) {
+		throw new HttpRequestError(401, "conversation context does not match caller");
+	}
+
+	let deptName: string | undefined;
+	if (data.deptName !== undefined && data.deptName !== null) {
+		if (typeof data.deptName !== "string") throw new HttpRequestError(401, "invalid conversation context deptName");
+		deptName = data.deptName.trim();
+		if (!deptName || deptName.length > MAX_CONTEXT_TEXT_LENGTH) {
+			throw new HttpRequestError(401, "invalid conversation context deptName");
+		}
+	}
+
+	const rawFurnaces = data.furnaces ?? [];
+	if (!Array.isArray(rawFurnaces) || rawFurnaces.length > MAX_CONTEXT_FURNACES) {
+		throw new HttpRequestError(401, "invalid conversation context furnaces");
+	}
+	const furnaces = rawFurnaces.map((value) => {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			throw new HttpRequestError(401, "invalid conversation context furnace");
+		}
+		const fnCode = (value as Record<string, unknown>).fnCode;
+		if (typeof fnCode !== "string" || !fnCode.trim() || fnCode.trim().length > MAX_CONTEXT_TEXT_LENGTH) {
+			throw new HttpRequestError(401, "invalid conversation context furnace");
+		}
+		return { fnCode: fnCode.trim() };
+	});
+	return { userId, tenantDeptId, ...(deptName ? { deptName } : {}), furnaces };
+}
+
+function parseCallerContext(request: IncomingMessage, config: RuntimeConfig): SignedCallerContext {
 	const rawContext = getHeader(request, "x-ai-biz-context");
 	if (!rawContext) throw new HttpRequestError(401, "missing business context");
 	const parts = rawContext.split(".");
@@ -102,7 +152,9 @@ function parseCallerContext(request: IncomingMessage, config: RuntimeConfig): Ja
 	if (expiresAt + config.clockSkewSeconds <= Math.floor(Date.now() / 1000)) {
 		throw new HttpRequestError(401, "expired business context");
 	}
-	return { tenantId, userId };
+	const caller = { tenantId, userId };
+	const businessContext = parseConversationBusinessContext(data.conversationContext, caller);
+	return { caller, ...(businessContext ? { businessContext } : {}) };
 }
 
 /** 所有会进入内存的请求体必须先经过字节上限，避免 Content-Length 缺失时无界缓冲。 */
@@ -483,9 +535,12 @@ export function createHttpServer(runtime: PiConversationRuntime, config: Runtime
 				return;
 			}
 			requireGatewayToken(request, config);
-			const caller = parseCallerContext(request, config);
+			const { caller, businessContext } = parseCallerContext(request, config);
 			if (request.method === "POST" && url.pathname === "/ai/conversations") {
-				const input = await readConversationBody(request);
+				const input = {
+					...(await readConversationBody(request)),
+					...(businessContext ? { businessContext } : {}),
+				};
 				if (acceptsEventStream(request)) {
 					await streamConversation(response, runtime, caller, input);
 					return;

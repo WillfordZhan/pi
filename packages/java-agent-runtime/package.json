@@ -26,7 +26,8 @@
 	},
 	"dependencies": {
 		"@earendil-works/pi-ai": "^0.83.0",
-		"@earendil-works/pi-coding-agent": "^0.83.0"
+		"@earendil-works/pi-coding-agent": "^0.83.0",
+		"@wecom/aibot-node-sdk": "1.0.7"
 	},
 	"devDependencies": {
 		"@types/node": "22.19.19",
