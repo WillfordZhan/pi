@@ -1,5 +1,6 @@
 /** Java v2 原生会话 Entry 持久化客户端。 */
 
+import { writeFileSync } from "node:fs";
 import { contentText } from "../../ai/src/utils/text.ts";
 import { type SessionEntry, SessionManager } from "../../coding-agent/src/core/session-manager.ts";
 import type { RuntimeConfig } from "./config.ts";
@@ -41,6 +42,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Java 返回的是持久化 JSON，恢复前至少校验 SessionManager 建树依赖的公共字段。 */
+function isSessionEntry(value: unknown): value is SessionEntry {
+	if (!isRecord(value)) return false;
+	if (
+		typeof value.type !== "string" ||
+		!value.type ||
+		typeof value.id !== "string" ||
+		!value.id ||
+		typeof value.timestamp !== "string" ||
+		!value.timestamp
+	) {
+		return false;
+	}
+	if (value.parentId !== null && typeof value.parentId !== "string") return false;
+	if (value.type === "message") return isRecord(value.message) && typeof value.message.role === "string";
+	if (value.type === "custom") return typeof value.customType === "string";
+	return [
+		"thinking_level_change",
+		"model_change",
+		"compaction",
+		"branch_summary",
+		"custom_message",
+		"label",
+		"session_info",
+	].includes(value.type);
+}
+
 /**
  * Pi JSONL 必须保留图片，模型才能在后续轮次继续引用；Java 表只是管理查询读模型，
  * 若复制 Base64 会让同一附件占用两份持久化空间，并把时间线查询放大到数十 MiB。
@@ -72,10 +100,60 @@ function entriesToSync(entries: readonly SessionEntry[]): SessionEntry[] {
 			break;
 		}
 	}
-	return entries
-		.slice(lastMarkerIndex + 1)
-		.filter((entry) => !(entry.type === "custom" && entry.customType === SYNC_MARKER_TYPE))
-		.map(entryForJavaStore);
+	// marker 位于末尾代表没有新增 Entry；有新增内容时必须携带边界 marker，
+	// 否则下一条 Entry 的 parentId 会在 Java 镜像中指向不存在的节点。
+	if (lastMarkerIndex === entries.length - 1) return [];
+	return entries.slice(Math.max(0, lastMarkerIndex)).map(entryForJavaStore);
+}
+
+/**
+ * 旧镜像过滤了同步 marker，但下一轮首条 Entry 仍会引用它。恢复时只为缺失父节点
+ * 合成不参与模型上下文的 marker，既保留原 Entry ID，也让 SessionManager 能走回完整历史。
+ */
+function repairLegacyMarkerGaps(entries: readonly SessionEntry[]): SessionEntry[] {
+	const restored: SessionEntry[] = [];
+	const seenIds = new Set<string>();
+	for (const entry of entries) {
+		if (seenIds.has(entry.id)) throw new Error(`conversation store entry id duplicated: ${entry.id}`);
+		if (entry.parentId !== null && !seenIds.has(entry.parentId)) {
+			const previous = restored.at(-1);
+			if (!previous) throw new Error(`conversation store entry parent missing: ${entry.parentId}`);
+			const marker: SessionEntry = {
+				type: "custom",
+				customType: SYNC_MARKER_TYPE,
+				data: { lastEntryId: previous.id },
+				id: entry.parentId,
+				parentId: previous.id,
+				timestamp: entry.timestamp,
+			};
+			restored.push(marker);
+			seenIds.add(marker.id);
+		}
+		restored.push(entry);
+		seenIds.add(entry.id);
+	}
+	return restored;
+}
+
+/**
+ * Java 仅保存 Pi 原始 Entry，不保存 Session Header。本地会话丢失时由 Pi 创建当前版本 Header，
+ * 再把已校验 Entry 一次性写成标准 JSONL，后续仍完全交给 SessionManager 管理和追加。
+ */
+export function restoreConversationSession(
+	config: RuntimeConfig,
+	conversationId: string,
+	entries: readonly SessionEntry[],
+): SessionManager {
+	if (entries.length === 0) throw new Error("conversation store has no entries to restore");
+	const manager = SessionManager.create(config.workingDirectory, config.sessionDirectory, { id: conversationId });
+	const header = manager.getHeader();
+	const sessionFile = manager.getSessionFile();
+	if (!header || !sessionFile) throw new Error("Pi session restore target unavailable");
+
+	// ponytail: 同进程由 conversationQueues 串行；共享会话卷的多实例写入需要在启用多副本前增加租约锁。
+	const fileEntries = [header, ...repairLegacyMarkerGaps(entries)];
+	writeFileSync(sessionFile, `${fileEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { flag: "wx" });
+	return SessionManager.open(sessionFile, config.sessionDirectory, config.workingDirectory);
 }
 
 /**
@@ -129,8 +207,8 @@ export class JavaConversationStoreClient {
 		return this.request<Record<string, unknown>>("/ai/internal/store/v2/conversations/search", "POST", request);
 	}
 
-	/** Entry 保持 Pi 原始结构返回，由管理层按当前 Pi 版本统一投影。 */
-	async listEntries(conversationId: string, caller?: JavaMcpCallerContext): Promise<unknown[]> {
+	/** Entry 保持 Pi 原始结构返回；非法数据不能进入展示投影或 SessionManager。 */
+	async listEntries(conversationId: string, caller?: JavaMcpCallerContext): Promise<SessionEntry[]> {
 		const ownerQuery = caller
 			? `?deptId=${encodeURIComponent(caller.tenantId)}&userId=${encodeURIComponent(caller.userId)}`
 			: "";
@@ -138,7 +216,9 @@ export class JavaConversationStoreClient {
 			`/ai/internal/store/v2/conversations/${encodeURIComponent(conversationId)}/entries${ownerQuery}`,
 			"GET",
 		);
-		if (!Array.isArray(entries)) throw new Error("conversation store entries response invalid");
+		if (!Array.isArray(entries) || !entries.every(isSessionEntry)) {
+			throw new Error("conversation store entries response invalid");
+		}
 		return entries;
 	}
 
