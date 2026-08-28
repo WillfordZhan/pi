@@ -3,9 +3,20 @@
  */
 
 import { type Content, FinishReason, FunctionCallingConfigMode, type Part } from "@google/genai";
-import type { Context, ImageContent, Model, StopReason, TextContent, Tool } from "../types.ts";
+import type {
+	Context,
+	ImageContent,
+	Model,
+	ModelThinkingLevel,
+	StopReason,
+	StreamOptions,
+	TextContent,
+	ThinkingLevel,
+	Tool,
+} from "../types.ts";
+import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
-import { resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
+import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { transformMessages } from "./transform-messages.ts";
 
 /** Google provider 的 API 类型：Google AI Studio 或 Vertex。 */
@@ -15,7 +26,30 @@ type GoogleApiType = "google-generative-ai" | "google-vertex";
  * Gemini 3 模型的思考级别。
  * 与 Google 的 ThinkingLevel 枚举值保持一致。
  */
-export type GoogleThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
+export type GoogleApiThinkingLevel = "THINKING_LEVEL_UNSPECIFIED" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
+export type ResolvedGoogleThinkingLevel = Exclude<ThinkingLevel, "xhigh" | "max">;
+
+/** Resolve a supported pi level or model-specific Google mapping to a standard Google level. */
+export function resolveGoogleThinkingLevel<T extends GoogleApiType>(
+	model: Model<T>,
+	level: ModelThinkingLevel,
+): ResolvedGoogleThinkingLevel {
+	if (level === "off") return "high";
+
+	const mapped = model.thinkingLevelMap?.[level];
+	const resolvedLevel = typeof mapped === "string" ? mapped.toLowerCase() : level;
+	switch (resolvedLevel) {
+		case "minimal":
+		case "low":
+		case "medium":
+		case "high":
+			return resolvedLevel;
+		default:
+			throw new Error(
+				`Unsupported Google thinking level mapping for ${model.provider}/${model.id}: ${level} -> ${String(mapped)}`,
+			);
+	}
+}
 
 /**
  * 判断流式返回的 Gemini `Part` 是否应被当作“思考”内容。
@@ -71,7 +105,12 @@ function resolveThoughtSignature(isSameProviderAndModel: boolean, signature: str
  * （如 Claude、GPT-OSS 系列）。
  */
 export function requiresToolCallId(modelId: string): boolean {
-	return modelId.startsWith("claude-") || modelId.startsWith("gpt-oss-");
+	const geminiMajorVersion = getGeminiMajorVersion(modelId);
+	return (
+		modelId.startsWith("claude-") ||
+		modelId.startsWith("gpt-oss-") ||
+		(geminiMajorVersion !== undefined && geminiMajorVersion >= 3)
+	);
 }
 
 /** 解析 Gemini 主版本号（如 gemini-3 → 3），无法识别时返回 undefined。 */
@@ -283,17 +322,22 @@ function sanitizeForOpenApi(schema: unknown): unknown {
 export function convertTools(
 	tools: Tool[],
 	useParameters = false,
+	supportsStrictMode = true,
 ): { functionDeclarations: Record<string, unknown>[] }[] | undefined {
 	if (tools.length === 0) return undefined;
 	return [
 		{
-			functionDeclarations: tools.map((tool) => ({
-				name: tool.name,
-				description: tool.description,
-				...(useParameters
-					? { parameters: sanitizeForOpenApi(tool.parameters as unknown) }
-					: { parametersJsonSchema: tool.parameters }),
-			})),
+			functionDeclarations: tools.map((tool) => {
+				const strict = resolveJsonSchemaStrictSampling(tool, supportsStrictMode);
+				const parameters = getJsonSchemaToolParameters(tool, strict);
+				return {
+					name: tool.name,
+					description: tool.description,
+					...(useParameters
+						? { parameters: sanitizeForOpenApi(parameters as unknown) }
+						: { parametersJsonSchema: parameters }),
+				};
+			}),
 		},
 	];
 }
@@ -381,4 +425,36 @@ export function mapStopReasonString(reason: string): StopReason {
 		default:
 			return "error";
 	}
+}
+
+/**
+ * Run a Google GenAI SDK request with the shared provider retry policy
+ * (408/409/429/5xx with backoff, honoring retry-after), mirroring how the
+ * Anthropic and OpenAI adapters wrap their initial request in
+ * retryProviderRequest. The SDK's ApiError has a `status` property but no
+ * `headers` property, and retryProviderRequest only retries errors that carry
+ * both, so normalize the error by adding the missing `headers` before
+ * rethrowing.
+ */
+export function retryGoogleRequest<T>(
+	request: () => Promise<T>,
+	options?: Pick<StreamOptions, "maxRetries" | "maxRetryDelayMs" | "signal">,
+): Promise<T> {
+	return retryProviderRequest(
+		async () => {
+			try {
+				return await request();
+			} catch (error) {
+				if (error instanceof Error && "status" in error && !("headers" in error)) {
+					(error as { headers?: Headers }).headers = undefined;
+				}
+				throw error;
+			}
+		},
+		{
+			maxRetries: options?.maxRetries,
+			maxRetryDelayMs: options?.maxRetryDelayMs,
+			signal: options?.signal,
+		},
+	);
 }

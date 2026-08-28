@@ -8,7 +8,7 @@ import {
 	type ResultForCommand,
 	type ServerEvent,
 	type ServerSnapshot,
-	type SessionSummary,
+	type SessionMetadata,
 } from "@earendil-works/pi-protocol";
 import { Connection } from "./connection.ts";
 import {
@@ -93,7 +93,6 @@ export class PiClient {
 		this.#options = options;
 		this.#state = new ClientState(options.onListenerError);
 		this.#connection = new Connection({
-			token: options.token,
 			transportFactory: options.transportFactory,
 			maxFrameLength: options.maxFrameLength,
 			onHandshake: (snapshot) => this.#state.applyServerSnapshot(snapshot),
@@ -170,8 +169,7 @@ export class PiClient {
 		return () => this.#connectionStateListeners.delete(listener);
 	}
 
-	/** 列出服务器上的全部会话。 */
-	async listSessions(): Promise<readonly SessionSummary[]> {
+	async listSessions(): Promise<readonly SessionMetadata[]> {
 		return (await this.#request({ command: "list" })).sessions;
 	}
 

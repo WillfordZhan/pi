@@ -2,7 +2,7 @@ import type { ClientMessageDecoder } from "@earendil-works/pi-protocol";
 
 import type { MaybePromise } from "./types.ts";
 
-/** 一条已连接的有序字节通道，是 PiServer 与传输无关的领域核心所依赖的最小抽象。 */
+/** An established, authorized ordered byte connection. */
 export interface ByteConnection {
 	/** 连接是否已关闭（用于判断是否还能继续发送数据）。 */
 	readonly closed: boolean;

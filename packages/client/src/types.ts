@@ -19,9 +19,6 @@ export type ListenerErrorHandler = (error: Error) => void;
 
 /** 创建 {@link PiClient} 时的配置选项。 */
 export interface PiClientOptions {
-	/** 用于身份认证的访问令牌。 */
-	token: string;
-	/** 传输层工厂：为每次连接尝试创建底层字节传输。 */
 	transportFactory: ByteTransportFactory;
 	/** 单帧最大长度（字节），用于编解码校验。 */
 	maxFrameLength?: number;

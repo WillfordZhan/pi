@@ -1,4 +1,4 @@
-import { Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
+import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
 /** 垂直栈布局：子组件自上而下垂直排列，条目之间用空行填充间隙。 */
 export class VStack extends Stack {
@@ -16,12 +16,21 @@ export class VStack extends Stack {
 	override render(width: number): string[] {
 		const viewport = { width: Math.max(1, width), height: Number.MAX_SAFE_INTEGER };
 		const entries = visibleStackEntries(this.entries, viewport);
+		const rendered = entries.map((entry) => entry.component.render(viewport.width));
+		const sizes = allocateStackSizes(
+			entries,
+			rendered.map((lines) => lines.length),
+			undefined,
+			this.gap,
+		);
 		const lines: string[] = [];
 		for (let index = 0; index < entries.length; index++) {
 			if (index > 0) {
 				for (let gap = 0; gap < this.gap; gap++) lines.push("");
 			}
-			lines.push(...entries[index]!.component.render(viewport.width));
+			const childLines = rendered[index]!.slice(0, sizes[index]);
+			lines.push(...childLines);
+			for (let padding = childLines.length; padding < sizes[index]!; padding++) lines.push("");
 		}
 		return lines;
 	}

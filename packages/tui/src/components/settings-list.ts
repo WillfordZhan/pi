@@ -16,8 +16,12 @@ export interface SettingItem {
 	currentValue: string;
 	/** 若提供，按 Enter/Space 会在这些值之间循环切换 */
 	values?: string[];
-	/** 若提供，按 Enter 会打开该子菜单。接收当前值和完成回调。 */
-	submenu?: (currentValue: string, done: (selectedValue?: string) => void) => Component;
+	/** If provided, Enter opens this submenu. Receives current value and done callback.
+	 *  done() accepts an optional selectedValue and an optional navigateTo id to move the cursor after close. */
+	submenu?: (
+		currentValue: string,
+		done: (selectedValue?: string, options?: { navigateTo?: string }) => void,
+	) => Component;
 }
 
 /** 设置列表的主题样式函数集合。 */
@@ -50,6 +54,7 @@ export class SettingsList implements Component {
 	// 子菜单状态
 	private submenuComponent: Component | null = null;
 	private submenuItemIndex: number | null = null;
+	private navigateAfterClose: string | null = null;
 
 	/**
 	 * @param items 设置项列表。
@@ -87,7 +92,15 @@ export class SettingsList implements Component {
 		}
 	}
 
-	/** 使子菜单或自身失效。 */
+	/** Move selection to the item with the given id (no-op if not found). */
+	selectItem(id: string): void {
+		const items = this.searchEnabled ? this.filteredItems : this.items;
+		const index = items.findIndex((i) => i.id === id);
+		if (index !== -1) {
+			this.selectedIndex = index;
+		}
+	}
+
 	invalidate(): void {
 		this.submenuComponent?.invalidate?.();
 	}
@@ -133,8 +146,8 @@ export class SettingsList implements Component {
 		);
 		const endIndex = Math.min(startIndex + this.maxVisible, displayItems.length);
 
-		// 计算最大标签宽度以便对齐右侧的值
-		const maxLabelWidth = Math.min(30, Math.max(...this.items.map((item) => visibleWidth(item.label))));
+		// Calculate max label width for alignment
+		const maxLabelWidth = Math.min(36, Math.max(...this.items.map((item) => visibleWidth(item.label))));
 
 		// 渲染可见条目
 		for (let i = startIndex; i < endIndex; i++) {
@@ -220,13 +233,19 @@ export class SettingsList implements Component {
 		if (item.submenu) {
 			// 打开子菜单，传入当前值以便子菜单正确预选
 			this.submenuItemIndex = this.selectedIndex;
-			this.submenuComponent = item.submenu(item.currentValue, (selectedValue?: string) => {
-				if (selectedValue !== undefined) {
-					item.currentValue = selectedValue;
-					this.onChange(item.id, selectedValue);
-				}
-				this.closeSubmenu();
-			});
+			this.submenuComponent = item.submenu(
+				item.currentValue,
+				(selectedValue?: string, options?: { navigateTo?: string }) => {
+					if (selectedValue !== undefined) {
+						item.currentValue = selectedValue;
+						this.onChange(item.id, selectedValue);
+					}
+					if (options?.navigateTo) {
+						this.navigateAfterClose = options.navigateTo;
+					}
+					this.closeSubmenu();
+				},
+			);
 		} else if (item.values && item.values.length > 0) {
 			// 循环切换值
 			const currentIndex = item.values.indexOf(item.currentValue);
@@ -240,8 +259,15 @@ export class SettingsList implements Component {
 	/** 关闭子菜单，并把选中项恢复到打开子菜单前的条目。 */
 	private closeSubmenu(): void {
 		this.submenuComponent = null;
-		// 恢复选中到打开子菜单的条目
-		if (this.submenuItemIndex !== null) {
+		if (this.navigateAfterClose !== null) {
+			const id = this.navigateAfterClose;
+			this.navigateAfterClose = null;
+			this.submenuItemIndex = null;
+			this.selectItem(id);
+			// Open the target item's submenu automatically
+			this.activateItem();
+		} else if (this.submenuItemIndex !== null) {
+			// Restore selection to the item that opened the submenu
 			this.selectedIndex = this.submenuItemIndex;
 			this.submenuItemIndex = null;
 		}

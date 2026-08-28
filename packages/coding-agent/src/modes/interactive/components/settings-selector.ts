@@ -1,35 +1,30 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Transport } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Model, type Transport } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	Container,
 	getCapabilities,
 	type ScrollViewScrollbar,
 	type SelectItem,
-	SelectList,
-	type SelectListLayoutOptions,
 	type SettingItem,
 	SettingsList,
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
-import type { DefaultProjectTrust, UiMode, WarningSettings } from "../../../core/settings-manager.ts";
-import {
-	getSelectListTheme,
-	getSettingsListTheme,
-	parseAutoThemeSetting,
-	type TerminalTheme,
-	theme,
-} from "../theme/theme.ts";
+import type {
+	DefaultProjectTrust,
+	FullscreenExitOutput,
+	MermaidRenderingMode,
+	TuiMode,
+	WarningSettings,
+} from "../../../core/settings-manager.ts";
+import { getSettingsListTheme, parseAutoThemeSetting, type TerminalTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
+import { SelectSubmenu, SteppedSubmenu, type SteppedSubmenuStep } from "./settings-submenu.ts";
 
-/** 设置子菜单中选项列表的布局约束：主列（选项名）宽度区间。 */
-const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
-	minPrimaryColumnWidth: 12,
-	maxPrimaryColumnWidth: 32,
-};
+const MODEL_PICKER_LAYOUT = { minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 46 };
 
 /** 各思考级别的说明文案，展示在“思考级别”子菜单中。 */
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
@@ -57,6 +52,9 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 /** 设置选择器所需的全部配置值（当前设置状态快照）。 */
 export interface SettingsConfig {
 	autoCompact: boolean;
+	defaultModel: string;
+	currentModel?: Model<any>;
+	availableDefaultModels: readonly Model<any>[];
 	showImages: boolean;
 	imageWidthCells: number;
 	autoResizeImages: boolean;
@@ -68,10 +66,12 @@ export interface SettingsConfig {
 	httpIdleTimeoutMs: number;
 	thinkingLevel: ThinkingLevel;
 	availableThinkingLevels: ThinkingLevel[];
+	modelThinkingLevels: Record<string, ThinkingLevel>;
 	currentTheme: string;
 	terminalTheme: TerminalTheme;
 	availableThemes: string[];
 	hideThinkingBlock: boolean;
+	mermaidRenderingMode: MermaidRenderingMode;
 	showCacheMissNotices: boolean;
 	collapseChangelog: boolean;
 	enableInstallTelemetry: boolean;
@@ -85,8 +85,10 @@ export interface SettingsConfig {
 	defaultProjectTrust: DefaultProjectTrust;
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
-	uiMode: UiMode;
+	tuiMode: TuiMode;
+	fullscreenExitOutput: FullscreenExitOutput;
 	fullscreenScrollbar: ScrollViewScrollbar;
+	fullscreenCopyOnSelect: boolean;
 	warnings: WarningSettings;
 }
 
@@ -102,10 +104,12 @@ export interface SettingsCallbacks {
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
 	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
-	onThinkingLevelChange: (level: ThinkingLevel) => void;
+	onModelThinkingLevelChange: (provider: string, modelId: string, level: ThinkingLevel) => void;
+	onModelThinkingLevelRemove: (provider: string, modelId: string) => void;
 	onThemeChange: (theme: string) => void;
 	onThemePreview?: (theme: string) => void;
 	onHideThinkingBlockChange: (hidden: boolean) => void;
+	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onShowCacheMissNoticesChange: (shown: boolean) => void;
 	onCollapseChangelogChange: (collapsed: boolean) => void;
 	onEnableInstallTelemetryChange: (enabled: boolean) => void;
@@ -119,8 +123,10 @@ export interface SettingsCallbacks {
 	onDefaultProjectTrustChange: (defaultProjectTrust: DefaultProjectTrust) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
 	onShowTerminalProgressChange: (enabled: boolean) => void;
-	onUiModeChange: (mode: UiMode) => void;
+	onTuiModeChange: (mode: TuiMode) => void;
+	onFullscreenExitOutputChange: (output: FullscreenExitOutput) => void;
 	onFullscreenScrollbarChange: (mode: ScrollViewScrollbar) => void;
+	onFullscreenCopyOnSelectChange: (enabled: boolean) => void;
 	onWarningsChange: (warnings: WarningSettings) => void;
 	onCancel: () => void;
 }
@@ -171,69 +177,24 @@ class WarningSettingsSubmenu extends Container {
 	}
 }
 
-/** 通用单选子菜单：展示标题、说明与一个选项列表，支持取消与选择回调。 */
-class SelectSubmenu extends Container {
-	private selectList: SelectList;
+const CLEAR_OVERRIDE_VALUE = "__clear__";
 
-	constructor(
-		title: string,
-		description: string,
-		options: SelectItem[],
-		currentValue: string,
-		onSelect: (value: string) => void,
-		onCancel: () => void,
-		onSelectionChange?: (value: string) => void,
-	) {
-		super();
+function modelSettingKey(model: Model<any>): string {
+	return `${model.provider}/${model.id}`;
+}
 
-		// Title
-		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+function modelDisplayLabel(model: Model<any>): string {
+	return `${model.id} [${model.provider}]`;
+}
 
-		// Description
-		if (description) {
-			this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("muted", description), 0, 0));
-		}
+function modelThinkingOverridesSummary(overrides: Record<string, ThinkingLevel>): string {
+	const count = Object.keys(overrides).length;
+	if (count === 0) return "none";
+	return `${count} configured`;
+}
 
-		// Spacer
-		this.addChild(new Spacer(1));
-
-		// Select list
-		this.selectList = new SelectList(
-			options,
-			Math.min(options.length, 10),
-			getSelectListTheme(),
-			SETTINGS_SUBMENU_SELECT_LIST_LAYOUT,
-		);
-
-		// Pre-select current value
-		const currentIndex = options.findIndex((o) => o.value === currentValue);
-		if (currentIndex !== -1) {
-			this.selectList.setSelectedIndex(currentIndex);
-		}
-
-		this.selectList.onSelect = (item) => {
-			onSelect(item.value);
-		};
-
-		this.selectList.onCancel = onCancel;
-
-		if (onSelectionChange) {
-			this.selectList.onSelectionChange = (item) => {
-				onSelectionChange(item.value);
-			};
-		}
-
-		this.addChild(this.selectList);
-
-		// Hint
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0));
-	}
-
-	handleInput(data: string): void {
-		this.selectList.handleInput(data);
-	}
+function modelItemLabel(model: Model<any>): string {
+	return `${model.id} ${theme.fg("muted", `[${model.provider}]`)}`;
 }
 
 /** 把可用主题名转换为选项列表项。 */
@@ -501,7 +462,14 @@ export class SettingsSelectorComponent extends Container {
 
 		const supportsImages = getCapabilities().images;
 		const followUpKey = keyDisplayText("app.message.followUp");
+		const cycleThinkingKey = keyDisplayText("app.thinking.cycle");
 		let currentWarnings = { ...config.warnings };
+		const currentModelThinkingLevels = { ...config.modelThinkingLevels };
+		const defaultModelByValue = new Map(
+			config.availableDefaultModels.map((model) => [modelSettingKey(model), model]),
+		);
+		const currentDefaultModelKey = defaultModelByValue.has(config.defaultModel) ? config.defaultModel : undefined;
+		const currentModelKey = config.currentModel ? modelSettingKey(config.currentModel) : undefined;
 
 		const items: SettingItem[] = [
 			{
@@ -549,9 +517,16 @@ export class SettingsSelectorComponent extends Container {
 				values: ["true", "false"],
 			},
 			{
+				id: "mermaid-rendering",
+				label: "Mermaid diagrams",
+				description: "Render Mermaid code blocks as Unicode diagrams",
+				currentValue: config.mermaidRenderingMode,
+				values: ["off", "final", "streaming"],
+			},
+			{
 				id: "cache-miss-notices",
 				label: "Cache miss notices",
-				description: "Show transcript notices for significant prompt-cache misses",
+				description: "Show transcript notices for significant prompt-cache misses and compaction costs",
 				currentValue: config.showCacheMissNotices ? "true" : "false",
 				values: ["true", "false"],
 			},
@@ -613,33 +588,118 @@ export class SettingsSelectorComponent extends Container {
 					),
 			},
 			{
-				id: "thinking",
-				label: "Thinking level",
-				description: "Reasoning depth for thinking-capable models",
-				currentValue: config.thinkingLevel,
-				submenu: (currentValue, done) =>
-					new SelectSubmenu(
-						"Thinking Level",
-						"Select reasoning depth for thinking-capable models",
-						config.availableThinkingLevels.map((level) => ({
-							value: level,
-							label: level,
-							description: THINKING_DESCRIPTIONS[level],
-						})),
-						currentValue,
-						(value) => {
-							callbacks.onThinkingLevelChange(value as ThinkingLevel);
-							done(value);
+				id: "model-thinking",
+				label: "Default thinking level per model",
+				description: `Override the default thinking level for specific models. ${cycleThinkingKey} cycles in-session.`,
+				currentValue: modelThinkingOverridesSummary(currentModelThinkingLevels),
+				submenu: (_currentValue, done) => {
+					const steps: SteppedSubmenuStep[] = [
+						{
+							key: "model",
+							title: "Per-Model Thinking Level",
+							description: "Select a model to configure",
+							options: () => {
+								const sorted = [...config.availableDefaultModels].sort((a, b) => {
+									const aKey = modelSettingKey(a);
+									const bKey = modelSettingKey(b);
+									if (aKey === currentModelKey) return -1;
+									if (bKey === currentModelKey) return 1;
+									if (aKey === currentDefaultModelKey) return -1;
+									if (bKey === currentDefaultModelKey) return 1;
+									return a.provider.localeCompare(b.provider);
+								});
+								const items: SelectItem[] = sorted.map((model) => {
+									const key = modelSettingKey(model);
+									const override = currentModelThinkingLevels[key];
+									return {
+										value: key,
+										label: modelItemLabel(model),
+										description: override ?? undefined,
+									};
+								});
+								if (items.length === 0) {
+									items.push({
+										value: "__none__",
+										label: "No models available",
+										description: "Log in to a provider or configure an API key first",
+									});
+								}
+								return items;
+							},
+							preselect: () => currentModelKey ?? currentDefaultModelKey,
+							searchable: true,
+							layout: MODEL_PICKER_LAYOUT,
 						},
-						() => done(),
-					),
+						{
+							key: "level",
+							title: (ctx) => {
+								const m = defaultModelByValue.get(ctx.model);
+								return `Thinking Level for ${m ? modelDisplayLabel(m) : ctx.model}`;
+							},
+							description: "Select default thinking level for this model",
+							options: (ctx) => {
+								const model = defaultModelByValue.get(ctx.model);
+								if (!model) return [];
+								const levels = (
+									model.reasoning ? getSupportedThinkingLevels(model) : ["off"]
+								) as ThinkingLevel[];
+								const items: SelectItem[] = levels.map((level) => ({
+									value: level,
+									label: level,
+									description: THINKING_DESCRIPTIONS[level],
+								}));
+								if (currentModelThinkingLevels[ctx.model] !== undefined) {
+									items.push({
+										value: CLEAR_OVERRIDE_VALUE,
+										label: "(clear override)",
+										description: `Revert to global default (${config.thinkingLevel})`,
+									});
+								}
+								return items;
+							},
+							preselect: (ctx) => currentModelThinkingLevels[ctx.model],
+						},
+					];
+
+					const summary = () => modelThinkingOverridesSummary(currentModelThinkingLevels);
+
+					return new SteppedSubmenu(
+						steps,
+						(selections) => {
+							const model = defaultModelByValue.get(selections.model);
+							if (!model) return;
+							if (selections.level === CLEAR_OVERRIDE_VALUE) {
+								callbacks.onModelThinkingLevelRemove(model.provider, model.id);
+								delete currentModelThinkingLevels[selections.model];
+							} else {
+								callbacks.onModelThinkingLevelChange(
+									model.provider,
+									model.id,
+									selections.level as ThinkingLevel,
+								);
+								currentModelThinkingLevels[selections.model] = selections.level as ThinkingLevel;
+							}
+						},
+						() => {
+							done(summary());
+						},
+						{ loop: true },
+					);
+				},
 			},
 			{
-				id: "ui-mode",
-				label: "UI mode",
-				description: "Interface layout used after restart; fullscreen mode is experimental",
-				currentValue: config.uiMode,
+				id: "tui-mode",
+				label: "TUI mode",
+				description: "Interface layout; fullscreen mode is experimental",
+				currentValue: config.tuiMode,
 				values: ["regular", "fullscreen"],
+			},
+			{
+				id: "fullscreen-exit-output",
+				label: "Fullscreen exit output",
+				description: "Print the transcript or only a session resume hint when exiting fullscreen mode",
+				currentValue: config.fullscreenExitOutput,
+				values: ["transcript", "resume-hint"],
 			},
 			{
 				id: "fullscreen-scrollbar",
@@ -647,6 +707,13 @@ export class SettingsSelectorComponent extends Container {
 				description: "Scrollbar behavior in fullscreen mode; has no effect in regular mode",
 				currentValue: config.fullscreenScrollbar,
 				values: ["auto", "always", "hidden"],
+			},
+			{
+				id: "fullscreen-copy-on-select",
+				label: "Fullscreen copy on select",
+				description: "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X",
+				currentValue: config.fullscreenCopyOnSelect ? "true" : "false",
+				values: ["true", "false"],
 			},
 			{
 				id: "theme",
@@ -812,6 +879,9 @@ export class SettingsSelectorComponent extends Container {
 					case "hide-thinking":
 						callbacks.onHideThinkingBlockChange(newValue === "true");
 						break;
+					case "mermaid-rendering":
+						callbacks.onMermaidRenderingModeChange(newValue as MermaidRenderingMode);
+						break;
 					case "cache-miss-notices":
 						callbacks.onShowCacheMissNoticesChange(newValue === "true");
 						break;
@@ -857,11 +927,17 @@ export class SettingsSelectorComponent extends Container {
 					case "terminal-progress":
 						callbacks.onShowTerminalProgressChange(newValue === "true");
 						break;
-					case "ui-mode":
-						callbacks.onUiModeChange(newValue as UiMode);
+					case "tui-mode":
+						callbacks.onTuiModeChange(newValue as TuiMode);
+						break;
+					case "fullscreen-exit-output":
+						callbacks.onFullscreenExitOutputChange(newValue as FullscreenExitOutput);
 						break;
 					case "fullscreen-scrollbar":
 						callbacks.onFullscreenScrollbarChange(newValue as ScrollViewScrollbar);
+						break;
+					case "fullscreen-copy-on-select":
+						callbacks.onFullscreenCopyOnSelectChange(newValue === "true");
 						break;
 					case "theme":
 						callbacks.onThemeChange(newValue);

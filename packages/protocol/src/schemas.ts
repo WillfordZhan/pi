@@ -1,7 +1,6 @@
 import Type, { type Static } from "typebox";
 
-/** 协议版本号。客户端与服务器必须一致才能通信。 */
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 1 as const;
 
 /** 通用 ID 模式：非空字符串。 */
 const IdSchema = Type.String({ minLength: 1 });
@@ -276,8 +275,15 @@ export const TranscriptProgressSchema = Type.Union([
 /** 增量活动事件的静态类型。 */
 export type TranscriptProgress = Static<typeof TranscriptProgressSchema>;
 
-/** 会话摘要（summary 与 snapshot 共用的）公共字段。 */
-const SessionSummaryProperties = {
+export const SessionMetadataSchema = StrictObject({
+	id: IdSchema,
+	createdAt: TimestampSchema,
+	updatedAt: Type.Optional(TimestampSchema),
+	parentSessionId: Type.Optional(IdSchema),
+	sessionName: Type.Optional(Type.String()),
+	cwd: Type.Optional(Type.String({ minLength: 1 })),
+});
+export const SessionSnapshotSchema = StrictObject({
 	id: IdSchema,
 	name: Type.Optional(Type.String()),
 	cwd: Type.String({ minLength: 1 }),
@@ -288,21 +294,12 @@ const SessionSummaryProperties = {
 	thinkingLevel: ThinkingLevelSchema,
 	attached: Type.Boolean(),
 	locked: Type.Boolean(),
-} as const;
-
-/** 会话摘要模式：不含完整记录，用于列表展示。 */
-export const SessionSummarySchema = StrictObject(SessionSummaryProperties);
-/** 会话完整快照模式：包含记录、版本号与待处理的 steer 队列。 */
-export const SessionSnapshotSchema = StrictObject({
-	...SessionSummaryProperties,
 	revision: Type.Integer({ minimum: 0 }),
 	transcript: Type.Array(TranscriptItemSchema),
 	queuedSteer: Type.Array(UserTranscriptItemSchema),
 	queuedSteerCount: Type.Integer({ minimum: 0 }),
 });
-/** 会话摘要的静态类型。 */
-export type SessionSummary = Static<typeof SessionSummarySchema>;
-/** 会话快照的静态类型。 */
+export type SessionMetadata = Static<typeof SessionMetadataSchema>;
 export type SessionSnapshot = Static<typeof SessionSnapshotSchema>;
 
 /** 服务器快照模式：协议版本、会话摘要列表与模型元数据列表。 */
@@ -310,7 +307,7 @@ export const ServerSnapshotSchema = StrictObject({
 	serverId: IdSchema,
 	protocolVersion: Type.Literal(PROTOCOL_VERSION),
 	revision: Type.Integer({ minimum: 0 }),
-	sessions: Type.Array(SessionSummarySchema),
+	sessions: Type.Array(SessionMetadataSchema),
 	models: Type.Array(ModelMetadataSchema),
 });
 /** 服务器快照的静态类型。 */
@@ -318,12 +315,13 @@ export type ServerSnapshot = Static<typeof ServerSnapshotSchema>;
 
 /** 协议错误码模式：认证失败、版本不匹配、繁忙、会话被锁定、未找到、非法请求。 */
 export const ProtocolErrorCodeSchema = Type.Union([
-	Type.Literal("auth"),
 	Type.Literal("version"),
 	Type.Literal("busy"),
 	Type.Literal("session_locked"),
 	Type.Literal("not_found"),
 	Type.Literal("invalid_request"),
+	Type.Literal("not_implemented"),
+	Type.Literal("internal_error"),
 ]);
 /** 协议错误模式：错误码、消息与可选的细节。 */
 export const ProtocolErrorSchema = StrictObject({
@@ -430,7 +428,7 @@ export const SetThinkingResultSchema = StrictObject({
 /** 列出会话命令的结果模式。 */
 export const ListResultSchema = StrictObject({
 	command: Type.Literal("list"),
-	sessions: Type.Array(SessionSummarySchema),
+	sessions: Type.Array(SessionMetadataSchema),
 });
 /** 分离命令的结果模式。 */
 export const DetachResultSchema = StrictObject({
@@ -463,7 +461,6 @@ export type ResultForCommand<TCommand extends Command> = TCommand["command"] ext
 export const ClientHelloSchema = StrictObject({
 	type: Type.Literal("hello"),
 	version: Type.Integer({ minimum: 0 }),
-	token: Type.String({ minLength: 1 }),
 });
 /** 客户端 hello 帧的静态类型。 */
 export type ClientHello = Static<typeof ClientHelloSchema>;

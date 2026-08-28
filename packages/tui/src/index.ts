@@ -17,7 +17,12 @@ export { Image, type ImageOptions, type ImageTheme } from "./components/image.ts
 export { Input } from "./components/input.ts";
 export { Loader, type LoaderIndicatorOptions } from "./components/loader.ts";
 export { type DefaultTextStyle, Markdown, type MarkdownOptions, type MarkdownTheme } from "./components/markdown.ts";
-export { ScrollView, type ScrollViewOptions, type ScrollViewScrollbar } from "./components/scroll-view.ts";
+export {
+	ScrollView,
+	type ScrollViewOptions,
+	type ScrollViewScrollbar,
+	type ScrollViewScrollToOptions,
+} from "./components/scroll-view.ts";
 export {
 	type SelectItem,
 	SelectList,
@@ -66,7 +71,9 @@ export {
 	parseKey,
 	setKittyProtocolActive,
 } from "./keys.ts";
-// 输入缓冲（用于批量拆分输入流）
+// LaTeX rendering
+export { type RenderLatexOptions, renderLatex } from "./latex.ts";
+// Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
 // 终端接口与实现
 export { ProcessTerminal, type Terminal } from "./terminal.ts";
@@ -102,6 +109,7 @@ export {
 	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
+	setCapabilityOverrides,
 	setCellDimensions,
 	type TerminalCapabilities,
 } from "./terminal-image.ts";
@@ -122,11 +130,13 @@ export {
 	type TUI,
 	type TuiInputListener,
 	type TuiInputListenerResult,
+	type TuiMode,
+	type TuiStopOptions,
 	type ViewportTUI,
 } from "./tui.ts";
 export { TuiAltScreen, type TuiAltScreenOptions } from "./tui-alt-screen.ts";
-export { TuiMainScreen } from "./tui-main-screen.ts";
-// 工具函数
+export { TuiMainScreen, type TuiMainScreenRenderState } from "./tui-main-screen.ts";
+// Utilities
 export {
 	getOsc8LinkAtColumn,
 	sliceByColumn,

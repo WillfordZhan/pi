@@ -7,9 +7,9 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
-import type { AssistantMessage, ImageContent, Message, Model } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, ImageContent, Message, Model, Usage } from "@earendil-works/pi-ai/compat";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -21,6 +21,7 @@ import type {
 	OverlayOptions,
 	SlashCommand,
 	Terminal,
+	TuiMainScreenRenderState,
 } from "@earendil-works/pi-tui";
 import * as TuiLayouts from "@earendil-works/pi-tui";
 import {
@@ -34,6 +35,7 @@ import {
 	matchesKey,
 	ProcessTerminal,
 	Spacer,
+	setCapabilityOverrides,
 	setKeybindings,
 	Text,
 	TruncatedText,
@@ -43,7 +45,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -52,11 +54,11 @@ import {
 	getAuthPath,
 	getDebugLogPath,
 	getDocsPath,
-	getShareViewerUrl,
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -64,6 +66,7 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -84,14 +87,14 @@ import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
-	resolveModelScope,
-	resolveModelScopeWithDiagnostics,
+	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
+import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
-import type { UiMode } from "../../core/settings-manager.ts";
+import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -106,12 +109,12 @@ import { openBrowser } from "../../utils/open-browser.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
 import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
-import { ensureTool } from "../../utils/tools-manager.ts";
+import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
+import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
-import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
@@ -126,6 +129,7 @@ import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent, formatTokens } from "./components/footer.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
+import { createMermaidMarkdownTransformer } from "./components/mermaid.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
 import {
 	type AuthSelectorProvider,
@@ -144,13 +148,16 @@ import {
 	type StatusIndicator,
 	WorkingStatusIndicator,
 } from "./components/status-indicator.ts";
+import { ThinkingSelectorComponent } from "./components/thinking-selector.ts";
 import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
+import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
+import { shareSession } from "./session-share.ts";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -215,15 +222,23 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
-/** 可渲染的会话条目：agent 消息或自定义类型条目。 */
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
+type CompactionCostNotice = {
+	type: "compaction_cost";
+	kind: "compaction" | "branch_summary";
+	usage: Usage;
+};
+
+type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }> | CompactionCostNotice;
 
 /** 类型守卫：判断渲染项是否为自定义会话条目。 */
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
 }
 
-/** 表示终端已死亡的错误码集合。 */
+function isCompactionCostNotice(item: RenderSessionItem): item is CompactionCostNotice {
+	return "type" in item && item.type === "compaction_cost";
+}
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
 /** 判断错误是否为终端已死亡（EIO/EPIPE/ENOTCONN）。 */
@@ -278,7 +293,12 @@ function hasDefaultModelProvider(providerId: string): providerId is keyof typeof
 	return providerId in defaultModelPerProvider;
 }
 
-/** 登录 provider 的补全选项：聚合同一 provider 的多种鉴权方式。 */
+function llamaCppPostLoginGuidance(actionLabel: string, loadedModelCount: number): string {
+	return loadedModelCount === 0
+		? `${actionLabel}. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it.`
+		: `${actionLabel}. Use /model to select a loaded llama.cpp model, or /llama to manage models.`;
+}
+
 type LoginProviderCompletionOption = {
 	id: string;
 	name: string;
@@ -343,7 +363,9 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
 export interface InteractiveModeOptions {
 	/** 已迁移到 auth.json 的 provider（会显示警告） */
 	migratedProviders?: string[];
-	/** 会话模型无法恢复时的警告消息 */
+	/** Diagnostics collected before the interactive TUI was initialized. */
+	startupDiagnostics?: AgentSessionRuntimeDiagnostic[];
+	/** Warning message if session model couldn't be restored */
 	modelFallbackMessage?: string;
 	/** 重载后需要信任的 cwd（在该隐式受信任会话期间获得了 .pi 目录）。 */
 	autoTrustOnReloadCwd?: string;
@@ -355,34 +377,83 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** 强制详细启动输出（覆盖 quietStartup 设置） */
 	verbose?: boolean;
-	/** UI 布局模式。 */
-	uiMode?: UiMode;
+	/** TUI layout mode. */
+	tuiMode?: TuiMode;
+	/** Initial interactive theme setting for this invocation. */
+	initialThemeSetting?: string;
 }
 
 /** 交互式 TUI 的构造选项。 */
 interface InteractiveTuiOptions {
-	uiMode: UiMode;
+	tuiMode: TuiMode;
 	showHardwareCursor: boolean;
 	logDirectory: string;
 	terminal?: Terminal;
+	onRightClickPaste?: () => void;
+	fullscreenCopyOnSelect?: boolean;
 }
 
-/** 组合根：根据 UI 模式选择交互式终端渲染器。 */
-export function createInteractiveTui(options: InteractiveTuiOptions): TUI {
+/** Composition root for selecting the interactive terminal renderer. */
+export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen {
 	const terminal = options.terminal ?? new ProcessTerminal();
-	if (options.uiMode === "fullscreen") {
-		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, { openUrl: openBrowser });
+	if (options.tuiMode === "fullscreen") {
+		const styleSearchMatch = (text: string) => theme.bg("searchMatchBg", theme.fg("searchMatchText", text));
+		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, {
+			searchMatchStyle: (text) => theme.underline(styleSearchMatch(text)),
+			searchCurrentMatchStyle: (text) => theme.bold(theme.inverse(styleSearchMatch(text))),
+			openUrl: openBrowser,
+			onRightClickPaste: options.onRightClickPaste,
+			copyOnSelect: options.fullscreenCopyOnSelect,
+			copySelection: async (text) => {
+				try {
+					await copyToClipboard(text);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		});
 	}
 	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
 }
 
-/** 编码 agent 的交互模式主类：管理 TUI 渲染、键盘/命令处理、扩展 UI 与消息循环。 */
+/** Stable reference for components while InteractiveMode replaces the active renderer. */
+export function createInteractiveTuiReference(getTui: () => TUI): TUI {
+	return new Proxy({} as TUI, {
+		get: (_target, property) => {
+			const tui = getTui();
+			const value = Reflect.get(tui, property, tui);
+			if (typeof value !== "function") return value;
+			let methodTui = tui;
+			let method = value;
+			return (...args: unknown[]) => {
+				const currentTui = getTui();
+				if (currentTui !== methodTui) {
+					const currentMethod = Reflect.get(currentTui, property, currentTui);
+					if (typeof currentMethod !== "function") {
+						throw new TypeError(`TUI property ${String(property)} is not callable`);
+					}
+					methodTui = currentTui;
+					method = currentMethod;
+				}
+				return Reflect.apply(method, methodTui, args);
+			};
+		},
+		set: (_target, property, value) => {
+			const tui = getTui();
+			return Reflect.set(tui, property, value, tui);
+		},
+		has: (_target, property) => Reflect.has(getTui(), property),
+		getPrototypeOf: () => Reflect.getPrototypeOf(getTui()),
+	});
+}
+
 export class InteractiveMode {
 	/** 底层的 agent 会话运行时宿主。 */
 	private runtimeHost: AgentSessionRuntime;
-	/** TUI 实例（备用屏幕或主屏幕）。 */
+	private renderer: TuiMainScreen | TuiAltScreen;
 	private ui: TUI;
-	/** 已加载资源（扩展/技能/提示/主题等）的容器。 */
+	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
 	private loadedResourcesContainer: Container;
 	/** 聊天消息容器。 */
 	private chatContainer: Container;
@@ -390,7 +461,7 @@ export class InteractiveMode {
 	private documentContainer: Container;
 	/** 全屏模式下的转录滚动视图。 */
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
-	/** 待发送消息的显示容器。 */
+	private fullscreenLayoutRoot: Component | undefined;
 	private pendingMessagesContainer: Container;
 	/** 状态指示器容器。 */
 	private statusContainer: Container;
@@ -408,7 +479,8 @@ export class InteractiveMode {
 	private fdPath: string | undefined;
 	/** 编辑器容器。 */
 	private editorContainer: Container;
-	/** 底部栏组件。 */
+	private activeSelectorToken?: object;
+	private activeSelectorDispose?: () => void;
 	private footer: FooterComponent;
 	/** 底部栏容器。 */
 	private footerContainer: Container;
@@ -455,6 +527,7 @@ export class InteractiveMode {
 	// 状态行跟踪（用于连续快速更新的状态消息就地更新）
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: Text | undefined = undefined;
+	private managedToolStatusStarted = false;
 
 	// 流式消息跟踪
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
@@ -469,6 +542,10 @@ export class InteractiveMode {
 	// 思考块可见性状态
 	private hideThinkingBlock = false;
 	private outputPad = 1;
+	private readonly mermaidMarkdownTransformer: MarkdownTransformer = createMermaidMarkdownTransformer({
+		getMode: () => this.settingsManager.getMermaidRenderingMode(),
+		theme,
+	});
 
 	// 技能命令：命令名 -> 技能文件路径
 	private skillCommands = new Map<string, string>();
@@ -502,7 +579,10 @@ export class InteractiveMode {
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
-	private extensionTerminalInputUnsubscribers = new Set<() => void>();
+	private extensionTerminalInputSubscriptions = new Set<{
+		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
+		unsubscribe: () => void;
+	}>();
 
 	// 扩展组件（渲染在编辑器上方/下方）
 	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
@@ -523,6 +603,9 @@ export class InteractiveMode {
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private options: InteractiveModeOptions;
+	private readonly onRightClickPaste = (): void => {
+		void this.handleRightClickPaste();
+	};
 	private autoTrustOnReloadCwd: string | undefined;
 	private themeController: InteractiveThemeController;
 
@@ -547,21 +630,26 @@ export class InteractiveMode {
 	 */
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
-		const uiMode = options.uiMode ?? this.settingsManager.getUiMode();
-		this.options = { ...options, uiMode };
+		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
+		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
+		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			this.resetExtensionUI();
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
+			await this.themeController.applyFromSettings();
 		});
 		this.version = VERSION;
-		this.ui = createInteractiveTui({
-			uiMode,
+		this.renderer = createInteractiveTui({
+			tuiMode,
 			showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
 			logDirectory: getAgentDir(),
+			onRightClickPaste: this.onRightClickPaste,
+			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 		});
+		this.ui = createInteractiveTuiReference(() => this.renderer);
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
@@ -597,12 +685,12 @@ export class InteractiveMode {
 
 		// 从资源加载器注册主题并初始化
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
-		this.themeController = new InteractiveThemeController(
-			this.ui,
-			this.settingsManager,
-			(message) => this.showError(message),
-			() => this.updateEditorBorderColor(),
-		);
+		this.themeController = new InteractiveThemeController(this.ui, {
+			getSettingsManager: () => this.settingsManager,
+			showError: (message) => this.showError(message),
+			onChanged: () => this.updateEditorBorderColor(),
+			initialThemeSetting: options.initialThemeSetting,
+		});
 	}
 
 	/** 根据来源信息生成自动补全的源标签前缀。 */
@@ -667,12 +755,11 @@ export class InteractiveMode {
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
 		if (modelCommand) {
-			modelCommand.getArgumentCompletions = async (prefix: string): Promise<AutocompleteItem[] | null> => {
-				// 获取可用模型（作用域模型或注册表）
+			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
 				const models =
 					this.session.scopedModels.length > 0
 						? this.session.scopedModels.map((s) => s.model)
-						: await this.session.modelRuntime.getAvailable();
+						: this.session.modelRuntime.getAvailableSnapshot();
 
 				if (models.length === 0) return null;
 
@@ -689,6 +776,21 @@ export class InteractiveMode {
 					label: item.id,
 					description: item.provider,
 				}));
+			};
+		}
+
+		const thinkingCommand = slashCommands.find((command) => command.name === "thinking");
+		if (thinkingCommand) {
+			thinkingCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+				return createFuzzyAutocompleteItems(
+					this.session.getAvailableThinkingLevels(),
+					prefix,
+					(level) => level,
+					(level) => ({
+						value: level,
+						label: level,
+					}),
+				);
 			};
 		}
 
@@ -793,7 +895,75 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new DynamicBorder());
 	}
 
-	/** 初始化交互模式：注册信号处理、搭建 UI 布局、启动 TUI 并渲染初始消息。 */
+	private mountInteractiveTui(tui: TuiMainScreen | TuiAltScreen, components: readonly Component[]): void {
+		for (const component of components) tui.addChild(component);
+		if (TuiLayouts.isViewportTUI(tui)) {
+			if (!this.fullscreenLayoutRoot) throw new Error("Fullscreen layout is not initialized");
+			tui.setLayoutRoot(this.fullscreenLayoutRoot);
+		}
+	}
+
+	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
+		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
+			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
+			this.switchTuiMode("regular", false, false);
+			this.renderer.renderNow();
+		}
+		this.ui.stop({ preserveScreen: this.renderer.mode === "fullscreen" });
+	}
+
+	private switchTuiMode(mode: TuiMode, restoreProgress = true, startRenderer = true): boolean {
+		const previousUi = this.renderer;
+		if (mode === previousUi.mode) return true;
+		if (previousUi.hasOverlayEntries) return false;
+
+		const components = [...previousUi.children];
+		const focus = previousUi.getFocusedComponent();
+		const terminal = previousUi.terminal;
+		const showHardwareCursor = previousUi.getShowHardwareCursor();
+		const clearOnShrink = previousUi.getClearOnShrink();
+		const onDebug = previousUi.onDebug;
+		if (previousUi instanceof TuiMainScreen) {
+			this.mainScreenRenderState = previousUi.captureRenderState();
+		}
+
+		previousUi.stop({ preserveScreen: true });
+		previousUi.setFocus(null);
+		previousUi.clear();
+		if (TuiLayouts.isViewportTUI(previousUi)) previousUi.setLayoutRoot(undefined);
+
+		const nextUi = createInteractiveTui({
+			tuiMode: mode,
+			showHardwareCursor,
+			logDirectory: getAgentDir(),
+			terminal,
+			onRightClickPaste: this.onRightClickPaste,
+			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
+		});
+		nextUi.setClearOnShrink(clearOnShrink);
+		nextUi.onDebug = onDebug;
+		if (nextUi instanceof TuiMainScreen && this.mainScreenRenderState) {
+			nextUi.restoreRenderState(this.mainScreenRenderState);
+		}
+		this.renderer = nextUi;
+		this.options.tuiMode = mode;
+		this.mountInteractiveTui(nextUi, components);
+		nextUi.invalidate();
+		nextUi.setFocus(focus);
+		if (!startRenderer) return true;
+		nextUi.start();
+		this.themeController.rebindTui();
+		this.rebindExtensionTerminalInputListeners();
+		if (
+			restoreProgress &&
+			this.settingsManager.getShowTerminalProgress() &&
+			(this.session.isStreaming || this.session.isCompacting)
+		) {
+			terminal.setProgress(true);
+		}
+		return true;
+	}
+
 	async init(): Promise<void> {
 		if (this.isInitialized) return;
 
@@ -801,11 +971,6 @@ export class InteractiveMode {
 
 		// 加载变更日志（仅显示新条目，恢复的会话跳过）
 		this.changelogMarkdown = this.getChangelogForDisplay();
-
-		// 确保 fd 和 rg 可用（缺失时下载，通过 getBinDir 加入 PATH）
-		// 两者都必需：fd 用于自动补全，rg 用于 grep 工具和 bash 命令
-		const [fdPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
-		this.fdPath = fdPath;
 
 		if (this.session.scopedModels.length > 0 && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
 			const modelList = this.session.scopedModels
@@ -822,45 +987,43 @@ export class InteractiveMode {
 			console.log(theme.fg("dim", `Model scope: ${modelList}${cycleHint}`));
 		}
 
-		// 在选择渲染器特定组合前，先填充稳定的区域
-		this.renderWidgets(); // 用默认 spacer 初始化
-		if (TuiLayouts.isViewportTUI(this.ui)) {
-			this.transcriptScrollView = new TuiLayouts.ScrollView(this.documentContainer, {
-				follow: "end",
-				primary: true,
-				overscroll: "chain",
-				scrollbar: this.settingsManager.getFullscreenScrollbar(),
-				scrollbarStyle: (text) => theme.bg("scrollbarThumb", text),
-			});
-			const dock = new TuiLayouts.VStack([
-				{ component: this.pendingMessagesContainer, shrink: 1, minSize: 0 },
-				{ component: this.statusContainer, shrink: 1, minSize: 0 },
-				{ component: this.widgetContainerAbove, shrink: 1, minSize: 0 },
-				{ component: this.editorContainer, shrink: 1, minSize: 3 },
-				{ component: this.widgetContainerBelow, shrink: 1, minSize: 0 },
-				{ component: this.footerContainer, shrink: 1, minSize: 1 },
-			]);
-			this.ui.setLayoutRoot(
-				new TuiLayouts.VStack([
-					{ component: this.transcriptScrollView, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-					{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
-				]),
-			);
-		} else {
-			this.ui.addChild(this.documentContainer);
-			this.ui.addChild(this.pendingMessagesContainer);
-			this.ui.addChild(this.statusContainer);
-			this.ui.addChild(this.widgetContainerAbove);
-			this.ui.addChild(this.editorContainer);
-			this.ui.addChild(this.widgetContainerBelow);
-			this.ui.addChild(this.footerContainer);
-		}
+		// Keep one component tree and remount it when changing renderers.
+		this.renderWidgets(); // Initialize with default spacer
+		this.transcriptScrollView = new TuiLayouts.ScrollView(this.documentContainer, {
+			follow: "end",
+			primary: true,
+			overscroll: "chain",
+			scrollbar: this.settingsManager.getFullscreenScrollbar(),
+			scrollbarStyle: (text) => theme.bg("scrollbarThumb", text),
+		});
+		const dock = new TuiLayouts.VStack([
+			{ component: this.pendingMessagesContainer, shrink: 1, minSize: 0 },
+			{ component: this.statusContainer, shrink: 1, minSize: 0 },
+			{ component: this.widgetContainerAbove, shrink: 1, minSize: 0 },
+			{ component: this.editorContainer, shrink: 1, minSize: 3 },
+			{ component: this.widgetContainerBelow, shrink: 1, minSize: 0 },
+			{ component: this.footerContainer, shrink: 1, minSize: 1 },
+		]);
+		this.fullscreenLayoutRoot = new TuiLayouts.VStack([
+			{ component: this.transcriptScrollView, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+			{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+		]);
+		this.mountInteractiveTui(this.renderer, [
+			this.documentContainer,
+			this.pendingMessagesContainer,
+			this.statusContainer,
+			this.widgetContainerAbove,
+			this.editorContainer,
+			this.widgetContainerBelow,
+			this.footerContainer,
+		]);
+		// Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
+		this.defaultEditor.onAction("app.clear", () => this.handleCtrlC());
+		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
+		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
 		this.ui.setFocus(this.editor);
 
-		this.setupKeyHandlers();
-		this.setupEditorSubmitHandler();
-
-		// 在初始化扩展之前启动 UI，以便 session_start 处理器能使用交互式对话框
+		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
 
@@ -928,7 +1091,21 @@ export class InteractiveMode {
 		}
 		this.ui.requestRender();
 
-		// 先初始化扩展，使资源在消息之前显示
+		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
+		// so slow downloads do not make startup appear frozen.
+		// Both are needed: fd for autocomplete, rg for grep tool and bash commands.
+		const [fdPath] = await Promise.all([
+			ensureTool("fd", (status) => this.showManagedToolStatus(status)),
+			ensureTool("rg", (status) => this.showManagedToolStatus(status)),
+		]);
+		this.fdPath = fdPath;
+
+		// Enable the remaining input handlers only after managed-tool setup completes.
+		this.setupKeyHandlers();
+		this.setupEditorSubmitHandler();
+		this.ui.requestRender();
+
+		// Initialize extensions first so resources are shown before messages
 		await this.rebindCurrentSession();
 
 		// 显示已加载资源之后再渲染初始消息
@@ -948,6 +1125,14 @@ export class InteractiveMode {
 
 		// 初始化底部栏显示的可用 provider 数量
 		await this.updateAvailableProviderCount();
+
+		// Flush the completed startup state before loading the remaining syntax grammars.
+		this.ui.renderNow();
+		void loadAllHighlightLanguages().then(() => {
+			if (!this.isInitialized) return;
+			this.ui.invalidate();
+			this.ui.requestRender();
+		});
 	}
 
 	/**
@@ -971,10 +1156,12 @@ export class InteractiveMode {
 		await this.init();
 
 		if (!process.env.PI_OFFLINE) {
-			void this.session.modelRuntime
-				.refresh()
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 15_000);
+			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
 				.then(() => this.updateAvailableProviderCount())
-				.catch(() => {});
+				.catch(() => {})
+				.finally(() => clearTimeout(timeout));
 		}
 
 		// 异步启动版本检查
@@ -1006,8 +1193,25 @@ export class InteractiveMode {
 			}
 		});
 
-		// 显示启动警告
-		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
+		// Show startup warnings
+		const {
+			migratedProviders,
+			startupDiagnostics,
+			modelFallbackMessage,
+			initialMessage,
+			initialImages,
+			initialMessages,
+		} = this.options;
+
+		for (const diagnostic of startupDiagnostics ?? []) {
+			if (diagnostic.type === "error") {
+				this.showError(diagnostic.message);
+			} else if (diagnostic.type === "warning") {
+				this.showWarning(diagnostic.message);
+			} else {
+				this.showStatus(diagnostic.message);
+			}
+		}
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -1879,8 +2083,12 @@ export class InteractiveMode {
 
 	/** 把运行时可调设置同步到 UI 与各组件。 */
 	private applyRuntimeSettings(): void {
+		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 		this.applyFullscreenScrollbarSetting();
+		if (this.renderer instanceof TuiAltScreen) {
+			this.renderer.setCopyOnSelect(this.settingsManager.getFullscreenCopyOnSelect());
+		}
 		this.footer.setSession(this.session);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerDataProvider.setCwd(this.sessionManager.getCwd());
@@ -1935,7 +2143,7 @@ export class InteractiveMode {
 		const message = error instanceof Error ? error.message : String(error);
 		this.showError(`${prefix}: ${message}`);
 		stopThemeWatcher();
-		this.stop();
+		this.stop("transcript");
 		process.exit(1);
 	}
 
@@ -1960,7 +2168,7 @@ export class InteractiveMode {
 
 	/** 获取扩展注册的 Markdown 转换器列表。 */
 	private getMarkdownTransformers(): MarkdownTransformer[] {
-		return this.session.extensionRunner.getMarkdownTransformers();
+		return [this.mermaidMarkdownTransformer, ...this.session.extensionRunner.getMarkdownTransformers()];
 	}
 
 	/**
@@ -2047,7 +2255,7 @@ export class InteractiveMode {
 		this.activeStatusIndicator?.dispose();
 		this.activeStatusIndicator = undefined;
 		this.statusContainer.clear();
-		if (hadActiveStatusIndicator && this.options.uiMode === "regular" && this.ui.getClearOnShrink()) {
+		if (hadActiveStatusIndicator && this.options.tuiMode === "regular" && this.ui.getClearOnShrink()) {
 			this.statusContainer.addChild(this.idleStatus);
 		}
 	}
@@ -2298,19 +2506,24 @@ export class InteractiveMode {
 	private addExtensionTerminalInputListener(
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined,
 	): () => void {
-		const unsubscribe = this.ui.addInputListener(handler);
-		this.extensionTerminalInputUnsubscribers.add(unsubscribe);
+		const subscription = { handler, unsubscribe: this.ui.addInputListener(handler) };
+		this.extensionTerminalInputSubscriptions.add(subscription);
 		return () => {
-			unsubscribe();
-			this.extensionTerminalInputUnsubscribers.delete(unsubscribe);
+			subscription.unsubscribe();
+			this.extensionTerminalInputSubscriptions.delete(subscription);
 		};
 	}
 
-	private clearExtensionTerminalInputListeners(): void {
-		for (const unsubscribe of this.extensionTerminalInputUnsubscribers) {
-			unsubscribe();
+	private rebindExtensionTerminalInputListeners(): void {
+		for (const subscription of this.extensionTerminalInputSubscriptions) {
+			subscription.unsubscribe();
+			subscription.unsubscribe = this.ui.addInputListener(subscription.handler);
 		}
-		this.extensionTerminalInputUnsubscribers.clear();
+	}
+
+	private clearExtensionTerminalInputListeners(): void {
+		for (const subscription of this.extensionTerminalInputSubscriptions) subscription.unsubscribe();
+		this.extensionTerminalInputSubscriptions.clear();
 	}
 
 	/**
@@ -2422,6 +2635,7 @@ export class InteractiveMode {
 				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
 			);
 
+			this.disposeActiveSelector();
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionSelector);
 			this.ui.setFocus(this.extensionSelector);
@@ -2498,6 +2712,7 @@ export class InteractiveMode {
 				{ tui: this.ui, timeout: opts?.timeout },
 			);
 
+			this.disposeActiveSelector();
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionInput);
 			this.ui.setFocus(this.extensionInput);
@@ -2539,6 +2754,7 @@ export class InteractiveMode {
 				this.settingsManager.getExternalEditorCommand(),
 			);
 
+			this.disposeActiveSelector();
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionEditor);
 			this.ui.setFocus(this.extensionEditor);
@@ -2567,6 +2783,7 @@ export class InteractiveMode {
 		// 切换前保存当前编辑器的文本
 		const currentText = this.editor.getText();
 
+		this.disposeActiveSelector();
 		this.editorContainer.clear();
 
 		if (factory) {
@@ -2708,6 +2925,7 @@ export class InteractiveMode {
 						// 向调用方暴露句柄以便控制可见性
 						options?.onHandle?.(handle);
 					} else {
+						this.disposeActiveSelector();
 						this.editorContainer.clear();
 						this.editorContainer.addChild(component);
 						this.ui.setFocus(component);
@@ -2793,7 +3011,10 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
-		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand());
+		this.defaultEditor.onAction(
+			"app.message.copy",
+			() => void this.handleCopyCommand({ flashConfirmation: true, preferSelection: true }),
+		);
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
@@ -2814,6 +3035,20 @@ export class InteractiveMode {
 		this.defaultEditor.onPasteImage = () => {
 			void this.handleClipboardPaste();
 		};
+	}
+
+	private async handleRightClickPaste(): Promise<void> {
+		const target = this.renderer.getFocusedComponent();
+		const handleInput = target?.handleInput;
+		if (!target || !handleInput) return;
+		try {
+			const text = await readClipboardText();
+			if (!text || this.renderer.getFocusedComponent() !== target) return;
+			handleInput.call(target, `\x1b[200~${text}\x1b[201~`);
+			this.ui.requestRender();
+		} catch {
+			// Silently ignore clipboard errors (may not have permission, etc.)
+		}
 	}
 
 	private async handleClipboardPaste(): Promise<void> {
@@ -2841,7 +3076,11 @@ export class InteractiveMode {
 		}
 	}
 
-	/** 设置编辑器的提交（Enter）处理器：分发斜杠命令、bash、消息提交等。 */
+	private handleStartupSubmit(text: string): void {
+		this.editor.setText(text);
+		this.showStatus("Startup is still in progress");
+	}
+
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
@@ -2862,6 +3101,12 @@ export class InteractiveMode {
 				const searchTerm = text.startsWith("/model ") ? text.slice(7).trim() : undefined;
 				this.editor.setText("");
 				await this.handleModelCommand(searchTerm);
+				return;
+			}
+			if (text === "/thinking" || text.startsWith("/thinking ")) {
+				const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
+				this.editor.setText("");
+				this.handleThinkingCommand(searchTerm);
 				return;
 			}
 			if (text === "/export" || text.startsWith("/export ")) {
@@ -3290,8 +3535,13 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
+					const entries = this.sessionManager.buildContextEntries();
+					if (entries[0]?.type !== "compaction") {
+						throw new Error("Completed compaction is missing from the session context");
+					}
 					this.chatContainer.clear();
-					this.rebuildChatFromMessages();
+					// The latest compaction is prepended for model context; append it below at its chronological position.
+					this.renderSessionEntries(entries.slice(1));
 					this.addMessageToChat(
 						createCompactionSummaryMessage(
 							event.result.summary,
@@ -3299,6 +3549,13 @@ export class InteractiveMode {
 							new Date().toISOString(),
 						),
 					);
+					if (event.result.usage) {
+						this.addCompactionCostNotice({
+							type: "compaction_cost",
+							kind: "compaction",
+							usage: event.result.usage,
+						});
+					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -3377,6 +3634,20 @@ export class InteractiveMode {
 				? [{ type: "text", text: message.content }]
 				: message.content.filter((c: { type: string }) => c.type === "text");
 		return textBlocks.map((c) => (c as { text: string }).text).join("");
+	}
+
+	/** Show a managed-tool status update in the chat. */
+	private showManagedToolStatus(status: ToolStatus): void {
+		if (!this.managedToolStatusStarted) {
+			this.chatContainer.addChild(new Spacer(1));
+			this.managedToolStatusStarted = true;
+		}
+		const message = status.type === "warning" ? `Warning: ${status.message}` : status.message;
+		const color = status.type === "warning" ? "warning" : "dim";
+		this.chatContainer.addChild(new Text(theme.fg(color, message), 1, 0));
+		this.lastStatusSpacer = undefined;
+		this.lastStatusText = undefined;
+		this.ui.requestRender();
 	}
 
 	/**
@@ -3558,6 +3829,10 @@ export class InteractiveMode {
 				this.addCustomEntryToChat(item);
 				continue;
 			}
+			if (isCompactionCostNotice(item)) {
+				this.addCompactionCostNotice(item);
+				continue;
+			}
 
 			const message = item;
 			// assistant 消息需要特殊处理工具调用
@@ -3635,14 +3910,36 @@ export class InteractiveMode {
 			if (entry.type === "custom") {
 				return [entry];
 			}
-			return sessionEntryToContextMessages(entry);
+			const messages = sessionEntryToContextMessages(entry);
+			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
+				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
+			}
+			return messages;
 		});
 		this.renderSessionItems(items, options);
 	}
 
 	/**
-	 * 当一条已完成的 assistant 消息产生显著缓存未命中时，在转录中显示通知。
-	 * 只陈述可观测的事实：未命中本身、模型切换，或超过缓存 TTL 的空闲间隔。
+	 * Render billing usage for a compaction or branch summary. The notice is derived
+	 * from persisted summary usage and is not stored as a separate session entry.
+	 */
+	private addCompactionCostNotice(notice: CompactionCostNotice): void {
+		if (!this.settingsManager.getShowCacheMissNotices()) return;
+
+		const { usage } = notice;
+		const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+		const cost = usage.cost.total >= 0.01 ? ` (~$${usage.cost.total.toFixed(2)})` : "";
+		const label = notice.kind === "compaction" ? "Compaction" : "Branch summary";
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(
+			new Text(theme.fg("warning", `${label}: ${formatTokens(tokens)} tokens billed${cost}`), 1, 0),
+		);
+	}
+
+	/**
+	 * Show a transcript notice when a completed assistant message paid for a
+	 * significant cache miss. Only states observable facts: the miss itself,
+	 * a model switch, or an idle gap past the cache TTL.
 	 */
 	private maybeShowCacheMissNotice(message: AssistantMessage): void {
 		if (!this.settingsManager.getShowCacheMissNotices()) return;
@@ -3828,7 +4125,7 @@ export class InteractiveMode {
 		try {
 			this.ui.stop();
 		} catch {}
-		console.error("pi exiting due to uncaughtException:");
+		console.error(`${APP_NAME} exiting due to uncaughtException:`);
 		console.error(error);
 		process.exit(1);
 	}
@@ -4034,22 +4331,20 @@ export class InteractiveMode {
 		this.showStatus(`Tool output: ${expanded ? "expanded" : "collapsed"}`);
 	}
 
-	/** 切换思考块的可见性并重建聊天。 */
+	/** Update rendered assistant messages without rebuilding live tool components. */
+	private updateThinkingBlockVisibility(): void {
+		for (const child of this.chatContainer.children) {
+			if (child instanceof AssistantMessageComponent) {
+				child.setHideThinkingBlock(this.hideThinkingBlock);
+			}
+		}
+		this.ui.requestRender();
+	}
+
 	private toggleThinkingBlockVisibility(): void {
 		this.hideThinkingBlock = !this.hideThinkingBlock;
 		this.settingsManager.setHideThinkingBlock(this.hideThinkingBlock);
-
-		// 根据会话消息重建聊天
-		this.chatContainer.clear();
-		this.rebuildChatFromMessages();
-
-		// 若在流式处理中，用更新后的可见性重新添加流式组件并重渲染
-		if (this.streamingComponent && this.streamingMessage) {
-			this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
-			this.streamingComponent.updateContent(this.streamingMessage);
-			this.chatContainer.addChild(this.streamingComponent);
-		}
-
+		this.updateThinkingBlockVisibility();
 		this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
 	}
 
@@ -4085,7 +4380,7 @@ export class InteractiveMode {
 	/** 在聊天中显示一条错误消息。 */
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
 		this.ui.requestRender();
 	}
 
@@ -4335,29 +4630,55 @@ export class InteractiveMode {
 	// 选择器
 	// =========================================================================
 
+	private disposeActiveSelector(): void {
+		const dispose = this.activeSelectorDispose;
+		this.activeSelectorToken = undefined;
+		this.activeSelectorDispose = undefined;
+		dispose?.();
+	}
+
 	/**
 	 * 在编辑器位置显示一个选择器组件。
 	 * @param create 接收 `done` 回调并返回组件与焦点目标的工厂函数
 	 */
-	private showSelector(create: (done: () => void) => { component: Component; focus: Component }): void {
+	private showSelector(
+		create: (done: () => void) => { component: Component; focus: Component; dispose?: () => void },
+	): void {
+		const token = {};
+		let dispose: (() => void) | undefined;
 		const done = () => {
+			dispose?.();
+			if (this.activeSelectorToken !== token) return;
+			this.activeSelectorToken = undefined;
+			this.activeSelectorDispose = undefined;
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
 			this.ui.setFocus(this.editor);
 		};
-		const { component, focus } = create(done);
+		const created = create(done);
+		dispose = created.dispose;
+		this.disposeActiveSelector();
+		this.activeSelectorToken = token;
+		this.activeSelectorDispose = dispose;
 		this.editorContainer.clear();
-		this.editorContainer.addChild(component);
-		this.ui.setFocus(focus);
+		this.editorContainer.addChild(created.component);
+		this.ui.setFocus(created.focus);
 		this.ui.requestRender();
 	}
 
 	/** 显示设置选择器。 */
 	private showSettingsSelector(): void {
 		this.showSelector((done) => {
-			const selector = new SettingsSelectorComponent(
+			let selector: SettingsSelectorComponent | undefined;
+			const defaultProvider = this.settingsManager.getDefaultProvider();
+			const defaultModelId = this.settingsManager.getDefaultModel();
+			const defaultModel = defaultProvider && defaultModelId ? `${defaultProvider}/${defaultModelId}` : "not set";
+			selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					defaultModel,
+					currentModel: this.session.model,
+					availableDefaultModels: this.session.modelRuntime.getAvailableSnapshot(),
 					showImages: this.settingsManager.getShowImages(),
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
@@ -4367,12 +4688,14 @@ export class InteractiveMode {
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
-					thinkingLevel: this.session.thinkingLevel,
-					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
-					currentTheme: this.settingsManager.getThemeSetting() || "dark",
+					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+					availableThinkingLevels: [...THINKING_LEVEL_OPTIONS],
+					modelThinkingLevels: this.settingsManager.getAllModelThinkingLevels(),
+					currentTheme: this.themeController.getThemeSelection() || "dark",
 					terminalTheme: this.themeController.getTerminalTheme(),
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
+					mermaidRenderingMode: this.settingsManager.getMermaidRenderingMode(),
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
 					enableInstallTelemetry: this.settingsManager.getEnableInstallTelemetry(),
 					doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
@@ -4386,8 +4709,10 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
-					uiMode: this.settingsManager.getUiMode(),
+					tuiMode: this.ui.mode,
+					fullscreenExitOutput: this.settingsManager.getFullscreenExitOutput(),
 					fullscreenScrollbar: this.settingsManager.getFullscreenScrollbar(),
+					fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -4436,26 +4761,41 @@ export class InteractiveMode {
 						configureHttpDispatcher(timeoutMs);
 						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
 					},
-					onThinkingLevelChange: (level) => {
-						this.session.setThinkingLevel(level);
-						this.footer.invalidate();
-						this.updateEditorBorderColor();
+					onModelThinkingLevelChange: (provider, modelId, level) => {
+						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
+						// If the override is for the current model, apply it to the session too
+						const current = this.session.model;
+						if (current && current.provider === provider && current.id === modelId) {
+							this.session.setThinkingLevel(level);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						}
+					},
+					onModelThinkingLevelRemove: (provider, modelId) => {
+						this.settingsManager.removeModelThinkingLevel(provider, modelId);
+						// If the override was for the current model, revert to global default
+						const current = this.session.model;
+						if (current && current.provider === provider && current.id === modelId) {
+							const globalDefault = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+							this.session.setThinkingLevel(globalDefault);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						}
 					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);
-						void this.themeController.applyFromSettings();
+						void this.themeController.setThemeSetting(themeSetting);
 					},
 					onThemePreview: (themeName) => this.themeController.preview(themeName),
 					onHideThinkingBlockChange: (hidden) => {
 						this.hideThinkingBlock = hidden;
 						this.settingsManager.setHideThinkingBlock(hidden);
-						for (const child of this.chatContainer.children) {
-							if (child instanceof AssistantMessageComponent) {
-								child.setHideThinkingBlock(hidden);
-							}
-						}
-						this.chatContainer.clear();
-						this.rebuildChatFromMessages();
+						this.updateThinkingBlockVisibility();
+					},
+					onMermaidRenderingModeChange: (mode) => {
+						this.settingsManager.setMermaidRenderingMode(mode);
+						this.chatContainer.invalidate();
+						this.ui.requestRender();
 					},
 					onShowCacheMissNoticesChange: (shown) => {
 						this.settingsManager.setShowCacheMissNotices(shown);
@@ -4528,13 +4868,26 @@ export class InteractiveMode {
 					onShowTerminalProgressChange: (enabled) => {
 						this.settingsManager.setShowTerminalProgress(enabled);
 					},
-					onUiModeChange: (mode) => {
-						this.settingsManager.setUiMode(mode);
-						this.showStatus(`UI mode: ${mode} (restart required)`);
+					onTuiModeChange: (mode) => {
+						if (!this.switchTuiMode(mode)) {
+							selector?.getSettingsList().updateValue("tui-mode", this.ui.mode);
+							this.showStatus("Close active overlays before changing TUI mode");
+							return;
+						}
+						this.settingsManager.setTuiMode(mode);
+						if (!this.activeStatusIndicator) this.statusContainer.clear();
+						this.showStatus(`TUI mode: ${mode}`);
+					},
+					onFullscreenExitOutputChange: (output) => {
+						this.settingsManager.setFullscreenExitOutput(output);
 					},
 					onFullscreenScrollbarChange: (mode) => {
 						this.settingsManager.setFullscreenScrollbar(mode);
 						this.applyFullscreenScrollbarSetting();
+					},
+					onFullscreenCopyOnSelectChange: (enabled) => {
+						this.settingsManager.setFullscreenCopyOnSelect(enabled);
+						if (this.renderer instanceof TuiAltScreen) this.renderer.setCopyOnSelect(enabled);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -4549,7 +4902,55 @@ export class InteractiveMode {
 		});
 	}
 
-	/** 处理 /model 命令：无参数时打开选择器，有参数时尝试精确匹配。 */
+	private handleThinkingCommand(searchTerm?: string): void {
+		const availableLevels = this.session.getAvailableThinkingLevels();
+		if (!searchTerm) {
+			this.showThinkingSelector();
+			return;
+		}
+
+		const normalized = searchTerm.trim().toLowerCase();
+		const level = availableLevels.find((candidate) => candidate.toLowerCase() === normalized);
+		if (!level) {
+			this.showError(`Unknown thinking level "${searchTerm}". Available levels: ${availableLevels.join(", ")}.`);
+			return;
+		}
+
+		this.selectThinkingLevel(level, false);
+	}
+
+	private selectThinkingLevel(level: ThinkingLevel, persist: boolean): void {
+		try {
+			this.session.setThinkingLevel(level, { persist });
+			this.footer.invalidate();
+			this.updateEditorBorderColor();
+			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private showThinkingSelector(): void {
+		this.showSelector((done) => {
+			const selectLevel = (level: ThinkingLevel, persist: boolean) => {
+				this.selectThinkingLevel(level, persist);
+				done();
+			};
+			const selector = new ThinkingSelectorComponent(
+				this.session.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+				this.session.getAvailableThinkingLevels(),
+				(level) => selectLevel(level, false),
+				() => {
+					done();
+					this.ui.requestRender();
+				},
+				(level) => selectLevel(level, true),
+				this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
 	private async handleModelCommand(searchTerm?: string): Promise<void> {
 		if (!searchTerm) {
 			this.showModelSelector();
@@ -4559,7 +4960,7 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model);
+				await this.session.setModel(model, { persist: false });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
@@ -4576,22 +4977,37 @@ export class InteractiveMode {
 
 	/** 在候选模型中按精确引用匹配搜索模型。 */
 	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
-		const models = await this.getModelCandidates();
-		return findExactModelReferenceMatch(searchTerm, models);
-	}
+		const cachedModels =
+			this.session.scopedModels.length > 0
+				? this.session.scopedModels.map((scoped) => scoped.model)
+				: [...this.session.modelRuntime.getAvailableSnapshot()];
+		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
+		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
 
-	/** 获取模型候选列表（作用域模型或全部可用模型）。 */
-	private async getModelCandidates(): Promise<Model<any>[]> {
-		if (this.session.scopedModels.length > 0) {
-			return this.session.scopedModels.map((scoped) => scoped.model);
-		}
-
+		this.showStatus("Refreshing model catalogs…");
+		const controller = new AbortController();
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, 15_000);
 		try {
-			await this.session.modelRuntime.refresh();
-			return [...(await this.session.modelRuntime.getAvailable())];
-		} catch {
-			return [];
+			const result = await refreshModelCatalogs(this.session.modelRuntime, controller.signal);
+			if (result.aborted && timedOut) {
+				this.showWarning("Model refresh timed out; searching cached models.");
+			} else if (result.errors.size > 0) {
+				this.showWarning(`Could not refresh ${[...result.errors.keys()].join(", ")}; searching cached models.`);
+			}
+		} catch (error) {
+			this.showWarning(
+				timedOut
+					? "Model refresh timed out; searching cached models."
+					: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		} finally {
+			clearTimeout(timeout);
 		}
+		return findExactModelReferenceMatch(searchTerm, [...this.session.modelRuntime.getAvailableSnapshot()]);
 	}
 
 	/** 从当前快照更新底部栏的可用 provider 数量，不刷新目录。 */
@@ -4676,7 +5092,7 @@ export class InteractiveMode {
 					trustStore.setMany(selection.updates);
 					done();
 					this.showStatus(
-						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart pi for this to take effect.`,
+						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart ${APP_NAME} for this to take effect.`,
 					);
 				},
 				onCancel: () => {
@@ -4691,113 +5107,106 @@ export class InteractiveMode {
 	/** 显示模型选择器。 */
 	private showModelSelector(initialSearchInput?: string): void {
 		this.showSelector((done) => {
+			const selectModel = async (model: Model<any>, persist: boolean) => {
+				try {
+					await this.session.setModel(model, { persist });
+					this.updateAvailableProviderCount();
+					this.footer.invalidate();
+					this.updateEditorBorderColor();
+					done();
+					this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
+					void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+					this.checkDaxnutsEasterEgg(model);
+				} catch (error) {
+					done();
+					this.showError(error instanceof Error ? error.message : String(error));
+				}
+			};
+			const defaultProvider = this.settingsManager.getDefaultProvider();
+			const defaultModel = this.settingsManager.getDefaultModel();
 			const selector = new ModelSelectorComponent(
 				this.ui,
 				this.session.model,
-				this.settingsManager,
 				this.session.modelRuntime,
 				this.session.scopedModels,
-				async (model) => {
-					try {
-						await this.session.setModel(model);
-						this.footer.invalidate();
-						this.updateEditorBorderColor();
-						done();
-						this.showStatus(`Model: ${model.id}`);
-						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-						this.checkDaxnutsEasterEgg(model);
-					} catch (error) {
-						done();
-						this.showError(error instanceof Error ? error.message : String(error));
-					}
-				},
+				(model) => selectModel(model, false),
 				() => {
 					done();
 					this.ui.requestRender();
 				},
 				initialSearchInput,
+				(model) => selectModel(model, true),
+				defaultProvider && defaultModel ? { provider: defaultProvider, id: defaultModel } : undefined,
 			);
-			return { component: selector, focus: selector };
+			return { component: selector, focus: selector, dispose: () => selector.dispose() };
 		});
 	}
 
-	/** 显示作用域模型选择器（/scoped-models）。 */
-	private async showModelsSelector(): Promise<void> {
-		// 获取所有可用模型
-		await this.session.modelRuntime.refresh();
-		const allModels = [...(await this.session.modelRuntime.getAvailable())];
-		const allModelIds = new Set(allModels.map((model) => `${model.provider}/${model.id}`));
+	private showModelsSelector(): void {
+		let availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
+		let availableModelIds = new Set(availableModels.map((model) => `${model.provider}/${model.id}`));
 		const configuredPatterns = this.settingsManager.getEnabledModels();
 		const sessionScopedModels = this.session.scopedModels;
+		const configuredEnabledIds = (models: readonly Model<any>[]): string[] | null => {
+			if (!configuredPatterns?.length) return null;
+			const resolved = resolveModelScopeFromModels(configuredPatterns, models);
+			const ids = resolved.scopedModels.map((scoped) => `${scoped.model.provider}/${scoped.model.id}`);
+			for (const diagnostic of resolved.diagnostics) {
+				if (diagnostic.code === "no-match" && !ids.includes(diagnostic.pattern)) ids.push(diagnostic.pattern);
+			}
+			return ids;
+		};
 
-		if (allModels.length === 0 && !configuredPatterns?.length && sessionScopedModels.length === 0) {
-			this.showStatus("No models available");
-			return;
-		}
+		let currentEnabledIds =
+			sessionScopedModels.length > 0
+				? sessionScopedModels.map((scoped) => `${scoped.model.provider}/${scoped.model.id}`)
+				: configuredEnabledIds(availableModels);
+		let selectionChanged = false;
 
-		const configuredScope = configuredPatterns?.length
-			? await resolveModelScopeWithDiagnostics(configuredPatterns, this.session.modelRuntime)
-			: undefined;
-
-		// 检查会话是否有作用域模型（来自之前的仅会话修改或 CLI --models）
-		const hasSessionScope = sessionScopedModels.length > 0;
-
-		// 从会话状态或设置构建已启用的模型 ID
-		let currentEnabledIds: string[] | null = null;
-
-		if (hasSessionScope) {
-			// 使用当前会话的作用域模型
-			currentEnabledIds = sessionScopedModels.map((scoped) => `${scoped.model.provider}/${scoped.model.id}`);
-		} else if (configuredScope) {
-			currentEnabledIds = configuredScope.scopedModels.map(
-				(scoped) => `${scoped.model.provider}/${scoped.model.id}`,
-			);
-		}
-
-		for (const diagnostic of configuredScope?.diagnostics ?? []) {
-			if (diagnostic.code !== "no-match") continue;
-			currentEnabledIds ??= [];
-			if (!currentEnabledIds.includes(diagnostic.pattern)) currentEnabledIds.push(diagnostic.pattern);
-		}
-
-		// 辅助函数：更新会话的作用域模型（仅会话内，不持久化）
-		const updateSessionModels = async (enabledIds: string[] | null) => {
+		const updateSessionModels = (enabledIds: string[] | null): void => {
 			currentEnabledIds = enabledIds === null ? null : [...enabledIds];
-			const hasEnabledAvailableModel = enabledIds?.some((id) => allModelIds.has(id)) ?? false;
+			const hasEnabledAvailableModel = enabledIds?.some((id) => availableModelIds.has(id)) ?? false;
 			const allAvailableModelsEnabled =
-				enabledIds !== null && [...allModelIds].every((id) => enabledIds.includes(id));
+				enabledIds !== null && [...availableModelIds].every((id) => enabledIds.includes(id));
 			if (enabledIds && hasEnabledAvailableModel && !allAvailableModelsEnabled) {
-				const newScopedModels = await resolveModelScope(enabledIds, this.session.modelRuntime);
+				const newScopedModels = resolveModelScopeFromModels(enabledIds, availableModels).scopedModels;
 				this.session.setScopedModels(
-					newScopedModels.map((sm) => ({
-						model: sm.model,
-						thinkingLevel: sm.thinkingLevel,
+					newScopedModels.map((scoped) => ({
+						model: scoped.model,
+						thinkingLevel: scoped.thinkingLevel,
 					})),
 				);
 			} else {
-				// 全部启用或全部未启用 = 无过滤
 				this.session.setScopedModels([]);
 			}
-			await this.updateAvailableProviderCount();
+			this.updateAvailableProviderCount();
 			this.ui.requestRender();
 		};
 
 		this.showSelector((done) => {
+			let disposed = false;
+			let timedOut = false;
+			const controller = new AbortController();
+			const timeout = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+			}, 15_000);
 			const selector = new ScopedModelsSelectorComponent(
 				{
-					allModels,
+					allModels: availableModels,
 					enabledModelIds: currentEnabledIds,
+					refreshStatus: "Refreshing model catalogs…",
 				},
 				{
-					onChange: async (enabledIds) => {
-						await updateSessionModels(enabledIds);
+					onChange: (enabledIds) => {
+						selectionChanged = true;
+						updateSessionModels(enabledIds);
 					},
 					onPersist: (enabledIds) => {
-						// 持久化到设置
 						const allEnabled =
 							enabledIds !== null &&
-							enabledIds.length === allModels.length &&
-							enabledIds.every((id) => allModelIds.has(id));
+							enabledIds.length === availableModels.length &&
+							enabledIds.every((id) => availableModelIds.has(id));
 						const newPatterns = enabledIds === null || allEnabled ? undefined : enabledIds;
 						this.settingsManager.setEnabledModels(newPatterns ? [...newPatterns] : undefined);
 						this.showStatus("Model selection saved to settings");
@@ -4808,7 +5217,50 @@ export class InteractiveMode {
 					},
 				},
 			);
-			return { component: selector, focus: selector };
+			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
+				.then((result) => {
+					if (disposed) return;
+					availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
+					availableModelIds = new Set(availableModels.map((model) => `${model.provider}/${model.id}`));
+					if (!selectionChanged && sessionScopedModels.length === 0) {
+						currentEnabledIds = configuredEnabledIds(availableModels);
+						selector.updateModels(availableModels, currentEnabledIds);
+					} else {
+						selector.updateModels(availableModels);
+					}
+					if (currentEnabledIds !== null) updateSessionModels(currentEnabledIds);
+					if (result.aborted && timedOut) {
+						selector.setRefreshStatus("Model refresh timed out; showing cached models.", "warning");
+					} else if (result.errors.size > 0) {
+						selector.setRefreshStatus(
+							`Could not refresh ${[...result.errors.keys()].join(", ")}; showing cached models.`,
+							"warning",
+						);
+					} else {
+						selector.setRefreshStatus("Model catalogs refreshed.", "success");
+					}
+					this.ui.requestRender();
+				})
+				.catch((error: unknown) => {
+					if (disposed) return;
+					selector.setRefreshStatus(
+						timedOut
+							? "Model refresh timed out; showing cached models."
+							: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`,
+						"warning",
+					);
+					this.ui.requestRender();
+				})
+				.finally(() => clearTimeout(timeout));
+			return {
+				component: selector,
+				focus: selector,
+				dispose: () => {
+					disposed = true;
+					clearTimeout(timeout);
+					controller.abort();
+				},
+			};
 		});
 	}
 
@@ -5127,7 +5579,7 @@ export class InteractiveMode {
 
 	/** 获取已保存凭据的 provider 列表（用于 /logout）。 */
 	private async getLogoutProviderOptions(): Promise<AuthSelectorProvider[]> {
-		return (await this.session.modelRuntime.listCredentials())
+		return (await this.session.modelRuntime.listCredentials({ signal: AbortSignal.timeout(15_000) }))
 			.map(({ providerId, type }) => ({
 				id: providerId,
 				name: this.session.modelRuntime.getProvider(providerId)?.name ?? providerId,
@@ -5153,7 +5605,6 @@ export class InteractiveMode {
 
 	/** 处理 /login 命令：无参数时显示鉴权方式选择，有参数时匹配 provider。 */
 	private async handleLoginCommand(providerRef?: string): Promise<void> {
-		await this.session.modelRuntime.getAvailable();
 		if (!providerRef) {
 			this.showLoginAuthTypeSelector();
 			return;
@@ -5297,7 +5748,13 @@ export class InteractiveMode {
 			return;
 		}
 
-		const providerOptions = await this.getLogoutProviderOptions();
+		let providerOptions: AuthSelectorProvider[];
+		try {
+			providerOptions = await this.getLogoutProviderOptions();
+		} catch (error) {
+			this.showError(`Could not read stored credentials: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
 		if (providerOptions.length === 0) {
 			this.showStatus(
 				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
@@ -5318,7 +5775,9 @@ export class InteractiveMode {
 					}
 
 					try {
-						await this.session.modelRuntime.logout(providerOption.id);
+						await this.session.modelRuntime.logout(providerOption.id, {
+							signal: AbortSignal.timeout(15_000),
+						});
 						await this.updateAvailableProviderCount();
 						const message =
 							providerOption.authType === "oauth"
@@ -5326,7 +5785,12 @@ export class InteractiveMode {
 								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
 						this.showStatus(message);
 					} catch (error: unknown) {
-						this.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+						const message = error instanceof Error ? error.message : String(error);
+						this.showError(
+							error instanceof CredentialSynchronizationError
+								? `Credentials removed for ${providerOption.name}, but local model state could not be synchronized: ${message}`
+								: `Logout failed: ${message}`,
+						);
 					}
 				},
 				() => {
@@ -5345,16 +5809,17 @@ export class InteractiveMode {
 		authType: "oauth" | "api_key",
 		previousModel: Model<any> | undefined,
 	): Promise<void> {
-		await this.session.modelRuntime.getAvailable();
-
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
 
 		let selectedModel: Model<any> | undefined;
 		let selectionError: string | undefined;
 		if (isUnknownModel(previousModel)) {
-			const availableModels = await this.session.modelRuntime.getAvailable();
+			const availableModels = this.session.modelRuntime.getAvailableSnapshot();
 			const providerModels = availableModels.filter((model) => model.provider === providerId);
-			if (!hasDefaultModelProvider(providerId)) {
+			// Matches LLAMA_PROVIDER_ID from extensions/llama/provider.ts; kept inline to avoid coupling interactive mode to the built-in extension.
+			if (providerId === "llama.cpp") {
+				selectionError = llamaCppPostLoginGuidance(actionLabel, providerModels.length);
+			} else if (!hasDefaultModelProvider(providerId)) {
 				selectionError = `${actionLabel}, but no default model is configured for provider "${providerId}". Use /model to select a model.`;
 			} else if (providerModels.length === 0) {
 				selectionError = `${actionLabel}, but no models are available for that provider. Use /model to select a model.`;
@@ -5365,7 +5830,7 @@ export class InteractiveMode {
 					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
 				} else {
 					try {
-						await this.session.setModel(selectedModel);
+						await this.session.setModel(selectedModel, { persist: true });
 					} catch (error: unknown) {
 						selectedModel = undefined;
 						const errorMessage = error instanceof Error ? error.message : String(error);
@@ -5390,6 +5855,27 @@ export class InteractiveMode {
 				void this.maybeWarnAboutAnthropicSubscriptionAuth();
 			}
 		}
+
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 15_000);
+		void this.session.modelRuntime
+			.refresh({ providers: [providerId], signal: controller.signal })
+			.then((result) => {
+				if (result.aborted) {
+					this.showWarning(`${actionLabel}, but its model catalog refresh timed out; using cached models.`);
+				} else if (result.errors.size > 0) {
+					this.showWarning(`${actionLabel}, but its model catalog could not be refreshed; using cached models.`);
+				}
+				this.updateAvailableProviderCount();
+				this.footer.invalidate();
+				this.ui.requestRender();
+			})
+			.catch((error: unknown) => {
+				this.showWarning(
+					`${actionLabel}, but its model catalog could not be refreshed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			})
+			.finally(() => clearTimeout(timeout));
 	}
 
 	/** 显示“环境鉴权”对话框（provider 在 pi 外部配置）。 */
@@ -5408,7 +5894,11 @@ export class InteractiveMode {
 			providerOption.name,
 			`${providerOption.name} setup`,
 		);
-		dialog.showInfo(`${providerOption.method?.name ?? "Authentication"} is configured outside pi.`, [], true);
+		dialog.showInfo(
+			`${providerOption.method?.name ?? "Authentication"} is configured outside ${APP_NAME}.`,
+			[],
+			true,
+		);
 
 		this.editorContainer.clear();
 		this.editorContainer.addChild(dialog);
@@ -5456,7 +5946,11 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			restoreEditor();
 			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
+			if (error instanceof CredentialSynchronizationError) {
+				this.showError(
+					`Saved API key for ${providerName}, but local model state could not be synchronized: ${errorMsg}`,
+				);
+			} else if (errorMsg !== "Login cancelled") {
 				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
 			}
 		}
@@ -5571,7 +6065,11 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			restoreEditor();
 			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
+			if (error instanceof CredentialSynchronizationError) {
+				this.showError(
+					`Logged in to ${providerName}, but local model state could not be synchronized: ${errorMsg}`,
+				);
+			} else if (errorMsg !== "Login cancelled") {
 				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
 			}
 		}
@@ -5643,8 +6141,8 @@ export class InteractiveMode {
 				activeHeader.setExpanded(this.toolOutputExpanded);
 			}
 			setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
-			await this.themeController.applyFromSettings();
 			this.applyRuntimeSettings();
+			await this.themeController.applyFromSettings();
 			this.setupAutocompleteProvider();
 			const runner = this.session.extensionRunner;
 			this.setupExtensionShortcuts(runner);
@@ -5681,7 +6179,9 @@ export class InteractiveMode {
 				const filePath = this.session.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
-				const filePath = await this.session.exportToHtml(outputPath);
+				const filePath = await this.session.exportToHtml(outputPath, {
+					themeName: theme.name,
+				});
 				this.showStatus(`Session exported to: ${filePath}`);
 			}
 		} catch (error: unknown) {
@@ -5766,101 +6266,29 @@ export class InteractiveMode {
 
 	/** 处理 /share 命令：把会话导出为 gist 并生成分享链接。 */
 	private async handleShareCommand(): Promise<void> {
-		// 检查 gh 是否可用且已登录
-		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
-			if (authResult.status !== 0) {
-				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
-				return;
-			}
-		} catch {
-			this.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
-			return;
-		}
-
-		// 导出到临时文件
-		const tmpFile = path.join(os.tmpdir(), "session.html");
-		try {
-			await this.session.exportToHtml(tmpFile);
-		} catch (error: unknown) {
-			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
-			return;
-		}
-
-		// 显示可取消的加载器，替换编辑器
-		const loader = new BorderedLoader(this.ui, theme, "Creating gist...");
-		this.editorContainer.clear();
-		this.editorContainer.addChild(loader);
-		this.ui.setFocus(loader);
-		this.ui.requestRender();
-
-		const restoreEditor = () => {
-			loader.dispose();
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-			try {
-				fs.unlinkSync(tmpFile);
-			} catch {
-				// 忽略清理错误
-			}
-		};
-
-		// 异步创建私有 gist
-		let proc: ReturnType<typeof spawn> | null = null;
-
-		loader.onAbort = () => {
-			proc?.kill();
-			restoreEditor();
-			this.showStatus("Share cancelled");
-		};
-
-		try {
-			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
-				let stdout = "";
-				let stderr = "";
-				proc.stdout?.on("data", (data) => {
-					stdout += data.toString();
-				});
-				proc.stderr?.on("data", (data) => {
-					stderr += data.toString();
-				});
-				proc.on("close", (code) => resolve({ stdout, stderr, code }));
-			});
-
-			if (loader.signal.aborted) return;
-
-			restoreEditor();
-
-			if (result.code !== 0) {
-				const errorMsg = result.stderr?.trim() || "Unknown error";
-				this.showError(`Failed to create gist: ${errorMsg}`);
-				return;
-			}
-
-			// 从 gh 返回的 URL 中提取 gist ID
-			// gh 返回类似：https://gist.github.com/username/GIST_ID
-			const gistUrl = result.stdout?.trim();
-			const gistId = gistUrl?.split("/").pop();
-			if (!gistId) {
-				this.showError("Failed to parse gist ID from gh output");
-				return;
-			}
-
-			// 创建预览 URL
-			const previewUrl = getShareViewerUrl(gistId);
-			this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
-		} catch (error: unknown) {
-			if (!loader.signal.aborted) {
-				restoreEditor();
-				this.showError(`Failed to create gist: ${error instanceof Error ? error.message : "Unknown error"}`);
-			}
-		}
+		await shareSession({
+			session: this.session,
+			ui: this.ui,
+			editorContainer: this.editorContainer,
+			editor: this.editor,
+			showStatus: (message) => this.showStatus(message),
+			showError: (message) => this.showError(message),
+		});
 	}
 
-	/** 处理 /copy 命令：把最后一条 assistant 消息复制到剪贴板。 */
-	private async handleCopyCommand(): Promise<void> {
+	private async handleCopyCommand(
+		options: { flashConfirmation?: boolean; preferSelection?: boolean } = {},
+	): Promise<void> {
+		if (
+			options.preferSelection &&
+			this.ui instanceof TuiAltScreen &&
+			!this.ui.getCopyOnSelect() &&
+			this.ui.hasActiveSelection()
+		) {
+			await this.ui.copyActiveSelectionToClipboard();
+			return;
+		}
+
 		const text = this.session.getLastAssistantText();
 		if (!text) {
 			this.showError("No agent messages to copy yet.");
@@ -5869,7 +6297,11 @@ export class InteractiveMode {
 
 		try {
 			await copyToClipboard(text);
-			this.showStatus("Copied last agent message to clipboard");
+			if (options.flashConfirmation && this.ui instanceof TuiAltScreen) {
+				this.ui.flash("Copied!");
+			} else {
+				this.showStatus("Copied last agent message to clipboard");
+			}
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -6294,8 +6726,8 @@ export class InteractiveMode {
 		}
 	}
 
-	/** 停止交互模式：清理状态、订阅、页脚与 TUI。 */
-	stop(): void {
+	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}
@@ -6308,7 +6740,7 @@ export class InteractiveMode {
 			this.unsubscribe();
 		}
 		if (this.isInitialized) {
-			this.ui.stop();
+			this.stopInteractiveTui(fullscreenExitOutput);
 			this.isInitialized = false;
 		}
 		this.unregisterSignalHandlers();

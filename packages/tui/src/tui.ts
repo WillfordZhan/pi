@@ -297,8 +297,15 @@ export function compositeTuiLine(
 	return visibleWidth(result) <= totalWidth ? result : sliceByColumn(result, 0, totalWidth, true);
 }
 
-/** TUI 主接口：定义终端 UI 的渲染、焦点、Overlay 与输入处理等能力。 */
+export type TuiMode = "regular" | "fullscreen";
+
+export interface TuiStopOptions {
+	/** Leave renderer output in place for another TUI taking over the same terminal. */
+	preserveScreen?: boolean;
+}
+
 export interface TUI extends Component {
+	readonly mode: TuiMode;
 	children: Component[];
 	terminal: Terminal;
 	onDebug?: () => void;
@@ -315,7 +322,8 @@ export interface TUI extends Component {
 	hideOverlay(): void;
 	hasOverlay(): boolean;
 	start(): void;
-	stop(): void;
+	stop(options?: TuiStopOptions): void;
+	renderNow(force?: boolean): void;
 	requestRender(force?: boolean): void;
 	addInputListener(listener: TuiInputListener): () => void;
 	removeInputListener(listener: TuiInputListener): void;
@@ -343,6 +351,7 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
  * TUI 抽象基类：实现焦点管理、Overlay 栈、输入分发、渲染调度等公共逻辑。
  */
 export abstract class TuiBase extends Container implements TUI {
+	abstract readonly mode: TuiMode;
 	public terminal: Terminal;
 	/** 当前持有焦点的组件。 */
 	private focusedComponent: Component | null = null;
@@ -353,7 +362,7 @@ export abstract class TuiBase extends Container implements TUI {
 	public onDebug?: () => void;
 	/** 是否已请求渲染（用于合并同一帧内的多次请求）。 */
 	private renderRequested = false;
-	/** 渲染定时器句柄。 */
+	private immediateRenderScheduled = false;
 	private renderTimer: NodeJS.Timeout | undefined;
 	/** 上次渲染的时间戳（毫秒）。 */
 	private lastRenderAt = 0;
@@ -382,8 +391,7 @@ export abstract class TuiBase extends Container implements TUI {
 	private focusOrderCounter = 0;
 	private overlayStack: OverlayStackEntry[] = [];
 
-	/** 是否已有 Overlay 入栈。 */
-	protected get hasOverlayEntries(): boolean {
+	get hasOverlayEntries(): boolean {
 		return this.overlayStack.length > 0;
 	}
 	/** 当前的 Overlay 焦点恢复状态。 */
@@ -416,11 +424,9 @@ export abstract class TuiBase extends Container implements TUI {
 	/** 终端启动后的钩子。 */
 	protected afterTerminalStart(): void {}
 
-	/** 终端停止前的钩子。 */
-	protected beforeTerminalStop(): void {}
+	protected beforeTerminalStop(_options: TuiStopOptions): void {}
 
-	/** 终端停止后的钩子。 */
-	protected afterTerminalStop(): void {}
+	protected afterTerminalStop(_options: TuiStopOptions): void {}
 
 	/** 全量重绘次数。 */
 	get fullRedraws(): number {
@@ -456,7 +462,10 @@ export abstract class TuiBase extends Container implements TUI {
 		this.clearOnShrink = enabled;
 	}
 
-	/** 设置当前焦点组件，并清除 Overlay 焦点恢复状态。 */
+	getFocusedComponent(): Component | null {
+		return this.focusedComponent;
+	}
+
 	setFocus(component: Component | null): void {
 		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
 	}
@@ -719,7 +728,14 @@ export abstract class TuiBase extends Container implements TUI {
 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
 	}
 
-	/** 检查某个 Overlay 记录当前是否可见。 */
+	/** Check if the focused component is a visible overlay */
+	protected isOverlayFocused(): boolean {
+		return this.overlayStack.some(
+			(entry) => entry.component === this.focusedComponent && this.isOverlayVisible(entry),
+		);
+	}
+
+	/** Check if an overlay entry is currently visible */
 	private isOverlayVisible(entry: OverlayStackEntry): boolean {
 		if (entry.hidden) return false;
 		if (entry.options?.visible) {
@@ -742,8 +758,8 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/** 使所有子组件及 Overlay 的渲染状态失效。 */
 	override invalidate(): void {
-		super.invalidate();
-		for (const overlay of this.overlayStack) overlay.component.invalidate?.();
+		for (const root of this.getMountedRoots()) root.invalidate();
+		for (const overlay of this.overlayStack) overlay.component.invalidate();
 	}
 
 	/** 启动 TUI：启动终端、注册输入回调、查询终端能力并触发首次渲染。 */
@@ -806,20 +822,24 @@ export abstract class TuiBase extends Container implements TUI {
 		this.terminal.write("\x1b[16t");
 	}
 
-	/** 停止 TUI：清理渲染定时器、恢复光标并关闭终端。 */
-	stop(): void {
+	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
-		if (this.renderTimer) {
-			clearTimeout(this.renderTimer);
-			this.renderTimer = undefined;
-		}
+		this.cancelRenderTimer();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
-		this.beforeTerminalStop();
+		this.beforeTerminalStop(options);
 		this.terminal.showCursor();
 		this.terminal.stop();
-		this.afterTerminalStop();
+		this.afterTerminalStop(options);
+	}
+
+	renderNow(force = false): void {
+		if (force) this.resetRenderState();
+		this.renderRequested = false;
+		this.cancelRenderTimer();
+		this.lastRenderAt = performance.now();
+		this.doRender();
 	}
 
 	/**
@@ -829,19 +849,7 @@ export abstract class TuiBase extends Container implements TUI {
 	requestRender(force = false): void {
 		if (force) {
 			this.resetRenderState();
-			if (this.renderTimer) {
-				clearTimeout(this.renderTimer);
-				this.renderTimer = undefined;
-			}
-			this.renderRequested = true;
-			process.nextTick(() => {
-				if (this.stopped || !this.renderRequested) {
-					return;
-				}
-				this.renderRequested = false;
-				this.lastRenderAt = performance.now();
-				this.doRender();
-			});
+			this.requestImmediateRender();
 			return;
 		}
 		if (this.renderRequested) return;
@@ -849,7 +857,29 @@ export abstract class TuiBase extends Container implements TUI {
 		process.nextTick(() => this.scheduleRender());
 	}
 
-	/** 按最小渲染间隔节流调度实际渲染，并在渲染期间有新请求时继续调度。 */
+	private requestImmediateRender(): void {
+		this.cancelRenderTimer();
+		this.renderRequested = true;
+		if (this.immediateRenderScheduled) return;
+		this.immediateRenderScheduled = true;
+		process.nextTick(() => {
+			this.immediateRenderScheduled = false;
+			if (this.stopped || !this.renderRequested) return;
+			// A previously queued scheduleRender() can create a timer before this
+			// callback runs. User input must preempt that throttled frame.
+			this.cancelRenderTimer();
+			this.renderRequested = false;
+			this.lastRenderAt = performance.now();
+			this.doRender();
+		});
+	}
+
+	private cancelRenderTimer(): void {
+		if (!this.renderTimer) return;
+		clearTimeout(this.renderTimer);
+		this.renderTimer = undefined;
+	}
+
 	private scheduleRender(): void {
 		if (this.stopped || this.renderTimer || !this.renderRequested) {
 			return;
@@ -943,7 +973,9 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			this.focusedComponent.handleInput(data);
-			this.requestRender();
+			// Keyboard input is latency-sensitive. Avoid the throttled timer path,
+			// where even setTimeout(0) can take a full 16 ms tick on Windows.
+			this.requestImmediateRender();
 		}
 	}
 

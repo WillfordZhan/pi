@@ -3,24 +3,20 @@ import {
 	type ModelMetadata,
 	PROTOCOL_VERSION,
 	type ServerSnapshot,
-	type SessionSummary,
+	type SessionMetadata,
 } from "@earendil-works/pi-protocol";
 import type { ConnectionState } from "./connection.ts";
-import type { PiSessionBackend } from "./types.ts";
+import type { PiServerService } from "./types.ts";
 
 /** 快照发布器依赖的外部协作接口（由 PiServer 注入）。 */
 interface ServerSnapshotPublisherOptions {
 	/** 服务器实例 ID。 */
 	serverId: string;
-	/** 会话后端，用于获取模型列表。 */
-	backend: PiSessionBackend;
-	/** 所有活跃连接集合，用于定位就绪连接。 */
+	service: PiServerService;
 	connections: Set<ConnectionState>;
 	/** 查询服务器是否正在关闭。 */
 	isClosing: () => boolean;
-	/** 获取会话摘要列表。 */
-	listSessions: (connection?: ConnectionState) => Promise<SessionSummary[]>;
-	/** 向指定连接发送事件消息。 */
+	listSessions: () => Promise<SessionMetadata[]>;
 	sendMessage: (connection: ConnectionState, message: EventEnvelope) => Promise<boolean>;
 	/** 上报非致命错误。 */
 	reportError: (error: unknown) => void;
@@ -45,14 +41,13 @@ export class ServerSnapshotPublisher {
 		return this.revision;
 	}
 
-	/** 构建一份服务器快照（可传入共享的模型列表以避免重复查询）。 */
-	async get(models?: ModelMetadata[], connection?: ConnectionState): Promise<ServerSnapshot> {
+	async get(models?: ModelMetadata[]): Promise<ServerSnapshot> {
 		return {
 			serverId: this.options.serverId,
 			protocolVersion: PROTOCOL_VERSION,
 			revision: this.revision,
-			sessions: await this.options.listSessions(connection),
-			models: models ?? (await this.options.backend.listModels()),
+			sessions: await this.options.listSessions(),
+			models: models ?? (await this.options.service.listModels()),
 		};
 	}
 
@@ -70,12 +65,10 @@ export class ServerSnapshotPublisher {
 		);
 		if (readyConnections.length === 0 || this.options.isClosing()) return;
 		const revision = ++this.revision;
-		const models = await this.options.backend.listModels();
-		for (const connection of readyConnections) {
-			const current = await this.get(models, connection);
-			const snapshot: ServerSnapshot = { ...current, revision };
-			const envelope: EventEnvelope = { type: "event", event: { type: "server_snapshot", snapshot } };
-			await this.options.sendMessage(connection, envelope);
-		}
+		const models = await this.options.service.listModels();
+		const current = await this.get(models);
+		const snapshot: ServerSnapshot = { ...current, revision };
+		const envelope: EventEnvelope = { type: "event", event: { type: "server_snapshot", snapshot } };
+		for (const connection of readyConnections) await this.options.sendMessage(connection, envelope);
 	}
 }

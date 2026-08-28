@@ -3,7 +3,6 @@
  * 以及旧版兼容模块（legacy）。
  */
 export * from "./errors.ts";
-export * from "./legacy/index.ts";
 export * from "./listener.ts";
 export * from "./protocol.ts";
 export * from "./server.ts";

@@ -2,9 +2,9 @@ import type {
 	Command,
 	ModelMetadata,
 	ModelRef,
+	SessionMetadata,
 	SessionPhase,
 	SessionSnapshot,
-	SessionSummary,
 	ThinkingLevel,
 	TranscriptProgress,
 } from "@earendil-works/pi-protocol";
@@ -13,9 +13,6 @@ import type { PiServerListener } from "./listener.ts";
 
 /** 构造 {@link PiServer} 时的配置选项。 */
 export interface PiServerOptions {
-	/** 握手鉴权令牌（明文，服务器内部只保存其 SHA-256 摘要）。 */
-	token: string;
-	/** 传输监听器列表。 */
 	listeners: readonly PiServerListener[];
 	/** 单帧消息的最大长度限制，默认由协议库决定。 */
 	maxFrameLength?: number;
@@ -37,7 +34,7 @@ export type SteerInput = Omit<Extract<Command, { command: "steer" }>, "command" 
 
 /** 创建会话时传给后端选项。 */
 export interface CreateSessionOptions {
-	/** 由 PiServer 分配的防碰撞 ID；后端必须原样持久化该 ID。 */
+	/** A collision-resistant ID assigned by PiServer. The service must persist this exact ID. */
 	id: string;
 	/** 会话工作目录。 */
 	cwd?: string;
@@ -77,11 +74,9 @@ export interface PiSessionRuntime {
 	dispose(): Promise<void>;
 }
 
-/** 持久化存储与独占运行时边界：供 PiServer 获取会话与模型。 */
-export interface PiSessionBackend {
-	/** 列出所有已存储会话的摘要。 */
-	listSessions(): Promise<SessionSummary[]>;
-	/** 列出可用模型。 */
+/** Service boundary for durable sessions and exclusively acquired runtimes. */
+export interface PiServerService {
+	listSessions(): Promise<SessionMetadata[]>;
 	listModels(): Promise<ModelMetadata[]>;
 	/** 创建一个新会话并返回其独占运行时。 */
 	createSession(options: CreateSessionOptions): Promise<PiSessionRuntime>;
@@ -91,7 +86,4 @@ export interface PiSessionBackend {
 
 /** {@link PiSessionRuntime} 的别名。 */
 export type SessionRuntime = PiSessionRuntime;
-/** {@link PiSessionBackend} 的别名。 */
-export type SessionBackend = PiSessionBackend;
-/** {@link PiSessionRuntimeEvent} 的别名。 */
 export type SessionRuntimeEvent = PiSessionRuntimeEvent;

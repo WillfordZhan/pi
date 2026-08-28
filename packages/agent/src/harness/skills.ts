@@ -47,8 +47,9 @@ export function formatSkillInvocation(skill: Skill, additionalInstructions?: str
 /**
  * 从一个或多个目录加载技能。
  *
- * 递归遍历目录，加载 `SKILL.md` 文件，加载直接的根级别 `.md` 文件作为技能，遵循忽略文件规则，
- * 并返回无效技能文件的诊断信息。缺失的输入目录会被跳过。
+ * Traverses directories recursively, loads `SKILL.md` files, loads direct root `.md` files with skill
+ * frontmatter, honors ignore files, and returns diagnostics for invalid declared skill files. Missing input
+ * directories are skipped.
  */
 export async function loadSkills(
 	env: ExecutionEnv,
@@ -161,7 +162,7 @@ async function loadSkillsFromDirInternal(
 		const relPath = relativeEnvPath(rootDir, fullPath);
 		if (ignoreMatcher.ignores(relPath)) continue;
 
-		const result = await loadSkillFromFile(env, fullPath);
+		const result = await loadSkillFromFile(env, fullPath, dirInfo.name);
 		if (result.skill) skills.push(result.skill);
 		diagnostics.push(...result.diagnostics);
 		return { skills, diagnostics };
@@ -185,7 +186,7 @@ async function loadSkillsFromDirInternal(
 		}
 
 		if (kind !== "file" || !includeRootFiles || !entry.name.endsWith(".md")) continue;
-		const result = await loadSkillFromFile(env, fullPath);
+		const result = await loadSkillFromFile(env, fullPath, dirInfo.name);
 		if (result.skill) skills.push(result.skill);
 		diagnostics.push(...result.diagnostics);
 	}
@@ -216,7 +217,17 @@ async function addIgnoreRules(
 	const prefix = relativeDir ? `${relativeDir}/` : "";
 
 	for (const filename of IGNORE_FILE_NAMES) {
-		const ignorePath = joinEnvPath(dir, filename);
+		const ignorePathResult = await env.joinPath([dir, filename]);
+		if (!ignorePathResult.ok) {
+			diagnostics.push({
+				type: "warning",
+				code: "file_info_failed",
+				message: ignorePathResult.error.message,
+				path: dir,
+			});
+			continue;
+		}
+		const ignorePath = ignorePathResult.value;
 		const info = await env.fileInfo(ignorePath);
 		if (!info.ok) {
 			if (info.error.code !== "not_found") {
@@ -285,8 +296,14 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 async function loadSkillFromFile(
 	env: ExecutionEnv,
 	filePath: string,
+	parentDirName: string,
 ): Promise<{ skill: Skill | null; diagnostics: SkillDiagnostic[] }> {
 	const diagnostics: SkillDiagnostic[] = [];
+	const isDeclaredSkill =
+		filePath
+			.replace(/[\\/]+$/, "")
+			.split(/[\\/]/)
+			.pop() === "SKILL.md";
 	const rawContent = await env.readTextFile(filePath);
 	if (!rawContent.ok) {
 		diagnostics.push({ type: "warning", code: "read_failed", message: rawContent.error.message, path: filePath });
@@ -295,14 +312,17 @@ async function loadSkillFromFile(
 
 	const parsed = parseFrontmatter<SkillFrontmatter>(rawContent.value);
 	if (!parsed.ok) {
-		diagnostics.push({ type: "warning", code: "parse_failed", message: parsed.error.message, path: filePath });
+		if (isDeclaredSkill) {
+			diagnostics.push({ type: "warning", code: "parse_failed", message: parsed.error.message, path: filePath });
+		}
 		return { skill: null, diagnostics };
 	}
 
 	const { frontmatter, body } = parsed.value;
-	const skillDir = dirnameEnvPath(filePath);
-	const parentDirName = basenameEnvPath(skillDir);
 	const description = typeof frontmatter.description === "string" ? frontmatter.description : undefined;
+	if (!isDeclaredSkill && (!description || description.trim() === "")) {
+		return { skill: null, diagnostics };
+	}
 
 	for (const error of validateDescription(description)) {
 		diagnostics.push({ type: "warning", code: "invalid_metadata", message: error, path: filePath });
@@ -440,29 +460,17 @@ async function resolveKind(
 	return target.value.kind === "file" || target.value.kind === "directory" ? target.value.kind : undefined;
 }
 
-/** 将基础路径和子名称用单个 `/` 分隔符拼接，规范化多余的斜杠。 */
-function joinEnvPath(base: string, child: string): string {
-	return `${base.replace(/\/+$/, "")}/${child.replace(/^\/+/, "")}`;
-}
-
-/** 返回父目录路径，去除末尾斜杠和最后一个路径段。根路径返回 `"/"`。 */
 function dirnameEnvPath(path: string): string {
-	const normalized = path.replace(/\/+$/, "");
-	const slashIndex = normalized.lastIndexOf("/");
-	return slashIndex <= 0 ? "/" : normalized.slice(0, slashIndex);
-}
-
-/** 返回最后一个路径段（文件或目录名），去除末尾斜杠。 */
-function basenameEnvPath(path: string): string {
-	const normalized = path.replace(/\/+$/, "");
-	const slashIndex = normalized.lastIndexOf("/");
-	return slashIndex === -1 ? normalized : normalized.slice(slashIndex + 1);
+	const normalized = path.replace(/[\\/]+$/, "");
+	const separatorIndex = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
+	if (separatorIndex === 2 && normalized[1] === ":") return normalized.slice(0, 3);
+	return separatorIndex <= 0 ? "/" : normalized.slice(0, separatorIndex);
 }
 
 /** 计算从 `root` 到 `path` 的相对路径。相等时返回空字符串，否则去除开头的斜杠。 */
 function relativeEnvPath(root: string, path: string): string {
-	const normalizedRoot = root.replace(/\/+$/, "");
-	const normalizedPath = path.replace(/\/+$/, "");
+	const normalizedRoot = root.replace(/\\/g, "/").replace(/\/+$/, "");
+	const normalizedPath = path.replace(/\\/g, "/").replace(/\/+$/, "");
 	if (normalizedPath === normalizedRoot) return "";
 	return normalizedPath.startsWith(`${normalizedRoot}/`)
 		? normalizedPath.slice(normalizedRoot.length + 1)

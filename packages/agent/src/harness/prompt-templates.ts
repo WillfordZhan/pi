@@ -57,7 +57,7 @@ export async function loadPromptTemplates(
 			promptTemplates.push(...result.promptTemplates);
 			diagnostics.push(...result.diagnostics);
 		} else if (kind === "file" && info.name.endsWith(".md")) {
-			const result = await loadTemplateFromFile(env, info.path);
+			const result = await loadTemplateFromFile(env, info.path, info.name);
 			if (result.promptTemplate) promptTemplates.push(result.promptTemplate);
 			diagnostics.push(...result.diagnostics);
 		}
@@ -123,7 +123,7 @@ async function loadTemplatesFromDir(
 	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
 		const kind = await resolveKind(env, entry, diagnostics);
 		if (kind !== "file" || !entry.name.endsWith(".md")) continue;
-		const result = await loadTemplateFromFile(env, entry.path);
+		const result = await loadTemplateFromFile(env, entry.path, entry.name);
 		if (result.promptTemplate) promptTemplates.push(result.promptTemplate);
 		diagnostics.push(...result.diagnostics);
 	}
@@ -140,6 +140,7 @@ async function loadTemplatesFromDir(
 async function loadTemplateFromFile(
 	env: ExecutionEnv,
 	filePath: string,
+	fileName: string,
 ): Promise<{ promptTemplate: PromptTemplate | null; diagnostics: PromptTemplateDiagnostic[] }> {
 	const diagnostics: PromptTemplateDiagnostic[] = [];
 	const rawContent = await env.readTextFile(filePath);
@@ -173,7 +174,7 @@ async function loadTemplateFromFile(
 	}
 	return {
 		promptTemplate: {
-			name: basenameEnvPath(filePath).replace(/\.md$/i, ""),
+			name: fileName.replace(/\.md$/i, ""),
 			description,
 			content: body,
 		},
@@ -245,26 +246,7 @@ function parseFrontmatter<T extends Record<string, unknown>>(
 	}
 }
 
-/**
- * 从环境风格路径中提取 basename。
- *
- * 去除尾部斜杠，然后返回最后一个 `/` 之后的所有内容。当没有 `/` 时返回整个字符串。
- * 这模拟了 POSIX 风格路径的 `basename(1)` 行为。
- */
-function basenameEnvPath(path: string): string {
-	const normalized = path.replace(/\/+$/, "");
-	const slashIndex = normalized.lastIndexOf("/");
-	return slashIndex === -1 ? normalized : normalized.slice(slashIndex + 1);
-}
-
-/**
- * 使用 shell 风格的引号将参数字符串解析为位置标记。
- *
- * 按未引用的空白字符（空格和制表符）分割。单引号（`'...'`）和双引号
- * （`"..."`）段会抑制分割和转义：引号字符本身被去除，
- * 引号之间的所有内容按原样保留。连续的空白分隔符会被折叠
- * （不会产生空参数）。未匹配的引号被视为在输入末尾闭合。
- */
+/** Parse an argument string using simple shell-style single and double quotes. */
 export function parseCommandArgs(argsString: string): string[] {
 	const args: string[] = [];
 	let current = "";

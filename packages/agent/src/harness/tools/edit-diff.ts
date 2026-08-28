@@ -36,17 +36,17 @@ export function normalizeForFuzzyMatch(text: string): string {
 			.map((line) => line.trimEnd())
 			.join("\n")
 			// 智能单引号 → '
-			.replace(/[‘’‚‛]/g, "'")
+			.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
 			// 智能双引号 → "
-			.replace(/[“”„‟]/g, '"')
+			.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
 			// 各种破折号/连字符 → -
 			// U+2010 连字符, U+2011 不间断连字符, U+2012 数字破折号,
 			// U+2013 短破折号, U+2014 长破折号, U+2015 水平线, U+2212 减号
-			.replace(/[‐‑‒–—―−]/g, "-")
+			.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
 			// 特殊空格 → 普通空格
 			// U+00A0 不间断空格, U+2002-U+200A 各种空格, U+202F 窄不间断空格,
 			// U+205F 中等数学空格, U+3000 表意空格
-			.replace(/[  -   　]/g, " ")
+			.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ")
 	);
 }
 
@@ -239,7 +239,7 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 
 /** 如果存在 UTF-8 BOM 则去除，同时返回 BOM（如果有）和去除后的文本 */
 export function stripBom(content: string): { bom: string; text: string } {
-	return content.startsWith("﻿") ? { bom: "﻿", text: content.slice(1) } : { bom: "", text: content };
+	return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
 }
 
 function countOccurrences(content: string, oldText: string): number {

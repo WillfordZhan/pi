@@ -9,9 +9,9 @@ import type {
 	ModelMetadata,
 	ModelRef,
 	ServerEvent,
+	SessionMetadata,
 	SessionPhase,
 	SessionSnapshot,
-	SessionSummary,
 	ThinkingLevel,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
@@ -145,8 +145,7 @@ export class RemoteSession {
 		return this.#client.snapshot?.models ?? [];
 	}
 
-	/** 服务端已知的会话摘要列表。 */
-	get sessions(): readonly SessionSummary[] {
+	get sessions(): readonly SessionMetadata[] {
 		return this.#client.snapshot?.sessions ?? [];
 	}
 

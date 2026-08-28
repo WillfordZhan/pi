@@ -1,27 +1,22 @@
 import {
+	type Api,
 	type AssistantMessage,
 	type Context,
 	contentText,
-	type ImageContent,
 	type Model,
 	type Models,
 	type RetryCallbacks,
 	type RetryPolicy,
 	retryAssistantCall,
 	type SimpleStreamOptions,
-	type TextContent,
 	type Usage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
-import {
-	convertToLlm,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createCustomMessage,
-} from "../messages.ts";
-import { buildSessionContext } from "../session/session.ts";
-import { type CompactionEntry, CompactionError, err, ok, type Result, type SessionTreeEntry } from "../types.ts";
+import { convertToLlm, createBranchSummaryMessage, createCompactionSummaryMessage } from "../messages.ts";
+import { buildSessionContext } from "../session/context.ts";
+import type { CompactionEntry, Entry } from "../session/types.ts";
+import { CompactionError, err, ok, type Result } from "../types.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -54,13 +49,13 @@ function safeJsonStringify(value: unknown): string {
  */
 function extractFileOperations(
 	messages: AgentMessage[],
-	entries: SessionTreeEntry[],
+	entries: Entry[],
 	prevCompactionIndex: number,
 ): FileOperations {
 	const fileOps = createFileOps();
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
-		if (!prevCompaction.fromHook && prevCompaction.details) {
+		if (prevCompaction.details) {
 			const details = prevCompaction.details as CompactionDetails;
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
@@ -76,23 +71,9 @@ function extractFileOperations(
 
 	return fileOps;
 }
-/**
- * 将会话树条目转换为具体的 {@link AgentMessage}，用于显示或序列化。
- * 处理 message、custom_message、branch_summary 和 compaction 条目类型。
- * 对于无法表示的条目（例如 label 或 session_info），返回 `undefined`。
- */
-function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined {
+function getMessageFromEntry(entry: Entry): AgentMessage | undefined {
 	if (entry.type === "message") {
 		return entry.message as AgentMessage;
-	}
-	if (entry.type === "custom_message") {
-		return createCustomMessage(
-			entry.customType,
-			entry.content as string | (TextContent | ImageContent)[],
-			entry.display,
-			entry.details,
-			entry.timestamp,
-		);
 	}
 	if (entry.type === "branch_summary") {
 		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
@@ -103,30 +84,24 @@ function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined 
 	return undefined;
 }
 
-/**
- * 与 {@link getMessageFromEntry} 类似，但过滤掉压缩条目。
- * 压缩摘要条目本身不应被再次压缩，因此它们被排除在传递给摘要模型的消息之外。
- */
-function getMessageFromEntryForCompaction(entry: SessionTreeEntry): AgentMessage | undefined {
+function getMessageFromEntryForCompaction(entry: Entry): AgentMessage | undefined {
 	if (entry.type === "compaction") {
 		return undefined;
 	}
 	return getMessageFromEntry(entry);
 }
 
-/** 准备好持久化为压缩条目的压缩数据。 */
-export interface CompactionResult<T = unknown> {
-	/** 在未来上下文中替换压缩历史的摘要文本。 */
+/** Generated compaction data ready to be persisted as a compaction entry. */
+export interface CompactResult<T = unknown> {
+	/** Summary text that replaces compacted history in future context. */
 	summary: string;
-	/** 保留的历史开始的条目 ID。Pi 2.0 过渡期间可选。 */
-	firstKeptEntryId?: string;
-	/** 压缩前预估的上下文 token 数。 */
+	/** Estimated context tokens before compaction. */
 	tokensBefore: number;
 	/** 生成此摘要的 LLM 调用的用量（如果可用）。 */
 	usage?: Usage;
-	/** 压缩后保留的近期消息，直接存储在压缩条目上。Pi 2.0 过渡期间可选。 */
-	retainedTail?: AgentMessage[];
-	/** 与压缩条目一起存储的可选实现特定详情。 */
+	/** Retained recent messages stored directly on the compaction entry. */
+	retainedTail: AgentMessage[];
+	/** Optional implementation-specific details stored with the compaction entry. */
 	details?: T;
 }
 
@@ -136,7 +111,7 @@ export interface CompactionResult<T = unknown> {
  */
 export async function completeSimpleWithRetries(
 	models: Models,
-	model: Model<any>,
+	model: Model<Api>,
 	context: Context,
 	options: SimpleStreamOptions,
 	retry?: RetryPolicy,
@@ -219,8 +194,8 @@ function getAssistantUsage(msg: AgentMessage): Usage | undefined {
 	return undefined;
 }
 
-/** 返回会话条目中最后一条成功助手消息的用量。 */
-export function getLastAssistantUsage(entries: SessionTreeEntry[]): Usage | undefined {
+/** Return usage from the last valid assistant message in session entries. */
+export function getLastAssistantUsage(entries: Entry[]): Usage | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type === "message") {
@@ -356,15 +331,7 @@ export function estimateTokens(message: AgentMessage): number {
 
 	return 0;
 }
-/**
- * 识别条目列表中压缩可以安全分割历史的索引位置。
- *
- * 允许在用户消息、助手消息、bash 执行、自定义消息、分支摘要、压缩摘要
- * 以及非工具结果的消息条目处设置分割点。工具结果消息被排除，因为在工具调用
- * 与其结果之间分割会破坏上下文完整性。非消息条目（标签、会话信息等）被跳过，
- * 因为它们本身不携带任何有意义的上下文。
- */
-function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, endIndex: number): number[] {
+function findValidCutPoints(entries: Entry[], startIndex: number, endIndex: number): number[] {
 	const cutPoints: number[] = [];
 	for (let i = startIndex; i < endIndex; i++) {
 		const entry = entries[i];
@@ -391,30 +358,18 @@ function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, end
 			case "compaction":
 			case "branch_summary":
 			case "custom":
-			case "custom_message":
-			case "label":
-			case "session_info":
-			case "leaf":
 				break;
 		}
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
-			cutPoints.push(i);
-		}
+		if (entry.type === "branch_summary") cutPoints.push(i);
 	}
 	return cutPoints;
 }
 
-/**
- * 找到包含某个条目的回合的起始可见消息。
- *
- * 从 `entryIndex` 向下反向搜索至 `startIndex`。一个回合开始于分支摘要、
- * 自定义消息或用户/bash 执行消息 —— 以反向扫描时最先出现的为准。
- * 这在分割回合压缩中用于识别部分回合的起始位置，以便单独摘要其前缀。
- */
-export function findTurnStartIndex(entries: SessionTreeEntry[], entryIndex: number, startIndex: number): number {
+/** Find the user-visible message that starts the turn containing an entry. */
+export function findTurnStartIndex(entries: Entry[], entryIndex: number, startIndex: number): number {
 	for (let i = entryIndex; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		if (entry.type === "branch_summary") {
 			return i;
 		}
 		if (entry.type === "message") {
@@ -439,7 +394,7 @@ export interface CutPointResult {
 
 /** 找到大约保留所请求的近期 token 预算的压缩分割点。 */
 export function findCutPoint(
-	entries: SessionTreeEntry[],
+	entries: Entry[],
 	startIndex: number,
 	endIndex: number,
 	keepRecentTokens: number,
@@ -571,7 +526,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	models: Models,
-	model: Model<any>,
+	model: Model<Api>,
 	reserveTokens: number,
 	signal?: AbortSignal,
 	customInstructions?: string,
@@ -599,7 +554,7 @@ export async function generateSummary(
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	models: Models,
-	model: Model<any>,
+	model: Model<Api>,
 	reserveTokens: number,
 	signal?: AbortSignal,
 	customInstructions?: string,
@@ -664,9 +619,7 @@ export async function generateSummaryWithUsage(
 
 /** 一次压缩运行的准备输入。 */
 export interface CompactionPreparation {
-	/** 保留的历史开始的条目 ID。 */
-	firstKeptEntryId: string;
-	/** 被摘要为历史摘要的消息。 */
+	/** Messages summarized into the history summary. */
 	messagesToSummarize: AgentMessage[];
 	/** 当压缩分割一个回合时，单独摘要的前缀消息。 */
 	turnPrefixMessages: AgentMessage[];
@@ -686,7 +639,7 @@ export interface CompactionPreparation {
 
 /** 准备用于压缩的会话条目，当压缩不适用时返回 undefined。 */
 export function prepareCompaction(
-	pathEntries: SessionTreeEntry[],
+	pathEntries: Entry[],
 	settings: CompactionSettings,
 ): Result<CompactionPreparation | undefined, CompactionError> {
 	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
@@ -702,42 +655,41 @@ export function prepareCompaction(
 	}
 
 	let previousSummary: string | undefined;
-	let boundaryStart = 0;
+	let compactableEntries = pathEntries;
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
 		previousSummary = prevCompaction.summary;
-		const firstKeptEntryIndex = prevCompaction.firstKeptEntryId
-			? pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId)
-			: -1;
-		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+		const virtualRetainedEntries: Entry[] = prevCompaction.retainedTail.map((message, index) => ({
+			type: "message",
+			id: `${prevCompaction.id}:retained:${index}`,
+			parentId: index === 0 ? prevCompaction.id : `${prevCompaction.id}:retained:${index - 1}`,
+			seq: prevCompaction.seq,
+			timestamp: message.timestamp,
+			message,
+		}));
+		compactableEntries = [...virtualRetainedEntries, ...pathEntries.slice(prevCompactionIndex + 1)];
 	}
-	const boundaryEnd = pathEntries.length;
+	const boundaryEnd = compactableEntries.length;
 
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
-	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
-	if (!firstKeptEntry?.id) {
-		return err(new CompactionError("invalid_session", "First kept entry has no UUID - session may need migration"));
-	}
-	const firstKeptEntryId = firstKeptEntry.id;
-
+	const cutPoint = findCutPoint(compactableEntries, 0, boundaryEnd, settings.keepRecentTokens);
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 	const messagesToSummarize: AgentMessage[] = [];
-	for (let i = boundaryStart; i < historyEnd; i++) {
-		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+	for (let i = 0; i < historyEnd; i++) {
+		const msg = getMessageFromEntryForCompaction(compactableEntries[i]);
 		if (msg) messagesToSummarize.push(msg);
 	}
 	const turnPrefixMessages: AgentMessage[] = [];
 	if (cutPoint.isSplitTurn) {
 		for (let i = cutPoint.turnStartIndex; i < cutPoint.firstKeptEntryIndex; i++) {
-			const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+			const msg = getMessageFromEntryForCompaction(compactableEntries[i]);
 			if (msg) turnPrefixMessages.push(msg);
 		}
 	}
 	const retainedTail: AgentMessage[] = [];
 	for (let i = cutPoint.firstKeptEntryIndex; i < boundaryEnd; i++) {
-		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+		const msg = getMessageFromEntryForCompaction(compactableEntries[i]);
 		if (msg) retainedTail.push(msg);
 	}
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
@@ -748,7 +700,6 @@ export function prepareCompaction(
 	}
 
 	return ok({
-		firstKeptEntryId,
 		messagesToSummarize,
 		turnPrefixMessages,
 		retainedTail,
@@ -782,15 +733,14 @@ export { serializeConversation } from "./utils.ts";
 export async function compact(
 	preparation: CompactionPreparation,
 	models: Models,
-	model: Model<any>,
+	model: Model<Api>,
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
-): Promise<Result<CompactionResult, CompactionError>> {
+): Promise<Result<CompactResult, CompactionError>> {
 	const {
-		firstKeptEntryId,
 		messagesToSummarize,
 		turnPrefixMessages,
 		retainedTail,
@@ -800,10 +750,6 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
-
-	if (!firstKeptEntryId) {
-		return err(new CompactionError("invalid_session", "First kept entry has no UUID - session may need migration"));
-	}
 
 	let summary: string;
 	let summaryUsage: Usage;
@@ -866,7 +812,6 @@ export async function compact(
 
 	return ok({
 		summary,
-		firstKeptEntryId,
 		tokensBefore,
 		usage: summaryUsage,
 		retainedTail,
@@ -884,7 +829,7 @@ export async function compact(
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	models: Models,
-	model: Model<any>,
+	model: Model<Api>,
 	reserveTokens: number,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,

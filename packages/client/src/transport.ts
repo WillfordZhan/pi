@@ -21,5 +21,5 @@ export interface ByteTransportHandlers {
 	onError(error: Error): void;
 }
 
-/** 为 PiClient 每次连接尝试创建一个全新已连接的传输层；只应触发一个终止性回调。 */
+/** Creates a fresh connected, authenticated transport. Exactly one terminal handler is expected. */
 export type ByteTransportFactory = (handlers: ByteTransportHandlers) => ByteTransport | Promise<ByteTransport>;

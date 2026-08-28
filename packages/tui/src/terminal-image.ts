@@ -37,6 +37,7 @@ export interface ImageRenderOptions {
 }
 
 let cachedCapabilities: TerminalCapabilities | null = null;
+let capabilityOverrides: Partial<TerminalCapabilities> = {};
 
 // 默认单元格尺寸——TUI 收到终端查询响应后会更新它
 let cellDimensions: CellDimensions = { widthPx: 9, heightPx: 18 };
@@ -72,17 +73,13 @@ function probeTmuxHyperlinks(): boolean {
 	}
 }
 
-/**
- * 根据环境变量探测当前终端的各项能力。
- * 逐个识别已知终端（Kitty、Ghostty、WezTerm、iTerm2 等），
- * 未知终端则保守地关闭超链接与图片。
- */
-export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks): TerminalCapabilities {
+function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean): TerminalCapabilities {
 	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() || "";
 	const terminalEmulator = process.env.TERMINAL_EMULATOR?.toLowerCase() || "";
 	const term = process.env.TERM?.toLowerCase() || "";
 	const colorTerm = process.env.COLORTERM?.toLowerCase() || "";
 	const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit";
+	const isWindowsConsole = process.platform === "win32";
 
 	// 仅当 tmux 确认会转发时才开启 OSC 8 超链接。
 	// 图片协议在 tmux 下不可靠，因此保持 `images: null`。
@@ -132,16 +129,52 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 		return { images: null, trueColor: true, hyperlinks: false };
 	}
 
-	// 未知终端：保持保守。OSC 8 在会吞掉它的终端上会不可见地渲染成
-	// “纯文本”，导致 URL 从渲染输出中消失。
-	// 除非上面已明确识别出支持超链接的终端，否则回退到旧的 `text (url)` 行为。
+	// Windows Terminal does not always set WT_SESSION, for example when it hosts
+	// a cmd.exe launched directly from Win+R. Modern Windows consoles support
+	// truecolor; keep hyperlinks off unless we positively detected support above.
+	if (isWindowsConsole) {
+		return { images: null, trueColor: true, hyperlinks: false };
+	}
+
+	// Unknown terminal: be conservative. OSC 8 is rendered invisibly as "just
+	// text" on terminals that swallow it, which means the URL disappears from
+	// the rendered output. Default to the legacy `text (url)` behavior unless we
+	// have positively identified a hyperlink-capable terminal above.
 	return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 }
 
-/** 获取（并缓存）终端能力。 */
+function parseBooleanCapabilityOverride(value: string | undefined): boolean | undefined {
+	return value === "1" ? true : value === "0" ? false : undefined;
+}
+
+export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks): TerminalCapabilities {
+	const hyperlinks = parseBooleanCapabilityOverride(process.env.PI_HYPERLINKS);
+	const detected = detectCapabilitiesFromEnvironment(
+		hyperlinks === undefined ? tmuxForwardsHyperlink : () => hyperlinks,
+	);
+	const imageProtocol = process.env.PI_IMAGE_PROTOCOL?.toLowerCase();
+	const images =
+		imageProtocol === "kitty" || imageProtocol === "iterm2"
+			? imageProtocol
+			: imageProtocol === "none" || imageProtocol === "0"
+				? null
+				: undefined;
+	const trueColor = parseBooleanCapabilityOverride(process.env.PI_TRUE_COLOR);
+	return {
+		...detected,
+		...(images !== undefined ? { images } : {}),
+		...(trueColor !== undefined ? { trueColor } : {}),
+		...(hyperlinks !== undefined ? { hyperlinks } : {}),
+	};
+}
+
 export function getCapabilities(): TerminalCapabilities {
 	if (!cachedCapabilities) {
-		cachedCapabilities = detectCapabilities();
+		const hyperlinks = capabilityOverrides.hyperlinks;
+		cachedCapabilities = {
+			...detectCapabilities(hyperlinks === undefined ? undefined : () => hyperlinks),
+			...capabilityOverrides,
+		};
 	}
 	return cachedCapabilities;
 }
@@ -151,7 +184,20 @@ export function resetCapabilitiesCache(): void {
 	cachedCapabilities = null;
 }
 
-/** 覆盖缓存的能力值。用于测试中覆盖两条代码路径。 */
+/** Override selected auto-detected capabilities. */
+export function setCapabilityOverrides(overrides: Partial<TerminalCapabilities>): void {
+	if (
+		capabilityOverrides.images === overrides.images &&
+		capabilityOverrides.trueColor === overrides.trueColor &&
+		capabilityOverrides.hyperlinks === overrides.hyperlinks
+	) {
+		return;
+	}
+	capabilityOverrides = { ...overrides };
+	cachedCapabilities = null;
+}
+
+/** Override the cached capabilities. Useful in tests to exercise both code paths. */
 export function setCapabilities(caps: TerminalCapabilities): void {
 	cachedCapabilities = caps;
 }
@@ -261,7 +307,10 @@ export function encodeITerm2(
 		inline?: boolean;
 	} = {},
 ): string {
-	const params: string[] = [`inline=${options.inline !== false ? 1 : 0}`];
+	const params: string[] = [
+		`inline=${options.inline !== false ? 1 : 0}`,
+		`size=${Buffer.byteLength(base64Data, "base64")}`,
+	];
 
 	if (options.width !== undefined) params.push(`width=${options.width}`);
 	if (options.height !== undefined) params.push(`height=${options.height}`);
@@ -298,6 +347,8 @@ interface RegisteredKittyImageMetadata extends KittyImageMetadata {
 export interface KittyImagePlacement {
 	imageId: number;
 	transmissionGeneration: number;
+	transmissionBytes: number;
+	estimatedDecodedBytes: number;
 	sequence: string;
 	replacementLine: string;
 }
@@ -389,6 +440,8 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 	return {
 		imageId: metadata.imageId,
 		transmissionGeneration: metadata.transmissionGeneration,
+		transmissionBytes: transmissionEnd - match.index,
+		estimatedDecodedBytes: metadata.widthPx * metadata.heightPx * 4,
 		sequence,
 		replacementLine: `${line.slice(0, match.index)}${sequence}${line.slice(transmissionEnd)}`,
 	};

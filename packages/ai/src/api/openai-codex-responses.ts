@@ -1,4 +1,3 @@
-import type * as NodeOs from "node:os";
 import type * as NodeZlib from "node:zlib";
 import type {
 	Tool as OpenAITool,
@@ -6,22 +5,6 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
-
-/** 带可选 `getBuiltinModule` 的 process 类型，用于在 Node/Bun 中按需加载 node:os。 */
-type ProcessWithOsBuiltinModule = typeof process & {
-	getBuiltinModule?: (id: "node:os") => typeof NodeOs;
-};
-
-/** 在 Node/Bun 运行时中按需加载 node:os 模块；浏览器环境返回 null。 */
-function loadNodeOs(): typeof NodeOs | null {
-	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
-		return null;
-	}
-	return (process as ProcessWithOsBuiltinModule).getBuiltinModule?.("node:os") ?? null;
-}
-
-// 切勿改成顶层运行时 import——会破坏浏览器/Vite 构建
-const _os: typeof NodeOs | null = loadNodeOs();
 
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
@@ -48,6 +31,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
@@ -552,7 +536,10 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
 
-	const base = buildBaseOptions(model, context, options, apiKey);
+	const base = {
+		...buildBaseOptions(model, context, options, apiKey),
+		toolChoice: options?.toolChoice,
+	} satisfies OpenAICodexResponsesOptions;
 	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
@@ -579,11 +566,17 @@ function buildRequestBody(
 ): RequestBody {
 	const supportsStrictMode = model.compat?.supportsStrictMode ?? true;
 	const supportsOpenAIGrammarTools = model.compat?.supportsOpenAIGrammarTools ?? false;
-	const toolPlacement = splitDeferredTools(context, model.compat?.supportsToolSearch ?? false);
+	const deferredToolsMode = model.compat?.supportsAdditionalTools
+		? "additional-tools"
+		: model.compat?.supportsToolSearch
+			? "tool-search"
+			: undefined;
+	const toolPlacement = splitDeferredTools(context, deferredToolsMode !== undefined);
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
 		grammarToolInputProperties,
 		deferredTools: toolPlacement.deferred,
+		deferredToolsMode,
 		toolOptions: {
 			strict: null,
 			supportsStrictMode,
@@ -708,7 +701,7 @@ async function processStream(
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal)), output, stream, model, {
+	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal), output), output, stream, model, {
 		serviceTier: options?.serviceTier,
 		grammarToolInputProperties,
 		resolveServiceTier: resolveCodexServiceTier,
@@ -771,8 +764,10 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 	};
 }
 
-/** 将 Codex 特有的事件类型映射为标准 responses 流事件，并在出错时抛出对应错误。 */
-async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
+async function* mapCodexEvents(
+	events: AsyncIterable<Record<string, unknown>>,
+	output: AssistantMessage,
+): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type) continue;
@@ -793,7 +788,10 @@ async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): 
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
-			const response = (event as { response?: { status?: unknown } }).response;
+			const response = (event as { response?: { status?: unknown; end_turn?: unknown } }).response;
+			if (typeof response?.end_turn === "boolean") {
+				output.endTurn = response.end_turn;
+			}
 			const normalizedResponse = response
 				? { ...response, status: normalizeCodexStatus(response.status) }
 				: response;
@@ -1595,7 +1593,7 @@ async function processWebSocketStream(
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs)),
+				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output),
 				onStart,
 			),
 			output,
@@ -1697,8 +1695,7 @@ function buildBaseCodexHeaders(
 	headers.set("Authorization", `Bearer ${token}`);
 	headers.set("chatgpt-account-id", accountId);
 	headers.set("originator", "pi");
-	const userAgent = _os ? `pi (${_os.platform()} ${_os.release()}; ${_os.arch()})` : "pi (browser)";
-	headers.set("User-Agent", userAgent);
+	headers.set("User-Agent", getPiUserAgent());
 	return headers;
 }
 

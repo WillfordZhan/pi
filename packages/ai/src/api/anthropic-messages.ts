@@ -33,11 +33,12 @@ import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
+import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 
-import { resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
+import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampMaxTokensToContext } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
@@ -173,15 +174,23 @@ export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 /** 思考内容的返回展示方式：`summarized` 返回摘要文本，`omitted` 返回空字段。 */
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
-/** 细粒度工具流式传输的 beta 头标识。 */
+type MessageCreateParamsStreamingWithFallbacks = MessageCreateParamsStreaming & {
+	fallbacks?: readonly { model: string }[];
+};
+
 const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 /** 交织思考（interleaved thinking）的 beta 头标识。 */
 const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
+const SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01";
+
+function shouldUseServerSideFallbackBeta(model: Model<"anthropic-messages">): boolean {
+	return (model.compat?.allowedFallbackModels?.length ?? 0) > 0;
+}
 
 /** 读取模型兼容配置，并为未显式配置的字段填入默认值。 */
 function getAnthropicCompat(
 	model: Model<"anthropic-messages">,
-): Required<Omit<AnthropicMessagesCompat, "forceAdaptiveThinking">> {
+): Required<Omit<AnthropicMessagesCompat, "forceAdaptiveThinking" | "allowedFallbackModels">> {
 	return {
 		supportsEagerToolInputStreaming: model.compat?.supportsEagerToolInputStreaming ?? true,
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
@@ -275,7 +284,10 @@ function mergeHeaders(...headerSources: (ProviderHeaders | undefined)[]): Provid
 	return merged;
 }
 
-/** 判断请求头中是否存在非空（且非 null）的指定头字段。 */
+function mergeClientHeaders(...headerSources: (ProviderHeaders | undefined)[]): ProviderHeaders {
+	return mergeHeaders({ "User-Agent": getPiUserAgent() }, ...headerSources);
+}
+
 function hasHeader(headers: ProviderHeaders | undefined, name: string): boolean {
 	if (!headers) return false;
 	const expected = name.toLowerCase();
@@ -532,6 +544,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
+			let usageModel = model;
 
 			if (options?.client) {
 				client = options.client;
@@ -557,6 +570,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					apiKey,
 					options?.interleavedThinking ?? true,
 					shouldUseFineGrainedToolStreamingBeta(model, context),
+					shouldUseServerSideFallbackBeta(model),
 					options?.headers,
 					options?.fetch,
 					copilotDynamicHeaders,
@@ -592,8 +606,16 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
-					// 从 message_start 事件中捕获初始 token 用量
-					// 这样即使流被提前中止，也能拿到输入 token 计数
+					output.model = event.message.model;
+					const fallbackCost =
+						output.model === model.id
+							? undefined
+							: model.compat?.allowedFallbackModels?.find(
+									(fallback) => fallback.provider === model.provider && fallback.model === output.model,
+								)?.cost;
+					usageModel = fallbackCost ? { ...model, id: output.model, cost: fallbackCost } : model;
+					// Capture initial token usage from message_start event
+					// This ensures we have input token counts even if the stream is aborted early
 					output.usage.input = event.message.usage.input_tokens || 0;
 					output.usage.output = event.message.usage.output_tokens || 0;
 					output.usage.cacheRead = event.message.usage.cache_read_input_tokens || 0;
@@ -602,7 +624,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					// Anthropic 不提供 total_tokens，需由各组成部分相加得出
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(model, output.usage);
+					calculateCost(usageModel, output.usage);
 				} else if (event.type === "content_block_start") {
 					if (event.content_block.type === "text") {
 						const block: Block = {
@@ -758,7 +780,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					// Anthropic 不提供 total_tokens，需由各组成部分相加得出
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-					calculateCost(model, output.usage);
+					calculateCost(usageModel, output.usage);
 				}
 			}
 
@@ -827,9 +849,15 @@ export const streamSimple: StreamFunction<"anthropic-messages", SimpleStreamOpti
 ): AssistantMessageEventStream => {
 	assertRequestAuth(model.provider, options?.apiKey, options?.headers);
 
-	const base = buildBaseOptions(model, context, options, options?.apiKey);
+	const base = {
+		...buildBaseOptions(model, context, options, options?.apiKey),
+		toolChoice: options?.toolChoice,
+	} satisfies AnthropicOptions;
 	if (!options?.reasoning) {
-		return stream(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
+		return stream(model, context, {
+			...base,
+			thinkingEnabled: false,
+		} satisfies AnthropicOptions);
 	}
 
 	// 自适应思考模型：使用精力级别；旧模型：使用预算式思考。
@@ -872,6 +900,7 @@ function createClient(
 	apiKey: string | undefined,
 	interleavedThinking: boolean,
 	useFineGrainedToolStreamingBeta: boolean,
+	useServerSideFallbackBeta: boolean,
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	dynamicHeaders?: Record<string, string>,
@@ -886,6 +915,9 @@ function createClient(
 	if (needsInterleavedBeta) {
 		betaFeatures.push(INTERLEAVED_THINKING_BETA);
 	}
+	if (useServerSideFallbackBeta) {
+		betaFeatures.push(SERVER_SIDE_FALLBACK_BETA);
+	}
 
 	// Copilot：Bearer 认证，选择性启用 beta 特性。
 	if (model.provider === "github-copilot") {
@@ -895,7 +927,7 @@ function createClient(
 			baseURL: model.baseUrl,
 			dangerouslyAllowBrowser: true,
 			fetch,
-			defaultHeaders: mergeHeaders(
+			defaultHeaders: mergeClientHeaders(
 				{
 					accept: "application/json",
 					"anthropic-dangerous-direct-browser-access": "true",
@@ -918,7 +950,7 @@ function createClient(
 			baseURL: model.baseUrl,
 			dangerouslyAllowBrowser: true,
 			fetch,
-			defaultHeaders: mergeHeaders(
+			defaultHeaders: mergeClientHeaders(
 				{
 					accept: "application/json",
 					"anthropic-dangerous-direct-browser-access": "true",
@@ -937,7 +969,7 @@ function createClient(
 	// 普通 API key 或请求头认证。
 	const sessionAffinityHeaders: ProviderHeaders =
 		sessionId && getAnthropicCompat(model).sendSessionAffinityHeaders ? { "x-session-affinity": sessionId } : {};
-	const defaultHeaders = mergeHeaders(
+	const defaultHeaders = mergeClientHeaders(
 		{
 			accept: "application/json",
 			"anthropic-dangerous-direct-browser-access": "true",
@@ -965,7 +997,7 @@ function buildParams(
 	context: Context,
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
-): MessageCreateParamsStreaming {
+): MessageCreateParamsStreamingWithFallbacks {
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention, options?.env);
 	const compat = getAnthropicCompat(model);
 	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
@@ -982,7 +1014,7 @@ function buildParams(
 		deferredTools = [];
 	}
 	const deferredToolNames = new Set(deferredTools.map((tool) => normalizeToolName(tool.name)));
-	const params: MessageCreateParamsStreaming = {
+	const params: MessageCreateParamsStreamingWithFallbacks = {
 		model: model.id,
 		messages: convertMessages(
 			transformedMessages,
@@ -1092,6 +1124,11 @@ function buildParams(
 		} else {
 			params.tool_choice = options.toolChoice;
 		}
+	}
+
+	const allowedFallbackModels = model.compat?.allowedFallbackModels;
+	if (allowedFallbackModels && allowedFallbackModels.length > 0) {
+		params.fallbacks = allowedFallbackModels.map((fallback) => ({ model: fallback.model }));
 	}
 
 	return params;
@@ -1324,7 +1361,8 @@ function convertTools(
 
 	return tools.map((tool, index) => {
 		const strict = resolveJsonSchemaStrictSampling(tool, supportsStrictTools);
-		const schema = tool.parameters as { properties?: unknown; required?: string[] };
+		const parameters = getJsonSchemaToolParameters(tool, strict);
+		const schema = parameters as { properties?: unknown; required?: string[] };
 		const legacyInputSchema = {
 			type: "object" as const,
 			properties: schema.properties ?? {},
@@ -1333,7 +1371,7 @@ function convertTools(
 		const inputSchema =
 			strict === true
 				? {
-						...(tool.parameters as Record<string, unknown>),
+						...(parameters as Record<string, unknown>),
 						...legacyInputSchema,
 					}
 				: legacyInputSchema;

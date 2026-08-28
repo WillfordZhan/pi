@@ -38,9 +38,10 @@ type _AiModelInputsFitProtocol = Assert<AiModelInput extends ProtocolModelInput 
 /** 编译期断言：协议的模型输入能匹配 pi-ai 的模型输入。 */
 type _ProtocolModelInputsFitAi = Assert<ProtocolModelInput extends AiModelInput ? true : false>;
 /**
- * 逐个枚举被映射以及有意省略的 pi-ai 字段，使新增字段时在此处编译失败以强制同步协议映射。
- * 提供者重放元数据、诊断信息、缓存写入保留时长拆分、模型传输设置、
- * 定价分层以及延迟工具可用性等字段有意保留在服务端内部，不对外传输。
+ * Enumerate mapped and intentionally omitted pi-ai fields so additions fail compilation here.
+ * Provider replay metadata, diagnostics, cache-write retention splits, model transport settings,
+ * model sampling defaults, pricing tiers, and deferred-tool availability remain intentionally
+ * server-side.
  */
 type _AiTextContentFieldsAccountedFor = Assert<ExactKeys<AiTextContent, "type" | "text" | "textSignature">>;
 /** 编译期断言：pi-ai 思考内容字段已逐一枚举。 */
@@ -54,7 +55,7 @@ type _AiThinkingContentFieldsAccountedFor = Assert<
 type _AiImageContentFieldsAccountedFor = Assert<ExactKeys<AiImageContent, "type" | "data" | "mimeType">>;
 /** 编译期断言：pi-ai 工具调用字段已逐一枚举。 */
 type _AiToolCallFieldsAccountedFor = Assert<
-	ExactKeys<ToolCall, "type" | "id" | "name" | "arguments" | "thoughtSignature">
+	ExactKeys<ToolCall, "type" | "id" | "name" | "arguments" | "thoughtSignature" | "namespace">
 >;
 /** 编译期断言：pi-ai 用量字段已逐一枚举。 */
 type _AiUsageFieldsAccountedFor = Assert<
@@ -82,6 +83,7 @@ type _AiModelFieldsAccountedFor = Assert<
 		| "cost"
 		| "contextWindow"
 		| "maxTokens"
+		| "samplingParams"
 		| "headers"
 		| "compat"
 	>
@@ -106,8 +108,10 @@ type _AiAssistantMessageFieldsAccountedFor = Assert<
 		| "diagnostics"
 		| "usage"
 		| "stopReason"
+		| "deferred"
 		| "errorMessage"
 		| "rawStopReason"
+		| "endTurn"
 		| "timestamp"
 	>
 >;
@@ -341,6 +345,8 @@ export function toProtocolAssistantMessage(
 				status: "complete",
 				stopReason: message.stopReason,
 			} satisfies AssistantTranscriptItem;
+		case "deferred":
+			throw new TypeError("Deferred assistant messages are not supported by protocol v1");
 		case "error":
 			if (message.errorMessage?.length === 0) {
 				throw new TypeError("Assistant error messages must not be empty");

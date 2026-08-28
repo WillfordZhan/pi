@@ -6,6 +6,7 @@ import {
 	type AssistantMessageEventStream,
 	type AuthCheck,
 	type AuthInteraction,
+	type AuthOperationOptions,
 	type AuthResult,
 	type AuthType,
 	type Context,
@@ -13,24 +14,31 @@ import {
 	type CredentialInfo,
 	type CredentialStore,
 	createModels,
+	type DeferredCancelOptions,
+	type DeferredFetchOptions,
+	type DeferredHandle,
 	lazyStream,
 	type Model,
 	type Models,
 	type ModelsApiStreamOptions,
+	type ModelsDeferredCancelOptions,
+	type ModelsDeferredFetchOptions,
 	ModelsError,
 	type ModelsRefreshOptions,
 	type ModelsRefreshResult,
+	type ModelsRequestTransforms,
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
-	type ModelsStreamTransforms,
 	type MutableModels,
 	type Provider,
 	type ProviderHeaders,
+	type ProviderRequestOptions,
 	type SimpleStreamOptions,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
+import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
@@ -69,17 +77,41 @@ export interface CreateModelRuntimeOptions {
 	/** 创建期网络刷新模型目录的超时时间。 */
 	modelRefreshTimeoutMs?: number;
 	catalogBaseUrl?: string;
+	/** Optional caller cancellation for initial cache restoration and availability checks. */
+	signal?: AbortSignal;
+	/** Skip initial catalog and availability refresh. Static models remain available. */
+	refreshOnCreate?: boolean;
 }
 
-/** 覆盖认证解析的选项。 */
-export interface ModelRuntimeAuthOverrides {
+export interface ModelRuntimeAuthOverrides extends AuthOperationOptions {
 	apiKey?: string;
 	env?: Record<string, string>;
 	/** 要求 OAuth token 至少剩余多少有效时间；默认五分钟。 */
 	minOAuthValidityMs?: number;
 }
 
-/** 合并两套请求头：覆盖值按名称（大小写不敏感）替换基础值。 */
+export type CredentialSynchronizationOperation = "login" | "logout" | "setRuntimeApiKey" | "removeRuntimeApiKey";
+
+/** Credentials changed successfully, but the local model/auth snapshot could not be synchronized. */
+export class CredentialSynchronizationError extends Error {
+	readonly providerId: string;
+	readonly operation: CredentialSynchronizationOperation;
+	readonly credential: Credential | undefined;
+
+	constructor(
+		providerId: string,
+		operation: CredentialSynchronizationOperation,
+		credential: Credential | undefined,
+		options: ErrorOptions,
+	) {
+		super(`Credential ${operation} committed for ${providerId}, but local synchronization failed`, options);
+		this.name = "CredentialSynchronizationError";
+		this.providerId = providerId;
+		this.operation = operation;
+		this.credential = credential;
+	}
+}
+
 function mergeHeaders(
 	base: ProviderHeaders | undefined,
 	override: ProviderHeaders | undefined,
@@ -126,12 +158,11 @@ export class ModelRuntime implements Models {
 		storedProviders: new Set(),
 		auth: new Map(),
 	};
-	/** 进行中的可用性刷新 Promise（用于合并并发读取）。 */
-	private availabilityRefresh: Promise<void> | undefined;
-	/** 可用性刷新序号，用于丢弃过期结果。 */
 	private availabilityRefreshSeq = 0;
-	/** 最近一次可用性刷新的错误信息。 */
+	private availabilityErrorSeq = 0;
+	private readonly providerAvailabilitySeq = new Map<string, number>();
 	private availabilityError: string | undefined;
+	private readonly credentialOperations = new Map<string, Promise<unknown>>();
 
 	/** 私有构造函数：请使用静态工厂方法 `create`。 */
 	private constructor(
@@ -182,12 +213,18 @@ export class ModelRuntime implements Models {
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
-		const controller = refreshFromNetwork ? new AbortController() : undefined;
-		const timeout = controller
-			? setTimeout(() => controller.abort(), options.modelRefreshTimeoutMs ?? 15_000)
-			: undefined;
+		const controller =
+			refreshFromNetwork && options.modelRefreshTimeoutMs !== undefined ? new AbortController() : undefined;
+		const timeout = controller ? setTimeout(() => controller.abort(), options.modelRefreshTimeoutMs) : undefined;
+		const signal = controller
+			? options.signal
+				? AbortSignal.any([options.signal, controller.signal])
+				: controller.signal
+			: options.signal;
 		try {
-			await runtime.refresh({ allowNetwork: refreshFromNetwork, signal: controller?.signal });
+			if (options.refreshOnCreate !== false) {
+				await runtime.refresh({ allowNetwork: refreshFromNetwork, signal });
+			}
 		} finally {
 			if (timeout) clearTimeout(timeout);
 		}
@@ -265,23 +302,20 @@ export class ModelRuntime implements Models {
 		};
 	}
 
-	/** 执行一次可用性刷新（可用模型 + 认证检查 + 凭据列表），并用序号防止过期结果覆盖快照。 */
-	private async runAvailabilityRefresh(seq: number): Promise<void> {
+	private async runAvailabilityRefresh(seq: number, errorSeq: number, signal: AbortSignal): Promise<void> {
 		const providers = this.models.getProviders();
 		const [available, checks, credentials] = await Promise.all([
-			this.models.getAvailable(),
+			this.models.getAvailable(undefined, { signal }),
 			Promise.all(
 				providers.map(
 					async (provider): Promise<[string, AuthCheck | undefined]> => [
 						provider.id,
-						await this.models.checkAuth(provider.id),
+						await this.models.checkAuth(provider.id, { signal }),
 					],
 				),
 			),
-			this.credentials.list(),
+			this.credentials.list({ signal }),
 		]);
-		// 刷新期间可能有更新的重建请求；丢弃本次结果，
-		// 避免一个缓慢且已被取代的刷新用过期数据覆盖快照。
 		if (seq !== this.availabilityRefreshSeq) return;
 		const auth = new Map(checks);
 		const configuredProviders = new Set(
@@ -296,39 +330,75 @@ export class ModelRuntime implements Models {
 			storedProviders: new Set(credentials.map((entry) => entry.providerId)),
 			auth,
 		};
-		this.availabilityError = undefined;
+		if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
 	}
 
-	/** 排队启动一次可用性刷新；只有最新一次刷新的错误会写入状态。 */
-	private queueAvailabilityRefresh(): Promise<void> {
+	private queueAvailabilityRefresh(signal?: AbortSignal): Promise<void> {
 		const seq = ++this.availabilityRefreshSeq;
-		const refresh = this.runAvailabilityRefresh(seq);
-		const recorded = refresh.catch((error) => {
-			// 只有最新请求的重建拥有错误状态的所有权。
-			if (seq === this.availabilityRefreshSeq) {
+		for (const [providerId, providerSeq] of this.providerAvailabilitySeq) {
+			this.providerAvailabilitySeq.set(providerId, providerSeq + 1);
+		}
+		const errorSeq = ++this.availabilityErrorSeq;
+		const effectiveSignal = operationSignal(signal);
+		return this.runAvailabilityRefresh(seq, errorSeq, effectiveSignal).catch((error) => {
+			if (errorSeq === this.availabilityErrorSeq && !effectiveSignal.aborted) {
 				this.availabilityError = error instanceof Error ? error.message : String(error);
 			}
 			throw error;
 		});
-		const tracked = recorded.finally(() => {
-			if (this.availabilityRefresh === tracked) this.availabilityRefresh = undefined;
-		});
-		this.availabilityRefresh = tracked;
-		return tracked;
 	}
 
-	/** 把并发读取合并到同一次进行中的刷新上。 */
-	private refreshAvailability(): Promise<void> {
-		return this.availabilityRefresh ?? this.queueAvailabilityRefresh();
-	}
-
-	/**
-	 * 变更必须观察到其状态变化之后开始的刷新，且卡住的进行中刷新不应阻塞它们。
-	 * 因此启动一次全新的独立刷新，而不是挂到待处理的刷新上。
-	 * runAvailabilityRefresh 中的序号保护保证被取代的刷新不会覆盖其结果。
-	 */
-	private forceRefreshAvailability(): Promise<void> {
-		return this.queueAvailabilityRefresh();
+	private async refreshProviderAvailability(providerId: string, signal: AbortSignal): Promise<void> {
+		// Invalidate any full availability pass that started before this credential change.
+		++this.availabilityRefreshSeq;
+		const providerSeq = (this.providerAvailabilitySeq.get(providerId) ?? 0) + 1;
+		this.providerAvailabilitySeq.set(providerId, providerSeq);
+		const errorSeq = ++this.availabilityErrorSeq;
+		try {
+			const [available, auth, credential] = await Promise.all([
+				this.models.getAvailable(providerId, { signal }),
+				this.models.checkAuth(providerId, { signal }),
+				this.credentials.read(providerId, { signal }),
+			]);
+			signal.throwIfAborted();
+			if (this.providerAvailabilitySeq.get(providerId) !== providerSeq) return;
+			const configuredProviders = new Set(this.snapshot.configuredProviders);
+			const storedProviders = new Set(this.snapshot.storedProviders);
+			const authByProvider = new Map(this.snapshot.auth);
+			if (auth) {
+				configuredProviders.add(providerId);
+				authByProvider.set(providerId, auth);
+			} else {
+				configuredProviders.delete(providerId);
+				authByProvider.delete(providerId);
+			}
+			if (credential) storedProviders.add(providerId);
+			else storedProviders.delete(providerId);
+			const all = [...this.models.getModels()];
+			const availableById = new Map(
+				[...this.snapshot.available.filter((model) => model.provider !== providerId), ...available].map((model) => [
+					`${model.provider}\0${model.id}`,
+					model,
+				]),
+			);
+			this.snapshot = {
+				all,
+				available: all.flatMap((model) => availableById.get(`${model.provider}\0${model.id}`) ?? []),
+				configuredProviders,
+				storedProviders,
+				auth: authByProvider,
+			};
+			if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
+		} catch (error) {
+			if (
+				this.providerAvailabilitySeq.get(providerId) === providerSeq &&
+				errorSeq === this.availabilityErrorSeq &&
+				!signal.aborted
+			) {
+				this.availabilityError = error instanceof Error ? error.message : String(error);
+			}
+			throw error;
+		}
 	}
 
 	/** 返回全部 provider。 */
@@ -351,26 +421,25 @@ export class ModelRuntime implements Models {
 		return this.models.getModel(providerId, modelId);
 	}
 
-	/** 检查指定 provider 的认证状态。 */
-	async checkAuth(providerId: string): Promise<AuthCheck | undefined> {
-		return this.models.checkAuth(providerId);
+	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
+		return this.models.checkAuth(providerId, options);
 	}
 
-	/** 获取可用模型；指定 provider 时仅返回该 provider 的结果。 */
-	async getAvailable(providerId?: string): Promise<readonly Model<Api>[]> {
+	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
 		if (providerId) {
-			if (this.availabilityRefresh) {
-				await this.availabilityRefresh;
-				return this.snapshot.available.filter((model) => model.provider === providerId);
-			}
+			const errorSeq = ++this.availabilityErrorSeq;
 			try {
-				return await this.models.getAvailable(providerId);
+				const available = await this.models.getAvailable(providerId, options);
+				if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
+				return available;
 			} catch (error) {
-				this.availabilityError = error instanceof Error ? error.message : String(error);
+				if (errorSeq === this.availabilityErrorSeq && !options?.signal?.aborted) {
+					this.availabilityError = error instanceof Error ? error.message : String(error);
+				}
 				throw error;
 			}
 		}
-		await this.refreshAvailability();
+		await this.queueAvailabilityRefresh(options?.signal);
 		return this.snapshot.available;
 	}
 
@@ -420,7 +489,10 @@ export class ModelRuntime implements Models {
 		return this.snapshot.auth.get(providerId)?.type === "oauth";
 	}
 
-	/** 判断 provider 是否已配置认证。 */
+	isUsingSubscription(providerId: string): boolean {
+		return this.isUsingOAuth(providerId) && this.models.getProvider(providerId)?.auth.oauth?.isSubscription === true;
+	}
+
 	hasConfiguredAuth(providerId: string): boolean {
 		return this.snapshot.configuredProviders.has(providerId);
 	}
@@ -450,35 +522,71 @@ export class ModelRuntime implements Models {
 		};
 	}
 
-	/** 设置运行期 API key（不持久化），并立即刷新可用模型。 */
-	async setRuntimeApiKey(
+	private enqueueCredentialOperation<T>(providerId: string, signal: AbortSignal, task: () => Promise<T>): Promise<T> {
+		const previous = this.credentialOperations.get(providerId) ?? Promise.resolve();
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const operation = (async () => {
+			await previous.catch(() => {});
+			signal.throwIfAborted();
+			markStarted?.();
+			return task();
+		})();
+		const tail = operation.catch(() => {});
+		this.credentialOperations.set(providerId, tail);
+		void tail.then(() => {
+			if (this.credentialOperations.get(providerId) === tail) this.credentialOperations.delete(providerId);
+		});
+		return raceWithAbortSignal(started, signal).then(() => operation);
+	}
+
+	private async synchronizeCredentialState(
 		providerId: string,
-		apiKey: string,
-		refreshOptions: ModelsRefreshOptions = {},
+		operation: CredentialSynchronizationOperation,
+		credential: Credential | undefined,
+		signal: AbortSignal,
 	): Promise<void> {
-		this.credentials.setRuntimeApiKey(providerId, apiKey);
-		const auth = new Map(this.snapshot.auth).set(providerId, { type: "api_key", source: "runtime API key" });
-		const configuredProviders = new Set(this.snapshot.configuredProviders).add(providerId);
-		const storedProviders = new Set(this.snapshot.storedProviders).add(providerId);
-		this.snapshot = {
-			...this.snapshot,
-			auth,
-			configuredProviders,
-			storedProviders,
-			available: this.snapshot.all.filter((model) => configuredProviders.has(model.provider)),
-		};
-		await this.refresh(refreshOptions);
+		try {
+			signal.throwIfAborted();
+			this.recomposeProvider(providerId);
+			const compositionError = this.compositionErrors.get(providerId);
+			if (compositionError) throw new Error(compositionError);
+			const result = await this.models.refresh({ allowNetwork: false, providers: [providerId], signal });
+			if (result.aborted) signal.throwIfAborted();
+			const refreshError = result.errors.get(providerId);
+			if (refreshError) throw refreshError;
+			this.updateModelSnapshot();
+			await this.refreshProviderAvailability(providerId, signal);
+		} catch (cause) {
+			throw new CredentialSynchronizationError(providerId, operation, credential, { cause });
+		}
 	}
 
-	/** 移除运行期 API key 并刷新可用模型。 */
-	async removeRuntimeApiKey(providerId: string): Promise<void> {
-		this.credentials.removeRuntimeApiKey(providerId);
-		await this.refresh({ allowNetwork: this.modelNetworkEnabled });
+	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
+		const signal = operationSignal(options.signal);
+		return this.enqueueCredentialOperation(providerId, signal, async () => {
+			this.credentials.setRuntimeApiKey(providerId, apiKey);
+			await this.synchronizeCredentialState(
+				providerId,
+				"setRuntimeApiKey",
+				{ type: "api_key", key: apiKey },
+				signal,
+			);
+		});
 	}
 
-	/** 列出全部存储的凭据信息。 */
-	listCredentials(): Promise<readonly CredentialInfo[]> {
-		return this.credentials.list();
+	removeRuntimeApiKey(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		const signal = operationSignal(options.signal);
+		return this.enqueueCredentialOperation(providerId, signal, async () => {
+			this.credentials.removeRuntimeApiKey(providerId);
+			await this.synchronizeCredentialState(providerId, "removeRuntimeApiKey", undefined, signal);
+		});
+	}
+
+	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
+		return this.credentials.list(options);
 	}
 
 	/** 汇总 provider 的认证状态来源（运行时 / 存储 / 配置 / 环境）。 */
@@ -494,17 +602,25 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
-	/** 准备一次模型请求：解析 provider、合并认证与头信息，返回可调用的参数。 */
-	private async prepareRequest(
+	private async prepareRequest<TOptions extends ProviderRequestOptions & ModelsRequestTransforms>(
 		model: Model<Api>,
-		options: (StreamOptions & ModelsStreamTransforms) | undefined,
-	): Promise<{ provider: Provider; model: Model<Api>; options: StreamOptions }> {
+		options: TOptions | undefined,
+	): Promise<{
+		provider: Provider;
+		model: Model<Api>;
+		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+	}> {
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-		const resolution = await this.getAuth(model, { apiKey: options?.apiKey, env: options?.env });
+		const resolution = await this.getAuth(model, {
+			apiKey: options?.apiKey,
+			env: options?.env,
+			signal: options?.signal,
+		});
 		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 
-		const { transformHeaders, ...providerOptions } = options ?? {};
+		const { transformHeaders, ...rawProviderOptions } = options ?? {};
+		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
 		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
 		const env =
@@ -519,7 +635,7 @@ export class ModelRuntime implements Models {
 				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
 				headers,
 				env,
-			},
+			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions,
 		};
 	}
 
@@ -532,7 +648,7 @@ export class ModelRuntime implements Models {
 		return lazyStream(model, async () => {
 			const prepared = await this.prepareRequest(
 				model,
-				options as (StreamOptions & ModelsStreamTransforms) | undefined,
+				options as (StreamOptions & ModelsRequestTransforms) | undefined,
 			);
 			return prepared.provider.stream(
 				prepared.model as Model<TApi>,
@@ -564,26 +680,59 @@ export class ModelRuntime implements Models {
 		return this.streamSimple(model, context, options).result();
 	}
 
-	/** 发起登录流程，成功后刷新可用模型。 */
-	async login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
-		const credential = await this.models.login(providerId, type, interaction);
-		await this.refresh({ allowNetwork: this.modelNetworkEnabled });
-		return credential;
+	async fetchDeferred(
+		model: Model<Api>,
+		handle: DeferredHandle,
+		options?: ModelsDeferredFetchOptions,
+	): Promise<AssistantMessage> {
+		return lazyStream(model, async () => {
+			const prepared = await this.prepareRequest(model, options);
+			if (!prepared.provider.fetchDeferred) {
+				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+			}
+			return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
+		}).result();
 	}
 
-	/** 退出登录并刷新模型；在刷新跳过未配置 provider 前先重置其兼容性投影。 */
-	async logout(providerId: string): Promise<void> {
-		await this.models.logout(providerId);
-		// 在刷新跳过未配置 provider 之前，重置依赖凭据的兼容性投影。
-		this.recomposeProvider(providerId);
-		await this.refresh({ allowNetwork: this.modelNetworkEnabled });
+	async cancelDeferred(
+		model: Model<Api>,
+		handle: DeferredHandle,
+		options?: ModelsDeferredCancelOptions,
+	): Promise<void> {
+		const prepared = await this.prepareRequest(model, options);
+		if (!prepared.provider.cancelDeferred) {
+			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+		}
+		await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
+	}
+
+	login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
+		const signal = operationSignal(interaction.signal);
+		return this.enqueueCredentialOperation(providerId, signal, async () => {
+			const credential = await this.models.login(providerId, type, { ...interaction, signal });
+			await this.synchronizeCredentialState(providerId, "login", credential, signal);
+			return credential;
+		});
+	}
+
+	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		const signal = operationSignal(options.signal);
+		return this.enqueueCredentialOperation(providerId, signal, async () => {
+			await this.models.logout(providerId, { signal });
+			await this.synchronizeCredentialState(providerId, "logout", undefined, signal);
+		});
 	}
 
 	/** 刷新模型：重新加载配置、重建 provider，并触发可用性刷新。 */
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
-		this.rebuildProviders();
+		if (options.providers) {
+			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);
+			this.updateModelSnapshot();
+		} else {
+			this.rebuildProviders();
+		}
 		const refreshOptions = {
 			...options,
 			allowNetwork: options.allowNetwork ?? this.modelNetworkEnabled,
@@ -594,13 +743,28 @@ export class ModelRuntime implements Models {
 			aborted: refreshOptions.signal?.aborted ?? false,
 			errors: new Map(),
 		};
+		const errors = new Map(result.errors);
 		this.updateModelSnapshot();
-		try {
-			await this.forceRefreshAvailability();
-		} catch {
-			// 可用性错误由 forceRefreshAvailability 记录；刷新后的模型仍然可用。
+		if (options.providers) {
+			await Promise.all(
+				[...new Set(options.providers)].map(async (providerId) => {
+					try {
+						await this.refreshProviderAvailability(providerId, operationSignal(options.signal));
+					} catch (error) {
+						if (!options.signal?.aborted) {
+							errors.set(providerId, error instanceof Error ? error : new Error(String(error)));
+						}
+					}
+				}),
+			);
+		} else {
+			try {
+				await this.queueAvailabilityRefresh(options.signal);
+			} catch {
+				// Availability errors are recorded by the latest pass; refreshed models remain usable.
+			}
 		}
-		return result;
+		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
 	}
 
 	/** 以原生 Provider 实例注册扩展 provider。 */

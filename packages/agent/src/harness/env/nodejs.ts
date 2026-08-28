@@ -10,11 +10,12 @@ import {
 	readdir,
 	readFile,
 	realpath,
+	rename,
 	rm,
 	writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -101,7 +102,7 @@ function fileInfoFromStats(
 	const kind = fileKindFromStats(stats);
 	if (!kind) return err(new FileError("invalid", "Unsupported file type", path));
 	return ok({
-		name: path.replace(/\/+$/, "").split("/").pop() ?? path,
+		name: basename(path),
 		path,
 		kind,
 		size: stats.size,
@@ -119,20 +120,14 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 	return error instanceof Error && "code" in error;
 }
 
-/**
- * 将各种类型的错误统一转换为 {@link FileError}。
- * 对 Node.js 原生错误，根据错误码（ENOENT、EACCES、EPERM、ENOTDIR、EISDIR、ABORT_ERR 等）
- * 映射为对应的 FileError 类型码；无法识别的错误统一归为 "unknown"。
- * @param error - 原始错误对象
- * @param path - 关联的文件路径（可选）
- * @returns 转换后的 FileError 实例
- */
-function toFileError(error: unknown, path?: string): FileError {
+function toFileError(error: unknown, fallbackPath?: string): FileError {
 	if (error instanceof FileError) return error;
 	const cause = toError(error);
-	if (isNodeError(error)) {
-		const message = error.message;
-		switch (error.code) {
+	const nodeError = isNodeError(error) ? error : undefined;
+	const path = typeof nodeError?.path === "string" ? nodeError.path : fallbackPath;
+	if (nodeError) {
+		const message = nodeError.message;
+		switch (nodeError.code) {
 			case "ABORT_ERR":
 				return new FileError("aborted", message, path, cause);
 			case "ENOENT":
@@ -352,11 +347,17 @@ function getShellEnv(
 function killProcessTree(pid: number): void {
 	if (process.platform === "win32") {
 		try {
-			spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
-				stdio: "ignore",
-				detached: true,
-				windowsHide: true,
-			});
+			const child = spawn(
+				join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+				["/F", "/T", "/PID", String(pid)],
+				{
+					stdio: "ignore",
+					detached: true,
+					windowsHide: true,
+				},
+			);
+			// A failed spawn emits "error" asynchronously; consume it to avoid crashing Node.
+			child.once("error", () => {});
 		} catch {
 			// 忽略错误。
 		}
@@ -691,6 +692,23 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			return ok(undefined);
 		} catch (error) {
 			return err(toFileError(error, resolved));
+		}
+	}
+
+	async renameFile(
+		sourcePath: string,
+		destinationPath: string,
+		abortSignal?: AbortSignal,
+	): Promise<Result<void, FileError>> {
+		const source = resolvePath(this.cwd, sourcePath);
+		const destination = resolvePath(this.cwd, destinationPath);
+		const aborted = abortResult<void>(abortSignal, destination);
+		if (aborted) return aborted;
+		try {
+			await rename(source, destination);
+			return ok(undefined);
+		} catch (error) {
+			return err(toFileError(error, source));
 		}
 	}
 

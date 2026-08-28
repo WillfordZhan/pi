@@ -5,7 +5,10 @@ import type {
 	Context,
 	Model,
 	ModelsApiStreamOptions,
+	ModelsRefreshOptions,
+	ModelsRefreshResult,
 	Provider,
+	ProviderHeaders,
 } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { AuthStatus, ProviderConfigInput } from "./provider-composer.ts";
@@ -16,7 +19,8 @@ export type ResolvedRequestAuth =
 	| {
 			ok: true;
 			apiKey?: string;
-			headers?: Record<string, string>;
+			headers?: ProviderHeaders;
+			baseUrl?: string;
 			env?: Record<string, string>;
 	  }
 	| { ok: false; error: string };
@@ -35,9 +39,9 @@ export class ModelRegistry {
 		this.runtime = runtime;
 	}
 
-	/** 异步重新加载 models.json；在做同步注册表读取前应先等待其完成。 */
-	async refresh(): Promise<void> {
-		await this.runtime.refresh();
+	/** Reload models.json asynchronously. Await before making synchronous registry reads. */
+	refresh(options?: ModelsRefreshOptions): Promise<ModelsRefreshResult> {
+		return this.runtime.refresh(options);
 	}
 
 	/** 获取当前模型的错误信息（配置错误、组合错误等）。 */
@@ -74,23 +78,15 @@ export class ModelRegistry {
 				if (compatibility.authHeader) {
 					return { ok: false, error: `No API key found for "${model.provider}"` };
 				}
-				const headers = compatibility.headers
-					? Object.fromEntries(
-							Object.entries(compatibility.headers).filter(
-								(entry): entry is [string, string] => entry[1] !== null,
-							),
-						)
-					: undefined;
-				return { ok: true, headers };
+				return { ok: true, headers: compatibility.headers };
 			}
-			const headers = resolution.auth.headers
-				? Object.fromEntries(
-						Object.entries(resolution.auth.headers).filter(
-							(entry): entry is [string, string] => entry[1] !== null,
-						),
-					)
-				: undefined;
-			return { ok: true, apiKey: resolution.auth.apiKey, headers, env: resolution.env };
+			return {
+				ok: true,
+				apiKey: resolution.auth.apiKey,
+				headers: resolution.auth.headers,
+				...(resolution.auth.baseUrl ? { baseUrl: resolution.auth.baseUrl } : {}),
+				env: resolution.env,
+			};
 		} catch (error) {
 			const cause = error instanceof Error ? error.cause : undefined;
 			const message =

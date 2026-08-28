@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { Command, EventEnvelope, SessionSnapshot, SessionSummary } from "@earendil-works/pi-protocol";
+import type { Command, EventEnvelope, SessionMetadata, SessionSnapshot } from "@earendil-works/pi-protocol";
 import type { ByteConnection, ConnectionState } from "./connection.ts";
 import { PiServerError } from "./errors.ts";
-import type { CreateSessionOptions, PiSessionBackend, PiSessionRuntime, PiSessionRuntimeEvent } from "./types.ts";
+import type { CreateSessionOptions, PiServerService, PiSessionRuntime, PiSessionRuntimeEvent } from "./types.ts";
 
 /** 服务器内存中一个「活跃会话」的运行时状态（绑定后端运行时与所有附加连接）。 */
 interface LiveSession {
@@ -26,9 +26,7 @@ interface LiveSession {
 
 /** 会话管理器依赖的外部协作接口（由 PiServer 注入）。 */
 interface LiveSessionManagerOptions {
-	/** 会话后端。 */
-	backend: PiSessionBackend;
-	/** 查询服务器是否正在关闭。 */
+	service: PiServerService;
 	isClosing: () => boolean;
 	/** 向某个连接发送事件消息。 */
 	sendMessage: (connection: ConnectionState, message: EventEnvelope) => Promise<boolean>;
@@ -42,19 +40,13 @@ interface LiveSessionManagerOptions {
 	reportError: (error: unknown) => void;
 }
 
-/** 从会话快照中提取摘要字段，生成列表用的轻量会话摘要。 */
-function toSummary(snapshot: SessionSnapshot): SessionSummary {
+function toMetadata(snapshot: SessionSnapshot): SessionMetadata {
 	return {
 		id: snapshot.id,
-		name: snapshot.name,
-		cwd: snapshot.cwd,
 		createdAt: snapshot.createdAt,
 		updatedAt: snapshot.updatedAt,
-		phase: snapshot.phase,
-		model: snapshot.model,
-		thinkingLevel: snapshot.thinkingLevel,
-		attached: snapshot.attached,
-		locked: snapshot.locked,
+		sessionName: snapshot.name,
+		cwd: snapshot.cwd,
 	};
 }
 
@@ -76,7 +68,7 @@ export class LiveSessionManager {
 	async executeCommand(connection: ConnectionState, command: Command) {
 		switch (command.command) {
 			case "list":
-				return { command: "list" as const, sessions: await this.listSummaries(connection) };
+				return { command: "list" as const, sessions: await this.listMetadata() };
 			case "create": {
 				const id = randomUUID();
 				const options: CreateSessionOptions = {
@@ -86,7 +78,7 @@ export class LiveSessionManager {
 					model: command.model,
 					thinkingLevel: command.thinkingLevel,
 				};
-				const live = await this.acquire(id, () => this.options.backend.createSession(options));
+				const live = await this.acquire(id, () => this.options.service.createSession(options));
 				await this.attach(connection, live);
 				const session = this.forConnection(await this.broadcastSnapshot(live), connection);
 				this.options.broadcastServerSnapshot();
@@ -94,7 +86,7 @@ export class LiveSessionManager {
 			}
 			case "attach": {
 				const live = await this.acquire(command.sessionId, () =>
-					this.options.backend.openSession(command.sessionId),
+					this.options.service.openSession(command.sessionId),
 				);
 				await this.attach(connection, live);
 				const session = this.forConnection(await this.broadcastSnapshot(live), connection);
@@ -161,25 +153,22 @@ export class LiveSessionManager {
 		}
 	}
 
-	/** 列出会话摘要：合并后端持久化数据与活跃会话的实时快照，并按连接标记附加状态。 */
-	async listSummaries(connection?: ConnectionState): Promise<SessionSummary[]> {
-		const stored = await this.options.backend.listSessions();
+	async listMetadata(): Promise<SessionMetadata[]> {
+		const stored = await this.options.service.listSessions();
 		const liveSnapshots = await Promise.all(
 			[...this.liveSessions.values()]
 				.filter((live) => !live.disposing)
 				.map(async (live) => [live.id, await this.normalizedSnapshot(live)] as const),
 		);
 		const liveById = new Map(liveSnapshots);
-		const summaries = stored.map((summary) => {
-			const snapshot = liveById.get(summary.id);
-			if (!snapshot) return { ...summary, attached: false };
-			liveById.delete(summary.id);
-			return { ...toSummary(snapshot), attached: connection?.sessionIds.has(summary.id) ?? false };
+		const metadata = stored.map((item) => {
+			const snapshot = liveById.get(item.id);
+			if (!snapshot) return item;
+			liveById.delete(item.id);
+			return { ...item, ...toMetadata(snapshot) };
 		});
-		for (const snapshot of liveById.values()) {
-			summaries.push({ ...toSummary(snapshot), attached: connection?.sessionIds.has(snapshot.id) ?? false });
-		}
-		return summaries;
+		for (const snapshot of liveById.values()) metadata.push(toMetadata(snapshot));
+		return metadata;
 	}
 
 	/** 关闭会话管理器：等待所有打开中的会话结束，然后释放全部活跃会话。 */
@@ -255,7 +244,7 @@ export class LiveSessionManager {
 			if (snapshot.id !== id) {
 				throw new PiServerError(
 					"invalid_request",
-					`Backend returned session ${snapshot.id} for server-assigned session ${id}`,
+					`Service returned session ${snapshot.id} for server-assigned session ${id}`,
 				);
 			}
 			live = {

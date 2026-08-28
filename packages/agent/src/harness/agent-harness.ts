@@ -1,1283 +1,508 @@
-import {
-	type AssistantMessage,
-	contentText,
-	type ImageContent,
-	type Model,
-	type Models,
-	type RetryCallbacks,
-	type RetryPolicy,
-	type UserMessage,
+import type {
+	Api,
+	AssistantMessage,
+	DeferredHandle,
+	ImageContent,
+	Message,
+	Model,
+	Models,
+	RetryPolicy,
+	SimpleStreamOptions,
+	Usage,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop } from "../agent-loop.ts";
+import type { AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../types.ts";
+import type { CompactionSettings } from "./compaction/compaction.ts";
+import { type Result as ResultValue, TaggedError } from "./result.ts";
 import type {
-	AgentContext,
-	AgentEvent,
-	AgentLoopConfig,
-	AgentMessage,
-	AgentTool,
-	QueueMode,
-	StreamFn,
-	ThinkingLevel,
-} from "../types.ts";
-import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.ts";
-import { compact, DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "./compaction/compaction.ts";
-import { convertToLlm } from "./messages.ts";
-import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
-import { formatSkillInvocation } from "./skills.ts";
-import type {
-	AbortResult,
-	AgentHarnessEvent,
-	AgentHarnessEventResultMap,
-	AgentHarnessOptions,
-	AgentHarnessOwnEvent,
-	AgentHarnessPhase,
-	AgentHarnessResources,
-	AgentHarnessStreamOptions,
-	AgentHarnessStreamOptionsPatch,
-	AgentHarnessSystemPrompt,
-	AgentHarnessTool,
-	AgentHarnessToolContextSource,
-	CompactResult,
-	NavigateTreeResult,
-	PendingSessionWrite,
-	PromptTemplate,
+	BranchSummaryEntry,
+	CompactionEntry,
+	Entry,
+	JsonValue,
+	ProvisionedEntry,
 	Session,
-	Skill,
-} from "./types.ts";
-import { AgentHarnessError, BranchSummaryError, CompactionError, SessionError, toError } from "./types.ts";
+	SessionTree,
+} from "./session/index.ts";
+import type { TelemetryContext } from "./telemetry.ts";
+import type { AgentHarnessResources, PromptTemplate, Skill } from "./types.ts";
 
-/** 构造一条可选的带图片的用户消息。 */
-function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
-	const content: Array<{ type: "text"; text: string } | ImageContent> = [{ type: "text", text }];
-	if (images) content.push(...images);
-	return { role: "user", content, timestamp: Date.now() };
+export class LaneBusy extends TaggedError("LaneBusy")<{
+	lane: string;
+	operationId: string;
+	operationKind: "run" | "compaction" | "navigation";
+	message: string;
+}> {}
+export class MissingIdentities extends TaggedError("MissingIdentities")<{
+	lane: string;
+	tools: string[];
+	models: string[];
+	message: string;
+}> {}
+export class NoActiveRun extends TaggedError("NoActiveRun")<{ lane: string; message: string }> {}
+export class NoActiveOperation extends TaggedError("NoActiveOperation")<{ lane: string; message: string }> {}
+export class NothingToResume extends TaggedError("NothingToResume")<{ lane: string; message: string }> {}
+export class InvalidMessage extends TaggedError("InvalidMessage")<{ lane: string; reason: string; message: string }> {}
+export class UnknownSkill extends TaggedError("UnknownSkill")<{ name: string; message: string }> {}
+export class UnknownTemplate extends TaggedError("UnknownTemplate")<{ name: string; message: string }> {}
+export class UnknownTarget extends TaggedError("UnknownTarget")<{ targetId: string; message: string }> {}
+export class UnknownQueueItem extends TaggedError("UnknownQueueItem")<{
+	lane: string;
+	entryId: string;
+	message: string;
+}> {}
+export class LaneExists extends TaggedError("LaneExists")<{ lane: string; message: string }> {}
+export class InvalidLane extends TaggedError("InvalidLane")<{ lane: string; reason: string; message: string }> {}
+export class NothingToCompact extends TaggedError("NothingToCompact")<{ lane: string; message: string }> {}
+export class Closed extends TaggedError("Closed")<{ message: string }> {}
+
+export class HarnessFault extends Error {
+	readonly cause: unknown;
+
+	constructor(message: string, cause: unknown) {
+		super(message);
+		this.name = "HarnessFault";
+		this.cause = cause;
+	}
 }
 
-/** 构造失败或被中止时的 assistant 消息，附带错误信息和零值 usage。 */
-function createFailureMessage(model: Model<any>, error: unknown, aborted: boolean): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [{ type: "text", text: "" }],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		stopReason: aborted ? "aborted" : "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
-		timestamp: Date.now(),
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
+export class HarnessClosed extends Error {
+	constructor() {
+		super("AgentHarness was closed while the operation was active");
+		this.name = "HarnessClosed";
+	}
+}
+
+export class HarnessNotImplemented extends Error {
+	readonly operation: string;
+
+	constructor(operation: string) {
+		super(`AgentHarness.${operation} is not implemented yet`);
+		this.name = "HarnessNotImplemented";
+		this.operation = operation;
+	}
+}
+
+export interface OperationError {
+	code: string;
+	message: string;
+}
+
+export type RunOutcome =
+	| { kind: "completed"; leafId: string; finalEntryId: string; finalMessage: AssistantMessage }
+	| { kind: "aborted"; leafId: string; finalEntryId: string; finalMessage: AssistantMessage }
+	| { kind: "failed"; leafId: string; error: OperationError; finalEntryId?: string; finalMessage?: AssistantMessage }
+	| { kind: "suspended"; leafId: string; finalEntryId: string; deferred: DeferredHandle };
+
+export type CompactionOutcome =
+	| { kind: "completed"; leafId: string; entry: CompactionEntry }
+	| { kind: "declined" | "aborted"; leafId: string }
+	| { kind: "failed"; leafId: string; error: OperationError };
+
+export type NavigationOutcome =
+	| { kind: "completed"; newLeafId: string | null; summaryEntry?: BranchSummaryEntry }
+	| { kind: "declined" | "aborted"; leafId: string | null }
+	| { kind: "failed"; leafId: string | null; error: OperationError };
+
+export type RunRejected = LaneBusy | InvalidMessage | UnknownSkill | UnknownTemplate | Closed;
+export type CompactionRejected = LaneBusy | NothingToCompact | Closed;
+export type NavigationRejected = LaneBusy | UnknownTarget | Closed;
+export type ResumeRejected = LaneBusy | NothingToResume | MissingIdentities | Closed;
+export type QueueRejected = NoActiveRun | InvalidMessage | Closed;
+export type CancelQueuedRejected = UnknownQueueItem | Closed;
+export type AbortRejected = NoActiveOperation | Closed;
+
+export type RunResult = ResultValue<{ runId: string } & RunOutcome, RunRejected>;
+export type CompactionResult = ResultValue<{ runId: string } & CompactionOutcome, CompactionRejected>;
+export type NavigationResult = ResultValue<{ runId: string } & NavigationOutcome, NavigationRejected>;
+export type QueueResult = ResultValue<{ entryId: string }, QueueRejected>;
+export type CancelQueuedResult = ResultValue<
+	{ outcome: "cancelled" | "already_consumed" | "already_cleared" },
+	CancelQueuedRejected
+>;
+export type RecordUsageResult = ResultValue<void, Closed>;
+export type AbortResult = ResultValue<
+	{ runId: string; steer: AgentMessage[]; followUp: AgentMessage[] },
+	AbortRejected
+>;
+
+export type ResumeOutcome =
+	| ({ operation: "run"; runId: string } & RunOutcome)
+	| ({ operation: "compaction"; runId: string } & CompactionOutcome)
+	| ({ operation: "navigation"; runId: string } & NavigationOutcome);
+export type ResumeResult = ResultValue<ResumeOutcome, ResumeRejected>;
+export type CreateLaneResult = ResultValue<AgentLane, LaneExists | InvalidLane | UnknownTarget | Closed>;
+
+export interface NavigateOptions {
+	summarize?: boolean;
+	customInstructions?: string;
+	label?: string;
+}
+
+export interface SuspendedOperation {
+	lane: string;
+	kind: "run" | "compaction" | "navigation";
+	id: string;
+	startedAt: number;
+	reason: "crash" | "deferred";
+	prompt?: AgentMessage[];
+	deferred?: DeferredHandle;
+	aborting?: { steer: AgentMessage[]; followUp: AgentMessage[] };
+	missing: { tools: string[]; models: string[] };
+}
+
+export interface LaneInfo {
+	name: string;
+	leafId: string | null;
+	operation: null | {
+		id: string;
+		kind: "run" | "compaction" | "navigation";
+		status: "running" | "suspended" | "aborting";
 	};
 }
 
-/** 浅拷贝流式选项，避免外部调用方意外修改内部状态。 */
-function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHarnessStreamOptions {
-	return {
-		...streamOptions,
-		headers: streamOptions?.headers ? { ...streamOptions.headers } : undefined,
-		metadata: streamOptions?.metadata ? { ...streamOptions.metadata } : undefined,
-	};
+export interface QueuedItem {
+	entryId: string;
+	message: AgentMessage;
 }
 
-/** 找出数组中重复出现的名字。 */
-function findDuplicateNames(names: string[]): string[] {
-	const seen = new Set<string>();
-	const duplicates = new Set<string>();
-	for (const name of names) {
-		if (seen.has(name)) duplicates.add(name);
-		seen.add(name);
+export interface LaneSnapshot {
+	lane: string;
+	transcript: Entry[];
+	leafId: string | null;
+	operation: LaneInfo["operation"];
+	queues: { steer: QueuedItem[]; followUp: QueuedItem[]; nextRun: QueuedItem[] };
+	pendingWrites: { id: string; entry: ProvisionedEntry }[];
+	faulted: boolean;
+}
+
+export interface SessionSnapshot {
+	lanes: (LaneInfo & { suspended?: SuspendedOperation })[];
+	faulted: boolean;
+}
+
+export type ActionInfo =
+	| { kind: "append_entry"; entryType: Entry["type"]; entryId: string }
+	| { kind: "append_record"; recordType: string }
+	| { kind: "move_lane"; to: string | null }
+	| { kind: "set_fact"; fact: "name" | "label" }
+	| { kind: "try_finish_run"; outcome: "completed" | "failed" }
+	| { kind: "finish_operation"; outcome: "completed" | "declined" | "failed" | "aborted" }
+	| { kind: "commit_follow_up" }
+	| { kind: "consume_queue_item"; queue: "steer" | "followUp"; entryId: string }
+	| { kind: "apply_pending_write"; entryId: string }
+	| { kind: "stream_assistant"; step: "assistant" | "compaction" | "branch_summary"; attempt: number }
+	| { kind: "execute_tool"; toolCallId: string; toolName: string }
+	| { kind: "fetch_deferred" | "cancel_deferred"; provider: string; id: string }
+	| { kind: "hook"; name: HookName }
+	| { kind: "sleep"; delayMs: number };
+
+export type HookName =
+	| "before_run"
+	| "before_resume"
+	| "before_run_end"
+	| "transform_context"
+	| "before_request"
+	| "before_payload"
+	| "after_response"
+	| "before_tool"
+	| "after_tool"
+	| "before_compaction"
+	| "before_navigation";
+
+export interface Hooks {
+	on(name: HookName, handler: (event: unknown) => unknown | Promise<unknown>, options?: { id?: string }): () => void;
+}
+
+export interface Events {
+	on(type: string, listener: (event: unknown) => void | Promise<void>): () => void;
+}
+
+class UnavailableRegistry implements Hooks, Events {
+	private readonly operation: string;
+	private readonly isClosed: () => boolean;
+
+	constructor(operation: string, isClosed: () => boolean) {
+		this.operation = operation;
+		this.isClosed = isClosed;
 	}
-	return [...duplicates];
-}
 
-/** 将部分更新的补丁应用到基础流式选项上，返回新的选项对象；值为 undefined 的字段会被删除。 */
-function applyStreamOptionsPatch(
-	base: AgentHarnessStreamOptions,
-	patch?: AgentHarnessStreamOptionsPatch,
-): AgentHarnessStreamOptions {
-	const result = cloneStreamOptions(base);
-	if (!patch) return result;
-
-	if (Object.hasOwn(patch, "transport")) result.transport = patch.transport;
-	if (Object.hasOwn(patch, "timeoutMs")) result.timeoutMs = patch.timeoutMs;
-	if (Object.hasOwn(patch, "maxRetries")) result.maxRetries = patch.maxRetries;
-	if (Object.hasOwn(patch, "maxRetryDelayMs")) result.maxRetryDelayMs = patch.maxRetryDelayMs;
-	if (Object.hasOwn(patch, "cacheRetention")) result.cacheRetention = patch.cacheRetention;
-
-	if (Object.hasOwn(patch, "headers")) {
-		if (patch.headers === undefined) {
-			result.headers = undefined;
-		} else {
-			const headers = { ...(result.headers ?? {}) };
-			for (const [key, value] of Object.entries(patch.headers)) {
-				if (value === undefined) delete headers[key];
-				else headers[key] = value;
-			}
-			result.headers = Object.keys(headers).length > 0 ? headers : undefined;
-		}
+	on(
+		_name: HookName | string,
+		_handler: (event: unknown) => unknown | Promise<unknown>,
+		_options?: { id?: string },
+	): () => void {
+		throw this.isClosed() ? new HarnessClosed() : new HarnessNotImplemented(this.operation);
 	}
-
-	if (Object.hasOwn(patch, "metadata")) {
-		if (patch.metadata === undefined) {
-			result.metadata = undefined;
-		} else {
-			const metadata = { ...(result.metadata ?? {}) };
-			for (const [key, value] of Object.entries(patch.metadata)) {
-				if (value === undefined) delete metadata[key];
-				else metadata[key] = value;
-			}
-			result.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
-		}
-	}
-
-	return result;
 }
 
-/** 订阅所有事件时使用的通配符事件类型。 */
-const SUBSCRIBER_EVENT_TYPE = "*";
+export type HarnessTool = AgentTool & { replay?: "never" | "safe" };
+export type Resources = AgentHarnessResources<Skill, PromptTemplate>;
+export type StreamOptions = SimpleStreamOptions;
+export type StreamOptionsPatch = Partial<SimpleStreamOptions>;
+export type EntryProjector = (entry: Entry) => AgentMessage[] | Promise<AgentMessage[]>;
 
-/** 事件处理函数签名：接收事件和可选的取消信号。 */
-type AgentHarnessHandler = (event: any, signal?: AbortSignal) => Promise<any> | any;
-
-/** 追踪任务种类：`operation` 表示运行中的操作，`mutation` 表示会话变更。 */
-type TrackedTaskKind = "operation" | "mutation";
-
-/** 将任意错误规范化为 {@link AgentHarnessError}，按错误类型映射到对应的错误码。 */
-function normalizeHarnessError(error: unknown, fallbackCode: AgentHarnessError["code"]): AgentHarnessError {
-	if (error instanceof AgentHarnessError) return error;
-	const cause = toError(error);
-	if (cause instanceof SessionError) return new AgentHarnessError("session", cause.message, cause);
-	if (cause instanceof CompactionError) return new AgentHarnessError("compaction", cause.message, cause);
-	if (cause instanceof BranchSummaryError) return new AgentHarnessError("branch_summary", cause.message, cause);
-	return new AgentHarnessError(fallbackCode, cause.message, cause);
+export interface AgentHarnessOptions {
+	session: Session;
+	models: Models;
+	model: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+	activeToolNames?: string[];
+	tools?: HarnessTool[];
+	toolContext?: object | (() => object | Promise<object>);
+	systemPrompt?: string | (() => string | Promise<string>);
+	resources?: Resources;
+	streamOptions?: StreamOptions;
+	retry?: RetryPolicy;
+	compaction?: CompactionSettings;
+	steeringMode?: QueueMode;
+	followUpMode?: QueueMode;
+	toolExecution?: "sequential" | "parallel";
+	drive?: "automatic" | "manual";
+	toProviderMessages?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	entryProjectors?: Record<string, EntryProjector>;
+	context?: TelemetryContext;
 }
 
-/** 将钩子回调抛出的错误规范化为 `hook` 错误码的 {@link AgentHarnessError}。 */
-function normalizeHookError(error: unknown): AgentHarnessError {
-	return normalizeHarnessError(error, "hook");
+export interface WatchHandle<TSnapshot> {
+	snapshot: TSnapshot;
+	start(listener: (event: unknown) => void): void;
+	unsubscribe(): void;
 }
 
-/** 单个回合运行所需的全部状态，在每个回合开始时统一创建。 */
-interface AgentHarnessTurnState<
-	TContext extends object | undefined,
-	TSkill extends Skill = Skill,
-	TPromptTemplate extends PromptTemplate = PromptTemplate,
-	TTool extends AgentHarnessTool<TContext> = AgentHarnessTool<TContext>,
-> {
-	messages: AgentMessage[];
-	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
-	toolContext: TContext;
-	streamOptions: AgentHarnessStreamOptions;
-	sessionId: string;
-	systemPrompt: string;
-	model: Model<any>;
-	thinkingLevel: ThinkingLevel;
-	tools: TTool[];
-	activeTools: TTool[];
+export interface AgentLane {
+	readonly name: string;
+	getLeafId(): Promise<string | null>;
+	prompt(text: string, images?: ImageContent[]): Promise<RunResult>;
+	prompt(message: AgentMessage | AgentMessage[]): Promise<RunResult>;
+	skill(name: string, additionalInstructions?: string): Promise<RunResult>;
+	promptFromTemplate(name: string, args?: string[]): Promise<RunResult>;
+	compact(options?: { customInstructions?: string }): Promise<CompactionResult>;
+	navigateTree(targetId: string | null, options?: NavigateOptions): Promise<NavigationResult>;
+	resume(): Promise<ResumeResult>;
+	abort(): Promise<AbortResult>;
+	steer(text: string, images?: ImageContent[]): Promise<QueueResult>;
+	steer(message: AgentMessage): Promise<QueueResult>;
+	followUp(text: string, images?: ImageContent[]): Promise<QueueResult>;
+	followUp(message: AgentMessage): Promise<QueueResult>;
+	nextRun(text: string, images?: ImageContent[]): Promise<QueueResult>;
+	nextRun(message: AgentMessage): Promise<QueueResult>;
+	cancelQueued(entryId: string): Promise<CancelQueuedResult>;
+	recordUsage(usage: Usage, options?: { entryId?: string; details?: JsonValue }): Promise<RecordUsageResult>;
+	waitForIdle(): Promise<void>;
+	runWhenIdle(callback: () => void | Promise<void>): Promise<void>;
+	peekAction(): Promise<ActionInfo | undefined>;
+	executeAction(): Promise<ActionInfo | undefined>;
+	runToCompletion(): Promise<void>;
+	getModel(): Promise<Model<Api>>;
+	setModel(model: Model<Api>): Promise<void>;
+	getThinkingLevel(): Promise<ThinkingLevel>;
+	setThinkingLevel(level: ThinkingLevel): Promise<void>;
+	getActiveTools(): Promise<string[]>;
+	setActiveTools(names: string[]): Promise<void>;
+	readonly session: SessionTree;
+	watch(): Promise<WatchHandle<LaneSnapshot>>;
 }
 
-/**
- * Agent 执行器（harness）：持有持久化会话，并编排提示词、steering、follow-up、
- * 工具调用、压缩（compaction）与分支导航等完整的 agent 运行生命周期。
- */
-export class AgentHarness<
-	TContext extends object | undefined = undefined,
-	TSkill extends Skill = Skill,
-	TPromptTemplate extends PromptTemplate = PromptTemplate,
-	TTool extends AgentHarnessTool<TContext> = AgentHarnessTool<TContext>,
-> {
-	/** 底层会话存储，保存所有消息与条目。 */
-	private session: Session;
-	/** 模型注册表，用于创建流式模型调用。 */
-	readonly models: Models;
-	/** 当前阶段：idle / turn / compaction / branch_summary。 */
-	private phase: AgentHarnessPhase = "idle";
-	/** 当前运行操作的 abort controller，用于取消进行中的任务。 */
-	private activeAbortController?: AbortController;
-	/** 追踪所有未完成的后台任务，按种类（操作/变更）区分。 */
-	private readonly activeTasks = new Map<Promise<void>, TrackedTaskKind>();
-	/** 关闭流程的 Promise，在请求关闭后等待所有任务结束。 */
-	private shutdownPromise?: Promise<void>;
-	/** 是否已请求关闭。 */
-	private isShutdown = false;
-	/** 运行期间暂存的会话写入，在回合结束时统一落盘。 */
-	private pendingSessionWrites: PendingSessionWrite[] = [];
-	/** 当前使用的模型。 */
-	private model: Model<any>;
-	/** 当前思考级别。 */
+export class AgentHarness implements AgentLane {
+	readonly name = "main";
+	readonly session: SessionTree;
+	readonly hooks: Hooks;
+	readonly events: Events;
+	private readonly durableSession: Session;
+	private model: Model<Api>;
 	private thinkingLevel: ThinkingLevel;
-	/** 系统提示词：可以是字符串，也可以是动态生成函数。 */
-	private systemPrompt: AgentHarnessSystemPrompt<TContext, TSkill, TPromptTemplate, TTool> | undefined;
-	/** 工具上下文的来源：直接值或异步解析函数。 */
-	private toolContext: AgentHarnessToolContextSource<TContext> | undefined;
-	/** 默认的流式选项，在创建回合时浅拷贝使用。 */
-	private streamOptions: AgentHarnessStreamOptions;
-	/** 模型调用的重试策略。 */
-	private retry: RetryPolicy | undefined;
-	/** 可用资源：技能与提示词模板。 */
-	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
-	/** 全部已注册工具，按名称索引。 */
-	private tools = new Map<string, TTool>();
-	/** 当前启用的工具名列表。 */
 	private activeToolNames: string[];
-	/** steering 消息队列，在当前回合运行期间注入。 */
-	private steerQueue: UserMessage[] = [];
-	/** steering 队列的排放模式。 */
-	private steeringQueueMode: QueueMode;
-	/** follow-up 消息队列，在回合结束时注入。 */
-	private followUpQueue: UserMessage[] = [];
-	/** follow-up 队列的排放模式。 */
-	private followUpQueueMode: QueueMode;
-	/** 下一回合消息队列，在下一个回合开始前合并。 */
-	private nextTurnQueue: AgentMessage[] = [];
-	/** 事件处理器集合，按事件类型索引。 */
-	private handlers = new Map<string, Set<AgentHarnessHandler>>();
+	private tools: HarnessTool[];
+	private resources: Resources;
+	private streamOptions: StreamOptions;
+	private retryPolicy: RetryPolicy;
+	private compactionSettings: CompactionSettings;
+	private steeringMode: QueueMode;
+	private followUpMode: QueueMode;
+	private closed = false;
 
-	/**
-	 * 构造 AgentHarness。
-	 * @param options - 配置选项，包含会话、模型、工具、系统提示词与各类队列模式。
-	 */
-	constructor(options: AgentHarnessOptions<TContext, TSkill, TPromptTemplate, TTool>) {
+	private constructor(options: AgentHarnessOptions) {
+		this.durableSession = options.session;
 		this.session = options.session;
-		this.models = options.models;
-		this.resources = options.resources ?? {};
-		this.streamOptions = cloneStreamOptions(options.streamOptions);
-		this.retry = options.retry;
-		this.systemPrompt = options.systemPrompt;
-		this.toolContext = options.toolContext;
-		this.validateUniqueNames(
-			(options.tools ?? []).map((tool) => tool.name),
-			"Duplicate tool name(s)",
-		);
-		for (const tool of options.tools ?? []) {
-			this.tools.set(tool.name, tool);
-		}
+		this.hooks = new UnavailableRegistry("hooks.on", () => this.closed);
+		this.events = new UnavailableRegistry("events.on", () => this.closed);
 		this.model = options.model;
 		this.thinkingLevel = options.thinkingLevel ?? "off";
-		this.activeToolNames = options.activeToolNames
-			? [...options.activeToolNames]
-			: (options.tools ?? []).map((tool) => tool.name);
-		this.validateUniqueNames(this.activeToolNames, "Duplicate active tool name(s)");
-		this.validateToolNames(this.activeToolNames);
-		this.steeringQueueMode = options.steeringMode ?? "one-at-a-time";
-		this.followUpQueueMode = options.followUpMode ?? "one-at-a-time";
-	}
-
-	/** 若实例已关闭则抛出 invalid_state 错误。 */
-	private assertNotShutDown(): void {
-		if (this.isShutdown) throw new AgentHarnessError("invalid_state", "AgentHarness has been shut down");
-	}
-
-	/** 获取指定事件类型的处理器集合。 */
-	private getHandlers(type: string): Set<AgentHarnessHandler> | undefined {
-		return this.handlers.get(type);
-	}
-
-	/** 向所有通配符订阅者广播 harness 自有事件。 */
-	private async emitOwn(event: AgentHarnessOwnEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
-		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
-			try {
-				await listener(event, signal);
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-	}
-
-	/** 向所有通配符订阅者广播任意 agent 事件。 */
-	private async emitAny(event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
-		for (const listener of this.getHandlers(SUBSCRIBER_EVENT_TYPE) ?? []) {
-			try {
-				await listener(event, signal);
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-	}
-
-	/** 触发指定类型的钩子，收集所有处理器返回的最后一个非 undefined 结果。 */
-	private async emitHook<TType extends keyof AgentHarnessEventResultMap>(
-		event: Extract<AgentHarnessOwnEvent, { type: TType }>,
-	): Promise<AgentHarnessEventResultMap[TType] | undefined> {
-		const handlers = this.getHandlers(event.type as TType);
-		if (!handlers || handlers.size === 0) return undefined;
-		let lastResult: AgentHarnessEventResultMap[TType] | undefined;
-		for (const handler of handlers) {
-			try {
-				const result = await handler(event);
-				if (result !== undefined) {
-					lastResult = result;
-				}
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-		return lastResult;
-	}
-
-	/** 构建重试回调，将压缩/分支摘要的重试过程转为对应 hook 事件。 */
-	private retryCallbacks(operation: "compaction" | "branch_summary"): RetryCallbacks {
-		return {
-			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) =>
-				this.emitOwn({ type: "retry_scheduled", operation, attempt, maxAttempts, delayMs, errorMessage }),
-			onRetryAttemptStart: () => this.emitOwn({ type: "retry_attempt_start", operation }),
-			onRetryFinished: () => this.emitOwn({ type: "retry_finished", operation }),
+		this.activeToolNames = [...(options.activeToolNames ?? options.tools?.map((tool) => tool.name) ?? [])];
+		this.tools = [...(options.tools ?? [])];
+		this.resources = {
+			skills: options.resources?.skills ? [...options.resources.skills] : undefined,
+			promptTemplates: options.resources?.promptTemplates ? [...options.resources.promptTemplates] : undefined,
 		};
-	}
-
-	/** 在发起 provider 请求前触发钩子，允许通过补丁修改流式选项。 */
-	private async emitBeforeProviderRequest(
-		model: Model<any>,
-		sessionId: string,
-		streamOptions: AgentHarnessStreamOptions,
-	): Promise<AgentHarnessStreamOptions> {
-		const handlers = this.getHandlers("before_provider_request");
-		let current = cloneStreamOptions(streamOptions);
-		if (!handlers || handlers.size === 0) return current;
-		for (const handler of handlers) {
-			try {
-				const result = await handler({
-					type: "before_provider_request",
-					model,
-					sessionId,
-					streamOptions: cloneStreamOptions(current),
-				});
-				if (result?.streamOptions) {
-					current = applyStreamOptionsPatch(current, result.streamOptions);
-				}
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-		return current;
-	}
-
-	/** 在 provider 载荷发出前触发钩子，允许替换实际发送的载荷。 */
-	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown> {
-		const handlers = this.getHandlers("before_provider_payload");
-		let current = payload;
-		if (!handlers || handlers.size === 0) return current;
-		for (const handler of handlers) {
-			try {
-				const result = await handler({ type: "before_provider_payload", model, payload: current });
-				if (result !== undefined) {
-					current = result.payload;
-				}
-			} catch (error) {
-				throw normalizeHookError(error);
-			}
-		}
-		return current;
-	}
-
-	/** 广播当前所有消息队列的快照。 */
-	private async emitQueueUpdate(): Promise<void> {
-		await this.emitOwn({
-			type: "queue_update",
-			steer: [...this.steerQueue],
-			followUp: [...this.followUpQueue],
-			nextTurn: [...this.nextTurnQueue],
-		});
-	}
-
-	/** 开启一次可取消的运行操作，返回取消信号与操作结束回调。 */
-	private startOperation(): { signal: AbortSignal; finish: () => void } {
-		const abortController = new AbortController();
-		let finish = () => {};
-		this.activeAbortController = abortController;
-		void this.track(
-			"operation",
-			() =>
-				new Promise<void>((resolve) => {
-					finish = resolve;
-				}),
-		);
-		return {
-			signal: abortController.signal,
-			finish: () => {
-				this.activeAbortController = undefined;
-				finish();
-			},
+		this.streamOptions = { ...(options.streamOptions ?? {}) };
+		this.retryPolicy = options.retry ?? { enabled: false, maxRetries: 0, baseDelayMs: 1000 };
+		this.compactionSettings = options.compaction ?? {
+			enabled: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
 		};
+		this.steeringMode = options.steeringMode ?? "one-at-a-time";
+		this.followUpMode = options.followUpMode ?? "one-at-a-time";
 	}
 
-	/** 登记并执行一个后台任务，任务结束后自动从追踪集合中移除。 */
-	private async track<T>(kind: TrackedTaskKind, operation: () => Promise<T>): Promise<T> {
-		let settle = () => {};
-		const settled = new Promise<void>((resolve) => {
-			settle = resolve;
-		});
-		this.activeTasks.set(settled, kind);
-		try {
-			return await operation();
-		} finally {
-			this.activeTasks.delete(settled);
-			settle();
-		}
+	static async create(
+		options: AgentHarnessOptions,
+	): Promise<{ harness: AgentHarness; suspended: SuspendedOperation[] }> {
+		const [record] = await options.session.findRecords({ limit: 1 });
+		if (record !== undefined) throw new HarnessNotImplemented("create.restore");
+		return { harness: new AgentHarness(options), suspended: [] };
 	}
 
-	/** 等待所有（或指定种类的）后台任务结束。 */
-	private async waitForTasks(kind?: TrackedTaskKind): Promise<void> {
-		while (true) {
-			const tasks = [...this.activeTasks].flatMap(([task, taskKind]) =>
-				kind === undefined || kind === taskKind ? [task] : [],
-			);
-			if (tasks.length === 0) return;
-			await Promise.all(tasks);
-		}
+	private unavailable<T>(operation: string): Promise<T> {
+		return Promise.reject(this.closed ? new HarnessClosed() : new HarnessNotImplemented(operation));
 	}
 
-	/** 解析工具上下文：若配置的是函数则调用求值，否则直接返回配置值。 */
-	private async resolveToolContext(): Promise<TContext> {
-		if (typeof this.toolContext === "function") {
-			return await (this.toolContext as () => TContext | Promise<TContext>)();
-		}
-		return this.toolContext as TContext;
+	async getLeafId(): Promise<string | null> {
+		return this.durableSession.getLeafId();
 	}
 
-	/** 将工具上下文绑定到工具的 execute，生成 agent 循环可直接调用的工具。 */
-	private bindToolContext(tool: TTool, context: TContext): AgentTool {
-		return {
-			...tool,
-			execute: (toolCallId, params, signal, onUpdate) => tool.execute(toolCallId, params, signal, onUpdate, context),
-		};
+	async prompt(_text: string, _images?: ImageContent[]): Promise<RunResult>;
+	async prompt(_message: AgentMessage | AgentMessage[]): Promise<RunResult>;
+	async prompt(_input: string | AgentMessage | AgentMessage[], _images?: ImageContent[]): Promise<RunResult> {
+		return this.unavailable("prompt");
 	}
-
-	/** 创建本回合运行所需的完整状态快照（消息、工具、系统提示词等）。 */
-	private async createTurnState(): Promise<AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>> {
-		this.assertNotShutDown();
-		const context = await this.session.buildContext();
-		const resources = this.getResources();
-		const sessionMetadata = await this.session.getMetadata();
-		const toolContext = await this.resolveToolContext();
-		const tools = [...this.tools.values()];
-		const activeTools = this.activeToolNames
-			.map((name) => this.tools.get(name))
-			.filter((tool): tool is TTool => tool !== undefined);
-		let systemPrompt = "You are a helpful assistant.";
-		if (typeof this.systemPrompt === "string") {
-			systemPrompt = this.systemPrompt;
-		} else if (this.systemPrompt) {
-			systemPrompt = await this.systemPrompt({
-				session: this.session,
-				model: this.model,
-				thinkingLevel: this.thinkingLevel,
-				activeTools,
-				resources,
-			});
-		}
-		return {
-			messages: context.messages,
-			resources,
-			toolContext,
-			streamOptions: cloneStreamOptions(this.streamOptions),
-			sessionId: sessionMetadata.id,
-			systemPrompt,
-			model: this.model,
-			thinkingLevel: this.thinkingLevel,
-			tools,
-			activeTools,
-		};
+	async skill(_name: string, _additionalInstructions?: string): Promise<RunResult> {
+		return this.unavailable("skill");
 	}
-
-	/** 依据回合状态构造 agent 循环上下文（系统提示词、消息、绑定好的工具）。 */
-	private createContext(
-		turnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
-		systemPrompt?: string,
-	): AgentContext {
-		return {
-			systemPrompt: systemPrompt ?? turnState.systemPrompt,
-			messages: turnState.messages.slice(),
-			tools: turnState.activeTools.map((tool) => this.bindToolContext(tool, turnState.toolContext)),
-		};
+	async promptFromTemplate(_name: string, _args?: string[]): Promise<RunResult> {
+		return this.unavailable("promptFromTemplate");
 	}
-
-	/** 构造流式函数，在每次模型调用前串联 provider 请求前/载荷前钩子。 */
-	private createStreamFn(
-		getTurnState: () => AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
-	): StreamFn {
-		return async (model, context, streamOptions) => {
-			const turnState = getTurnState();
-			const snapshotOptions: AgentHarnessStreamOptions = { ...turnState.streamOptions };
-			const requestOptions = await this.emitBeforeProviderRequest(model, turnState.sessionId, snapshotOptions);
-			return this.models.streamSimple(model, context, {
-				cacheRetention: requestOptions.cacheRetention,
-				headers: requestOptions.headers,
-				maxRetries: requestOptions.maxRetries,
-				maxRetryDelayMs: requestOptions.maxRetryDelayMs,
-				metadata: requestOptions.metadata,
-				onPayload: async (payload) => await this.emitBeforeProviderPayload(model, payload),
-				onResponse: async (response) => {
-					const headers = { ...(response.headers as Record<string, string>) };
-					await this.emitOwn(
-						{ type: "after_provider_response", status: response.status, headers },
-						streamOptions?.signal,
-					);
-				},
-				reasoning: streamOptions?.reasoning,
-				signal: streamOptions?.signal,
-				sessionId: turnState.sessionId,
-				timeoutMs: requestOptions.timeoutMs,
-				transport: requestOptions.transport,
-			});
-		};
+	async compact(_options?: { customInstructions?: string }): Promise<CompactionResult> {
+		return this.unavailable("compact");
 	}
-
-	/** 从消息队列取出待处理消息（按模式取全部或一条），并广播队列更新。 */
-	private async drainQueuedMessages(queue: AgentMessage[], mode: QueueMode): Promise<AgentMessage[]> {
-		const messages = mode === "all" ? queue.splice(0) : queue.splice(0, 1);
-		if (messages.length === 0) return messages;
-		try {
-			await this.emitQueueUpdate();
-			return messages;
-		} catch (error) {
-			queue.unshift(...messages);
-			throw normalizeHookError(error);
-		}
+	async navigateTree(_targetId: string | null, _options?: NavigateOptions): Promise<NavigationResult> {
+		return this.unavailable("navigateTree");
 	}
-
-	/** 构造 agent 循环配置，把 harness 的钩子与队列接入底层 agent-loop。 */
-	private createLoopConfig(
-		getTurnState: () => AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
-		setTurnState: (turnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>) => void,
-	): AgentLoopConfig {
-		const turnState = getTurnState();
-		return {
-			model: turnState.model,
-			reasoning: turnState.thinkingLevel === "off" ? undefined : turnState.thinkingLevel,
-			convertToLlm,
-			transformContext: async (messages) => {
-				const result = await this.emitHook({ type: "context", messages: [...messages] });
-				return result?.messages ?? messages;
-			},
-			beforeToolCall: async ({ toolCall, args }) => {
-				const result = await this.emitHook({
-					type: "tool_call",
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
-				});
-				return result ? { block: result.block, reason: result.reason } : undefined;
-			},
-			afterToolCall: async ({ toolCall, args, result, isError }) => {
-				const patch = await this.emitHook({
-					type: "tool_result",
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
-					content: result.content,
-					details: result.details,
-					isError,
-					usage: result.usage,
-				});
-				return patch
-					? {
-							content: patch.content,
-							details: patch.details,
-							isError: patch.isError,
-							usage: patch.usage,
-							terminate: patch.terminate,
-						}
-					: undefined;
-			},
-			prepareNextTurn: async () => {
-				await this.flushPendingSessionWrites();
-				const nextTurnState = await this.createTurnState();
-				setTurnState(nextTurnState);
-				return {
-					context: this.createContext(nextTurnState),
-					model: nextTurnState.model,
-					thinkingLevel: nextTurnState.thinkingLevel,
-				};
-			},
-			getSteeringMessages: async () => this.drainQueuedMessages(this.steerQueue, this.steeringQueueMode),
-			getFollowUpMessages: async () => this.drainQueuedMessages(this.followUpQueue, this.followUpQueueMode),
-		};
+	async resume(): Promise<ResumeResult> {
+		return this.unavailable("resume");
 	}
-
-	/** 校验名字列表没有重复，否则抛出 invalid_argument 错误。 */
-	private validateUniqueNames(names: string[], message: string): void {
-		const duplicates = findDuplicateNames(names);
-		if (duplicates.length > 0)
-			throw new AgentHarnessError("invalid_argument", `${message}: ${duplicates.join(", ")}`);
+	async abort(): Promise<AbortResult> {
+		return this.unavailable("abort");
 	}
-
-	/** 校验工具名没有重复且都已注册，否则抛出 invalid_argument 错误。 */
-	private validateToolNames(toolNames: string[], tools: Map<string, TTool> = this.tools): void {
-		this.validateUniqueNames(toolNames, "Duplicate active tool name(s)");
-		const missing = toolNames.filter((name) => !tools.has(name));
-		if (missing.length > 0) throw new AgentHarnessError("invalid_argument", `Unknown tool(s): ${missing.join(", ")}`);
+	async steer(_text: string, _images?: ImageContent[]): Promise<QueueResult>;
+	async steer(_message: AgentMessage): Promise<QueueResult>;
+	async steer(_input: string | AgentMessage, _images?: ImageContent[]): Promise<QueueResult> {
+		return this.unavailable("steer");
 	}
-
-	/** 将暂存的会话写入逐条落盘到会话存储，直到队列清空。 */
-	private async flushPendingSessionWrites(): Promise<void> {
-		while (this.pendingSessionWrites.length > 0) {
-			const write = this.pendingSessionWrites[0]!;
-			if (write.type === "message") {
-				await this.session.appendMessage(write.message);
-			} else if (write.type === "model_change") {
-				await this.session.appendModelChange(write.provider, write.modelId);
-			} else if (write.type === "thinking_level_change") {
-				await this.session.appendThinkingLevelChange(write.thinkingLevel);
-			} else if (write.type === "active_tools_change") {
-				await this.session.appendActiveToolsChange(write.activeToolNames);
-			} else if (write.type === "custom") {
-				await this.session.appendCustomEntry(write.customType, write.data);
-			} else if (write.type === "custom_message") {
-				await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details);
-			} else if (write.type === "label") {
-				await this.session.appendLabel(write.targetId, write.label);
-			} else if (write.type === "session_info") {
-				await this.session.appendSessionName(write.name ?? "");
-			} else if (write.type === "leaf") {
-				await this.session.moveTo(write.targetId);
-			}
-			this.pendingSessionWrites.shift();
-		}
+	async followUp(_text: string, _images?: ImageContent[]): Promise<QueueResult>;
+	async followUp(_message: AgentMessage): Promise<QueueResult>;
+	async followUp(_input: string | AgentMessage, _images?: ImageContent[]): Promise<QueueResult> {
+		return this.unavailable("followUp");
 	}
-
-	/** 处理 agent 循环事件：将消息写入会话、广播事件并在回合/运行结束时落盘。 */
-	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
-		if (event.type === "message_end") {
-			await this.session.appendMessage(event.message);
-			await this.emitAny(event, signal);
-			return;
-		}
-		if (event.type === "turn_end") {
-			let eventError: unknown;
-			try {
-				await this.emitAny(event, signal);
-			} catch (error) {
-				eventError = error;
-			}
-			const hadPendingMutations = this.pendingSessionWrites.length > 0;
-			await this.flushPendingSessionWrites();
-			if (eventError) throw eventError;
-			await this.emitOwn({ type: "save_point", hadPendingMutations });
-			return;
-		}
-		if (event.type === "agent_end") {
-			await this.flushPendingSessionWrites();
-			this.phase = "idle";
-			await this.emitAny(event, signal);
-			await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
-			return;
-		}
-		await this.emitAny(event, signal);
+	async nextRun(_text: string, _images?: ImageContent[]): Promise<QueueResult>;
+	async nextRun(_message: AgentMessage): Promise<QueueResult>;
+	async nextRun(_input: string | AgentMessage, _images?: ImageContent[]): Promise<QueueResult> {
+		return this.unavailable("nextRun");
 	}
-
-	/** 运行失败时构造失败消息，并按序发出 message/turn/agent 结束事件。 */
-	private async emitRunFailure(
-		model: Model<any>,
-		error: unknown,
-		aborted: boolean,
-		signal: AbortSignal,
-	): Promise<AgentMessage[]> {
-		const failureMessage = createFailureMessage(model, error, aborted);
-		await this.handleAgentEvent({ type: "message_start", message: failureMessage }, signal);
-		await this.handleAgentEvent({ type: "message_end", message: failureMessage }, signal);
-		await this.handleAgentEvent({ type: "turn_end", message: failureMessage, toolResults: [] }, signal);
-		await this.handleAgentEvent({ type: "agent_end", messages: [failureMessage] }, signal);
-		return [failureMessage];
+	async cancelQueued(_entryId: string): Promise<CancelQueuedResult> {
+		return this.unavailable("cancelQueued");
 	}
-
-	/** 执行单个回合：合并队列消息、运行 agent loop，并返回最后的 assistant 消息。 */
-	private async executeTurn(
-		turnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>,
-		text: string,
-		signal: AbortSignal,
-		options?: { images?: ImageContent[] },
-	): Promise<AssistantMessage> {
-		this.assertNotShutDown();
-		let activeTurnState = turnState;
-		let messages: AgentMessage[] = [createUserMessage(text, options?.images)];
-		if (this.nextTurnQueue.length > 0) {
-			const queuedMessages = this.nextTurnQueue.splice(0);
-			try {
-				await this.emitQueueUpdate();
-			} catch (error) {
-				this.nextTurnQueue.unshift(...queuedMessages);
-				throw normalizeHookError(error);
-			}
-			messages = [...queuedMessages, messages[0]!];
-		}
-		const beforeResult = await this.emitHook({
-			type: "before_agent_start",
-			prompt: text,
-			images: options?.images,
-			systemPrompt: turnState.systemPrompt,
-			resources: turnState.resources,
-		});
-		this.assertNotShutDown();
-		if (beforeResult?.messages) messages = [...messages, ...beforeResult.messages];
-
-		const getTurnState = () => activeTurnState;
-		const setTurnState = (nextTurnState: AgentHarnessTurnState<TContext, TSkill, TPromptTemplate, TTool>) => {
-			activeTurnState = nextTurnState;
-		};
-		const runResultPromise = (async () => {
-			try {
-				return await runAgentLoop(
-					messages,
-					this.createContext(turnState, beforeResult?.systemPrompt),
-					this.createLoopConfig(getTurnState, setTurnState),
-					(event) => this.handleAgentEvent(event, signal),
-					signal,
-					this.createStreamFn(getTurnState),
-				);
-			} catch (error) {
-				try {
-					return await this.emitRunFailure(activeTurnState.model, error, signal.aborted, signal);
-				} catch (failureError) {
-					const cause = new AggregateError(
-						[toError(error), toError(failureError)],
-						"Agent run failed and failure reporting failed",
-					);
-					throw new AgentHarnessError("unknown", cause.message, cause);
-				}
-			}
-		})();
-		try {
-			const newMessages = await runResultPromise;
-			for (let i = newMessages.length - 1; i >= 0; i--) {
-				const message = newMessages[i]!;
-				if (message.role === "assistant") {
-					return message;
-				}
-			}
-			throw new AgentHarnessError("invalid_state", "AgentHarness prompt completed without an assistant message");
-		} finally {
-			await this.flushPendingSessionWrites();
-		}
+	async recordUsage(_usage: Usage, _options?: { entryId?: string; details?: JsonValue }): Promise<RecordUsageResult> {
+		return this.unavailable("recordUsage");
 	}
-
-	/** 在空闲状态下发起一次提示词回合，返回最终的 assistant 消息。 */
-	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
-		this.assertNotShutDown();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
-		this.phase = "turn";
-		const operation = this.startOperation();
-		try {
-			const turnState = await this.createTurnState();
-			return await this.executeTurn(turnState, text, operation.signal, options);
-		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
-		} finally {
-			operation.finish();
-		}
+	async waitForIdle(): Promise<void> {
+		return this.unavailable("waitForIdle");
 	}
-
-	/** 在空闲状态下按名称调用技能发起一次回合，可附加额外指令。 */
-	async skill(name: string, additionalInstructions?: string): Promise<AssistantMessage> {
-		this.assertNotShutDown();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
-		this.phase = "turn";
-		const operation = this.startOperation();
-		try {
-			const turnState = await this.createTurnState();
-			const skill = (turnState.resources.skills ?? []).find((candidate) => candidate.name === name);
-			if (!skill) throw new AgentHarnessError("invalid_argument", `Unknown skill: ${name}`);
-			return await this.executeTurn(
-				turnState,
-				formatSkillInvocation(skill, additionalInstructions),
-				operation.signal,
-			);
-		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
-		} finally {
-			operation.finish();
-		}
+	async runWhenIdle(_callback: () => void | Promise<void>): Promise<void> {
+		return this.unavailable("runWhenIdle");
 	}
-
-	/** 在空闲状态下按提示词模板名称发起一次回合，args 为模板参数。 */
-	async promptFromTemplate(name: string, args: string[] = []): Promise<AssistantMessage> {
-		this.assertNotShutDown();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "AgentHarness is busy");
-		this.phase = "turn";
-		const operation = this.startOperation();
-		try {
-			const turnState = await this.createTurnState();
-			const template = (turnState.resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
-			if (!template) throw new AgentHarnessError("invalid_argument", `Unknown prompt template: ${name}`);
-			return await this.executeTurn(turnState, formatPromptTemplateInvocation(template, args), operation.signal);
-		} catch (error) {
-			this.phase = "idle";
-			throw normalizeHarnessError(error, "unknown");
-		} finally {
-			operation.finish();
-		}
+	async peekAction(): Promise<ActionInfo | undefined> {
+		return this.unavailable("peekAction");
 	}
-
-	/** 在当前回合运行期间注入一条 steering 消息。 */
-	async steer(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		this.assertNotShutDown();
-		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot steer while idle");
-		this.steerQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
+	async executeAction(): Promise<ActionInfo | undefined> {
+		return this.unavailable("executeAction");
 	}
-
-	/** 在当前回合结束、agent 即将空闲时注入一条 follow-up 消息。 */
-	async followUp(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		this.assertNotShutDown();
-		if (this.phase === "idle") throw new AgentHarnessError("invalid_state", "Cannot follow up while idle");
-		this.followUpQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
+	async runToCompletion(): Promise<void> {
+		return this.unavailable("runToCompletion");
 	}
-
-	/** 排队一条将在下一个回合开始前注入的消息。 */
-	async nextTurn(text: string, options?: { images?: ImageContent[] }): Promise<void> {
-		this.assertNotShutDown();
-		this.nextTurnQueue.push(createUserMessage(text, options?.images));
-		await this.emitQueueUpdate();
-	}
-
-	/** 追加一条消息到会话；若正在运行则先暂存，待回合结束时统一落盘。 */
-	async appendMessage(message: AgentMessage): Promise<void> {
-		this.assertNotShutDown();
-		return this.track("mutation", async () => {
-			try {
-				if (this.phase === "idle") {
-					await this.session.appendMessage(message);
-				} else {
-					this.pendingSessionWrites.push({ type: "message", message });
-				}
-			} catch (error) {
-				throw normalizeHarnessError(error, "session");
-			}
-		});
-	}
-
-	/** 压缩会话：汇总旧分支条目，保留被标记为保留的尾部，可在空闲状态下调用。 */
-	async compact(customInstructions?: string): Promise<CompactResult> {
-		this.assertNotShutDown();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
-		this.phase = "compaction";
-		const operation = this.startOperation();
-		try {
-			const model = this.model;
-			if (!model) throw new AgentHarnessError("invalid_state", "No model set for compaction");
-			const branchEntries = await this.session.getBranch();
-			const preparationResult = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS);
-			if (!preparationResult.ok) throw preparationResult.error;
-			const preparation = preparationResult.value;
-			if (!preparation) throw new AgentHarnessError("compaction", "Nothing to compact");
-			const hookResult = await this.emitHook({
-				type: "session_before_compact",
-				preparation,
-				branchEntries,
-				customInstructions,
-				signal: operation.signal,
-			});
-			if (hookResult?.cancel) throw new AgentHarnessError("compaction", "Compaction cancelled");
-			const provided = hookResult?.compaction;
-			const compactResult = provided
-				? { ok: true as const, value: provided }
-				: await compact(
-						preparation,
-						this.models,
-						model,
-						customInstructions,
-						operation.signal,
-						this.thinkingLevel,
-						this.retry,
-						this.retryCallbacks("compaction"),
-					);
-			if (!compactResult.ok) throw compactResult.error;
-			const result = compactResult.value;
-			this.assertNotShutDown();
-			const entryId = await this.session.appendCompaction(
-				result.summary,
-				result.firstKeptEntryId,
-				result.tokensBefore,
-				result.details,
-				provided !== undefined,
-				result.usage,
-				result.retainedTail,
-			);
-			const entry = await this.session.getEntry(entryId);
-			if (entry?.type === "compaction") {
-				await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
-			}
-			return result;
-		} catch (error) {
-			throw normalizeHarnessError(error, "compaction");
-		} finally {
-			this.phase = "idle";
-			operation.finish();
-		}
-	}
-
-	/** 将会话叶子指针移动到目标条目，可选为旧分支生成摘要；在空闲状态下调用。 */
-	async navigateTree(
-		targetId: string,
-		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
-	): Promise<NavigateTreeResult> {
-		this.assertNotShutDown();
-		if (this.phase !== "idle") throw new AgentHarnessError("busy", "navigateTree() requires idle harness");
-		this.phase = "branch_summary";
-		const operation = this.startOperation();
-		try {
-			const oldLeafId = await this.session.getLeafId();
-			if (oldLeafId === targetId) return { cancelled: false };
-			const targetEntry = await this.session.getEntry(targetId);
-			if (!targetEntry) throw new AgentHarnessError("invalid_argument", `Entry ${targetId} not found`);
-			const { entries, commonAncestorId } = await collectEntriesForBranchSummary(this.session, oldLeafId, targetId);
-			const preparation = {
-				targetId,
-				oldLeafId,
-				commonAncestorId,
-				entriesToSummarize: entries,
-				userWantsSummary: options?.summarize ?? false,
-				customInstructions: options?.customInstructions,
-				replaceInstructions: options?.replaceInstructions,
-				label: options?.label,
-			};
-			const hookResult = await this.emitHook({
-				type: "session_before_tree",
-				preparation,
-				signal: operation.signal,
-			});
-			if (hookResult?.cancel) return { cancelled: true };
-			let summaryEntry: NavigateTreeResult["summaryEntry"];
-			let summaryText: string | undefined = hookResult?.summary?.summary;
-			let summaryDetails: unknown = hookResult?.summary?.details;
-			let summaryUsage = hookResult?.summary?.usage;
-			if (!summaryText && options?.summarize && entries.length > 0) {
-				const model = this.model;
-				if (!model) throw new AgentHarnessError("invalid_state", "No model set for branch summary");
-				const branchSummary = await generateBranchSummary(entries, {
-					models: this.models,
-					model,
-					signal: operation.signal,
-					customInstructions: hookResult?.customInstructions ?? options?.customInstructions,
-					replaceInstructions: hookResult?.replaceInstructions ?? options?.replaceInstructions,
-					retry: this.retry,
-					callbacks: this.retryCallbacks("branch_summary"),
-				});
-				if (!branchSummary.ok) {
-					if (branchSummary.error.code === "aborted") return { cancelled: true };
-					throw new AgentHarnessError("branch_summary", branchSummary.error.message, branchSummary.error);
-				}
-				summaryText = branchSummary.value.summary;
-				summaryUsage = branchSummary.value.usage;
-				summaryDetails = {
-					readFiles: branchSummary.value.readFiles,
-					modifiedFiles: branchSummary.value.modifiedFiles,
-				};
-			}
-			let editorText: string | undefined;
-			let newLeafId: string | null;
-			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
-				newLeafId = targetEntry.parentId;
-				editorText = contentText(targetEntry.message.content, "");
-			} else if (targetEntry.type === "custom_message") {
-				newLeafId = targetEntry.parentId;
-				editorText = contentText(targetEntry.content, "");
-			} else {
-				newLeafId = targetId;
-			}
-			this.assertNotShutDown();
-			const summaryId = await this.session.moveTo(
-				newLeafId,
-				summaryText
-					? {
-							summary: summaryText,
-							details: summaryDetails,
-							usage: summaryUsage,
-							fromHook: hookResult?.summary !== undefined,
-						}
-					: undefined,
-			);
-			if (summaryId) {
-				const entry = await this.session.getEntry(summaryId);
-				if (entry?.type === "branch_summary") summaryEntry = entry;
-			}
-			await this.emitOwn({
-				type: "session_tree",
-				newLeafId: await this.session.getLeafId(),
-				oldLeafId,
-				summaryEntry,
-				fromHook: hookResult?.summary !== undefined,
-			});
-			return { cancelled: false, editorText, summaryEntry };
-		} catch (error) {
-			throw normalizeHarnessError(error, "branch_summary");
-		} finally {
-			this.phase = "idle";
-			operation.finish();
-		}
-	}
-
-	/** 返回当前模型。 */
-	getModel(): Model<any> {
+	async getModel(): Promise<Model<Api>> {
 		return this.model;
 	}
-
-	/** 设置模型，并将会话记录模型变更。 */
-	async setModel(model: Model<any>): Promise<void> {
-		this.assertNotShutDown();
-		return this.track("mutation", async () => {
-			try {
-				const previousModel = this.model;
-				if (this.phase === "idle") {
-					await this.session.appendModelChange(model.provider, model.id);
-				} else {
-					this.pendingSessionWrites.push({ type: "model_change", provider: model.provider, modelId: model.id });
-				}
-				this.model = model;
-				await this.emitOwn({ type: "model_update", model, previousModel, source: "set" });
-			} catch (error) {
-				throw normalizeHarnessError(error, "session");
-			}
-		});
+	async setModel(model: Model<Api>): Promise<void> {
+		this.model = model;
 	}
-
-	/** 返回当前思考级别。 */
-	getThinkingLevel(): ThinkingLevel {
+	async getThinkingLevel(): Promise<ThinkingLevel> {
 		return this.thinkingLevel;
 	}
-
-	/** 设置思考级别，并将会话记录变更。 */
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
-		this.assertNotShutDown();
-		return this.track("mutation", async () => {
-			try {
-				const previousLevel = this.thinkingLevel;
-				if (this.phase === "idle") {
-					await this.session.appendThinkingLevelChange(level);
-				} else {
-					this.pendingSessionWrites.push({ type: "thinking_level_change", thinkingLevel: level });
-				}
-				this.thinkingLevel = level;
-				await this.emitOwn({ type: "thinking_level_update", level, previousLevel });
-			} catch (error) {
-				throw normalizeHarnessError(error, "session");
-			}
-		});
+		this.thinkingLevel = level;
+	}
+	async getActiveTools(): Promise<string[]> {
+		return [...this.activeToolNames];
+	}
+	async setActiveTools(names: string[]): Promise<void> {
+		this.activeToolNames = [...names];
+	}
+	async watch(): Promise<WatchHandle<LaneSnapshot>> {
+		return this.unavailable("watch");
 	}
 
-	/** 返回全部已注册工具。 */
-	getTools(): TTool[] {
-		return [...this.tools.values()];
+	async lane(_name: string): Promise<AgentLane | undefined> {
+		return this.unavailable("lane");
 	}
-
-	/** 批量设置工具集合，并可同时指定启用的工具名。 */
-	async setTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
-		this.assertNotShutDown();
-		return this.track("mutation", () => this.applyTools(tools, activeToolNames));
+	async createLane(_name: string, _at: string | null): Promise<CreateLaneResult> {
+		return this.unavailable("createLane");
 	}
-
-	/** 应用工具变更：校验唯一性与注册情况，落盘并广播更新事件。 */
-	private async applyTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
-		try {
-			this.validateUniqueNames(
-				tools.map((tool) => tool.name),
-				"Duplicate tool name(s)",
-			);
-			const nextTools = new Map(tools.map((tool) => [tool.name, tool]));
-			const nextActiveToolNames = activeToolNames ? [...activeToolNames] : this.activeToolNames;
-			this.validateToolNames(nextActiveToolNames, nextTools);
-			const previousToolNames = [...this.tools.keys()];
-			const previousActiveToolNames = [...this.activeToolNames];
-			if (this.phase === "idle") {
-				await this.session.appendActiveToolsChange(nextActiveToolNames);
-			} else {
-				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...nextActiveToolNames] });
-			}
-			this.tools = nextTools;
-			this.activeToolNames = [...nextActiveToolNames];
-			await this.emitOwn({
-				type: "tools_update",
-				toolNames: [...this.tools.keys()],
-				previousToolNames,
-				activeToolNames: [...this.activeToolNames],
-				previousActiveToolNames,
-				source: "set",
-			});
-		} catch (error) {
-			throw normalizeHarnessError(error, "invalid_argument");
-		}
+	async lanes(): Promise<LaneInfo[]> {
+		return this.unavailable("lanes");
 	}
-
-	/** 返回当前启用的工具。 */
-	getActiveTools(): TTool[] {
-		return this.activeToolNames.map((name) => this.tools.get(name)!);
+	async getTools(): Promise<HarnessTool[]> {
+		return [...this.tools];
 	}
-
-	/** 设置当前启用的工具名列表。 */
-	async setActiveTools(toolNames: string[]): Promise<void> {
-		this.assertNotShutDown();
-		return this.track("mutation", () => this.applyActiveTools(toolNames));
+	async setTools(tools: HarnessTool[], activeNames?: string[]): Promise<void> {
+		this.tools = [...tools];
+		this.activeToolNames = [...(activeNames ?? tools.map((tool) => tool.name))];
 	}
-
-	/** 应用启用工具变更：校验、落盘并广播更新事件。 */
-	private async applyActiveTools(toolNames: string[]): Promise<void> {
-		try {
-			this.validateToolNames(toolNames);
-			const previousToolNames = [...this.tools.keys()];
-			const previousActiveToolNames = [...this.activeToolNames];
-			if (this.phase === "idle") {
-				await this.session.appendActiveToolsChange(toolNames);
-			} else {
-				this.pendingSessionWrites.push({ type: "active_tools_change", activeToolNames: [...toolNames] });
-			}
-			this.activeToolNames = [...toolNames];
-			await this.emitOwn({
-				type: "tools_update",
-				toolNames: [...this.tools.keys()],
-				previousToolNames,
-				activeToolNames: [...this.activeToolNames],
-				previousActiveToolNames,
-				source: "set",
-			});
-		} catch (error) {
-			throw normalizeHarnessError(error, "invalid_argument");
-		}
-	}
-
-	/** 返回 steering 队列的排放模式。 */
-	getSteeringMode(): QueueMode {
-		return this.steeringQueueMode;
-	}
-
-	/** 设置 steering 队列的排放模式。 */
-	async setSteeringMode(mode: QueueMode): Promise<void> {
-		this.assertNotShutDown();
-		this.steeringQueueMode = mode;
-	}
-
-	/** 返回 follow-up 队列的排放模式。 */
-	getFollowUpMode(): QueueMode {
-		return this.followUpQueueMode;
-	}
-
-	/** 设置 follow-up 队列的排放模式。 */
-	async setFollowUpMode(mode: QueueMode): Promise<void> {
-		this.assertNotShutDown();
-		this.followUpQueueMode = mode;
-	}
-
-	/** 返回当前资源（技能与提示词模板）的副本。 */
-	getResources(): AgentHarnessResources<TSkill, TPromptTemplate> {
+	async getResources(): Promise<Resources> {
 		return {
-			skills: this.resources.skills?.slice(),
-			promptTemplates: this.resources.promptTemplates?.slice(),
+			skills: this.resources.skills ? [...this.resources.skills] : undefined,
+			promptTemplates: this.resources.promptTemplates ? [...this.resources.promptTemplates] : undefined,
 		};
 	}
-
-	/** 设置资源（技能与提示词模板），并广播更新事件。 */
-	async setResources(resources: AgentHarnessResources<TSkill, TPromptTemplate>): Promise<void> {
-		this.assertNotShutDown();
-		const previousResources = this.getResources();
+	async setResources(resources: Resources): Promise<void> {
 		this.resources = {
-			skills: resources.skills?.slice(),
-			promptTemplates: resources.promptTemplates?.slice(),
+			skills: resources.skills ? [...resources.skills] : undefined,
+			promptTemplates: resources.promptTemplates ? [...resources.promptTemplates] : undefined,
 		};
-		await this.emitOwn({ type: "resources_update", resources: this.getResources(), previousResources });
 	}
-
-	/** 返回当前流式选项的副本。 */
-	getStreamOptions(): AgentHarnessStreamOptions {
-		return cloneStreamOptions(this.streamOptions);
+	async getStreamOptions(): Promise<StreamOptions> {
+		return { ...this.streamOptions };
 	}
-
-	/** 设置流式选项。 */
-	async setStreamOptions(streamOptions: AgentHarnessStreamOptions): Promise<void> {
-		this.assertNotShutDown();
-		this.streamOptions = cloneStreamOptions(streamOptions);
+	async setStreamOptions(options: StreamOptions): Promise<void> {
+		this.streamOptions = { ...options };
 	}
-
-	/** 永久停止此 harness 实例，但不会删除其持久化会话。 */
-	requestShutdown(): void {
-		if (this.isShutdown) return;
-		this.isShutdown = true;
-		this.pendingSessionWrites = [];
-		this.steerQueue = [];
-		this.followUpQueue = [];
-		this.nextTurnQueue = [];
-		this.activeAbortController?.abort();
-		this.shutdownPromise = this.waitForTasks();
+	async getRetryPolicy(): Promise<RetryPolicy> {
+		return { ...this.retryPolicy };
 	}
-
-	/** 等待请求关闭时仍在进行的工作全部结束。 */
-	waitForShutdown(): Promise<void> {
-		if (!this.shutdownPromise) {
-			return Promise.reject(new AgentHarnessError("invalid_state", "Shutdown has not been requested"));
-		}
-		return this.shutdownPromise;
+	async setRetryPolicy(policy: RetryPolicy): Promise<void> {
+		this.retryPolicy = { ...policy };
 	}
-
-	/** 中止当前运行：清空 steering/follow-up 队列、取消操作并等待空闲。 */
-	async abort(): Promise<AbortResult> {
-		this.assertNotShutDown();
-		const clearedSteer = [...this.steerQueue];
-		const clearedFollowUp = [...this.followUpQueue];
-		this.steerQueue = [];
-		this.followUpQueue = [];
-		this.activeAbortController?.abort();
-		const errors: Error[] = [];
-		try {
-			await this.emitQueueUpdate();
-		} catch (error) {
-			errors.push(toError(error));
-		}
-		try {
-			await this.waitForIdle();
-		} catch (error) {
-			errors.push(toError(error));
-		}
-		try {
-			await this.emitOwn({ type: "abort", clearedSteer, clearedFollowUp });
-		} catch (error) {
-			errors.push(toError(error));
-		}
-		if (errors.length > 0) {
-			const cause = errors.length === 1 ? errors[0]! : new AggregateError(errors, "Abort completed with errors");
-			throw normalizeHarnessError(cause, "hook");
-		}
-		return { clearedSteer, clearedFollowUp };
+	async getCompactionSettings(): Promise<CompactionSettings> {
+		return { ...this.compactionSettings };
 	}
-
-	/** 等待所有运行中的操作结束。 */
-	async waitForIdle(): Promise<void> {
-		await this.waitForTasks("operation");
+	async setCompactionSettings(settings: CompactionSettings): Promise<void> {
+		this.compactionSettings = { ...settings };
 	}
-
-	/** 订阅所有事件（通配符），返回取消订阅函数。 */
-	subscribe(
-		listener: (event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal) => Promise<void> | void,
-	): () => void {
-		this.assertNotShutDown();
-		let handlers = this.handlers.get(SUBSCRIBER_EVENT_TYPE);
-		if (!handlers) {
-			handlers = new Set();
-			this.handlers.set(SUBSCRIBER_EVENT_TYPE, handlers);
-		}
-		handlers.add(listener as AgentHarnessHandler);
-		return () => handlers!.delete(listener as AgentHarnessHandler);
+	async getSteeringMode(): Promise<QueueMode> {
+		return this.steeringMode;
 	}
-
-	/** 订阅指定类型的事件，返回取消订阅函数。 */
-	on<TType extends keyof AgentHarnessEventResultMap>(
-		type: TType,
-		handler: (
-			event: Extract<AgentHarnessOwnEvent, { type: TType }>,
-		) => Promise<AgentHarnessEventResultMap[TType]> | AgentHarnessEventResultMap[TType],
-	): () => void {
-		this.assertNotShutDown();
-		let handlers = this.handlers.get(type);
-		if (!handlers) {
-			handlers = new Set();
-			this.handlers.set(type, handlers);
-		}
-		handlers.add(handler as AgentHarnessHandler);
-		return () => handlers!.delete(handler as AgentHarnessHandler);
+	async setSteeringMode(mode: QueueMode): Promise<void> {
+		this.steeringMode = mode;
+	}
+	async getFollowUpMode(): Promise<QueueMode> {
+		return this.followUpMode;
+	}
+	async setFollowUpMode(mode: QueueMode): Promise<void> {
+		this.followUpMode = mode;
+	}
+	async watchSession(): Promise<WatchHandle<SessionSnapshot>> {
+		return this.unavailable("watchSession");
+	}
+	async close(): Promise<void> {
+		this.closed = true;
 	}
 }

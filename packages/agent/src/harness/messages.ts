@@ -120,21 +120,16 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 	return text;
 }
 
-/**
- * 创建一个 {@link BranchSummaryMessage}，捕获在返回主对话前子代理分支中
- * 发生的事件。
- *
- * @param summary - 分支活动的人类可读摘要。
- * @param fromId - 此摘要来源的分支标识符。
- * @param timestamp - 表示摘要创建时间的 ISO-8601 时间戳字符串。
- * @returns 一个新的 {@link BranchSummaryMessage} 实例。
- */
-export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
+export function createBranchSummaryMessage(
+	summary: string,
+	fromId: string,
+	timestamp: string | number,
+): BranchSummaryMessage {
 	return {
 		role: "branchSummary",
 		summary,
 		fromId,
-		timestamp: new Date(timestamp).getTime(),
+		timestamp: typeof timestamp === "number" ? timestamp : new Date(timestamp).getTime(),
 	};
 }
 
@@ -150,13 +145,13 @@ export function createBranchSummaryMessage(summary: string, fromId: string, time
 export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
-	timestamp: string,
+	timestamp: string | number,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary,
 		tokensBefore,
-		timestamp: new Date(timestamp).getTime(),
+		timestamp: typeof timestamp === "number" ? timestamp : new Date(timestamp).getTime(),
 	};
 }
 
@@ -175,7 +170,7 @@ export function createCustomMessage(
 	content: string | (TextContent | ImageContent)[],
 	display: boolean,
 	details: unknown | undefined,
-	timestamp: string,
+	timestamp: string | number,
 ): CustomMessage {
 	return {
 		role: "custom",
@@ -183,7 +178,7 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
-		timestamp: new Date(timestamp).getTime(),
+		timestamp: typeof timestamp === "number" ? timestamp : new Date(timestamp).getTime(),
 	};
 }
 

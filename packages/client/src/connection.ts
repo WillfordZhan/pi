@@ -37,9 +37,6 @@ type ConnectionLifecycle =
 
 /** Connection 的构造选项。 */
 interface ConnectionOptions {
-	/** 连接使用的访问令牌。 */
-	token: string;
-	/** 传输层工厂，用于创建底层字节传输。 */
 	transportFactory: ByteTransportFactory;
 	/** 单帧最大长度（字节），缺省时使用协议默认值。 */
 	maxFrameLength?: number;
@@ -159,10 +156,7 @@ export class Connection {
 		this.#lifecycle = { ...lifecycle, transport };
 		try {
 			await transport.send(
-				encodeClientMessage(
-					{ type: "hello", version: PROTOCOL_VERSION, token: this.#options.token },
-					{ maxFrameLength: this.#maxFrameLength },
-				),
+				encodeClientMessage({ type: "hello", version: PROTOCOL_VERSION }, { maxFrameLength: this.#maxFrameLength }),
 			);
 		} catch (error) {
 			if (this.#isCurrent(id)) this.#failAndClose(toDisconnectedError(error));

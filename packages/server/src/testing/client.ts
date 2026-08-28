@@ -9,7 +9,7 @@ import {
 	type ServerMessage,
 	ServerMessageDecoder,
 } from "@earendil-works/pi-protocol";
-import { Deferred, TEST_TOKEN } from "./backend.ts";
+import { Deferred } from "./service.ts";
 
 /** 等待某条匹配消息的等待者记录。 */
 interface MessageWaiter {
@@ -58,10 +58,9 @@ export class ProtocolTestClient {
 		return this.closedValue;
 	}
 
-	/** 发送 hello 并等待服务器的 hello/hello_error 响应。 */
-	hello(token = TEST_TOKEN, version: number = PROTOCOL_VERSION): Promise<ServerMessage> {
+	hello(version: number = PROTOCOL_VERSION): Promise<ServerMessage> {
 		const response = this.next((message) => message.type === "hello" || message.type === "hello_error");
-		void this.sendMessage({ type: "hello", token, version });
+		void this.sendMessage({ type: "hello", version });
 		return response;
 	}
 

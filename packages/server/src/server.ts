@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
 	type ClientHello,
 	type ClientMessage,
@@ -21,11 +21,16 @@ import {
 	type ConnectionState,
 	isTerminalConnection,
 } from "./connection.ts";
-import { PiServerError } from "./errors.ts";
+import {
+	INTERNAL_SERVER_ERROR_MESSAGE,
+	InternalServerError,
+	NOT_IMPLEMENTED_MESSAGE,
+	PiServerError,
+} from "./errors.ts";
 import type { PiServerListener } from "./listener.ts";
 import { LiveSessionManager } from "./sessions.ts";
 import { ServerSnapshotPublisher } from "./snapshots.ts";
-import type { PiServerOptions, PiSessionBackend } from "./types.ts";
+import type { PiServerOptions, PiServerService } from "./types.ts";
 
 /** 默认的握手超时时长（毫秒）。 */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
@@ -34,21 +39,12 @@ const MAX_UINT32 = 0xffff_ffff;
 /** Node.js 定时器允许的最大延迟（毫秒）。 */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-/** 计算令牌的 SHA-256 摘要，用于常驻内存中的安全比对（避免直接保存明文令牌）。 */
-function tokenDigest(token: string): Buffer {
-	return createHash("sha256").update(token, "utf8").digest();
-}
-
-/** 远程会话服务器：管理连接握手、会话执行、快照广播与所有传输监听器的生命周期。 */
 export class PiServer {
 	/** 服务器实例唯一 ID。 */
 	readonly id: string;
 
 	/** 已注册的传输监听器列表。 */
 	private readonly listeners: readonly PiServerListener[];
-	/** 期望令牌的 SHA-256 摘要，用于握手鉴权。 */
-	private readonly expectedTokenDigest: Buffer;
-	/** 单帧消息的最大长度限制。 */
 	private readonly maxFrameLength: number;
 	/** 握手超时时长（毫秒）。 */
 	private readonly handshakeTimeoutMs: number;
@@ -69,20 +65,15 @@ export class PiServer {
 	/** 是否已成功启动。 */
 	private started = false;
 
-	/**
-	 * @param backend 会话后端（持久化存储与运行时边界）。
-	 * @param options 服务器配置（令牌、监听器、帧长、超时等）。
-	 */
-	constructor(backend: PiSessionBackend, options: PiServerOptions) {
+	constructor(service: PiServerService, options: PiServerOptions) {
 		const resolved = resolveOptions(options);
 		this.listeners = options.listeners;
 		this.id = options.serverId ?? randomUUID();
-		this.expectedTokenDigest = tokenDigest(options.token);
 		this.maxFrameLength = resolved.maxFrameLength;
 		this.handshakeTimeoutMs = resolved.handshakeTimeoutMs;
 		this.onError = options.onError;
 		this.sessions = new LiveSessionManager({
-			backend,
+			service,
 			isClosing: () => this.closing,
 			sendMessage: (connection, message) => this.sendMessage(connection, message),
 			closeConnection: (connection) => this.closeConnection(connection),
@@ -92,10 +83,10 @@ export class PiServer {
 		});
 		this.snapshots = new ServerSnapshotPublisher({
 			serverId: this.id,
-			backend,
+			service,
 			connections: this.connections,
 			isClosing: () => this.closing,
-			listSessions: (connection) => this.sessions.listSummaries(connection),
+			listSessions: () => this.sessions.listMetadata(),
 			sendMessage: (connection, message) => this.sendMessage(connection, message),
 			reportError: (error) => this.reportError(error),
 		});
@@ -251,10 +242,6 @@ export class PiServer {
 
 	/** 完成握手：校验令牌与协议版本，回复 hello 快照并把连接推进到就绪阶段。 */
 	private async finishHandshake(state: ConnectionState, hello: ClientHello): Promise<void> {
-		if (!this.authenticate(hello)) {
-			await this.failProtocol(state, { code: "auth", message: "Authentication failed" });
-			return;
-		}
 		if (!isSupportedProtocolVersion(hello.version)) {
 			await this.failProtocol(state, {
 				code: "version",
@@ -263,7 +250,7 @@ export class PiServer {
 			return;
 		}
 
-		const snapshot = await this.snapshots.get(undefined, state);
+		const snapshot = await this.snapshots.get();
 		if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) return;
 		const sent = await this.sendMessage(state, {
 			type: "hello",
@@ -276,7 +263,7 @@ export class PiServer {
 			state.stage = "ready";
 			clearTimeout(state.handshakeTimeout);
 			if (snapshot.revision !== this.snapshots.currentRevision) {
-				const current = await this.snapshots.get(undefined, state);
+				const current = await this.snapshots.get();
 				await this.sendMessage(state, {
 					type: "event",
 					event: { type: "server_snapshot", snapshot: current },
@@ -285,12 +272,6 @@ export class PiServer {
 		}
 	}
 
-	/** 校验客户端令牌：对客户端令牌取摘要后与期望摘要做恒定时间比较。 */
-	private authenticate(hello: ClientHello): boolean {
-		return timingSafeEqual(tokenDigest(hello.token), this.expectedTokenDigest);
-	}
-
-	/** 执行一个会话命令，并将成功结果或协议错误封装为响应消息返回。 */
 	private async handleRequest(state: ConnectionState, envelope: RequestEnvelope): Promise<void> {
 		try {
 			const result = await this.sessions.executeCommand(state, envelope.request);
@@ -398,7 +379,14 @@ export class PiServer {
 
 	/** 将任意异常映射为协议错误：PiServerError 直接透传，其余归为内部错误。 */
 	private toProtocolError(error: unknown): ProtocolError {
+		if (error instanceof InternalServerError) {
+			this.reportError(error.cause);
+			return { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE };
+		}
 		if (error instanceof PiServerError) {
+			if (error.code === "not_implemented") {
+				return { code: "not_implemented", message: NOT_IMPLEMENTED_MESSAGE };
+			}
 			return error.details === undefined
 				? { code: error.code, message: error.message }
 				: { code: error.code, message: error.message, details: error.details };
@@ -407,7 +395,7 @@ export class PiServer {
 			return { code: "invalid_request", message: error.message };
 		}
 		this.reportError(error);
-		return { code: "invalid_request", message: "Internal server error" };
+		return { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE };
 	}
 
 	/** 上报错误给 onError 回调；错误观察者的异常不能影响服务器状态。 */
@@ -423,7 +411,6 @@ export class PiServer {
 /** 校验并规范化服务器选项（监听器、令牌、帧长、握手超时）。 */
 function resolveOptions(options: PiServerOptions): { maxFrameLength: number; handshakeTimeoutMs: number } {
 	if (!Array.isArray(options.listeners)) throw new TypeError("PiServer listeners must be an array");
-	if (!options.token) throw new TypeError("PiServer token must not be empty");
 	if (options.serverId === "") throw new TypeError("PiServer serverId must not be empty");
 	const maxFrameLength = options.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
 	if (!Number.isSafeInteger(maxFrameLength) || maxFrameLength <= 0 || maxFrameLength > MAX_UINT32) {

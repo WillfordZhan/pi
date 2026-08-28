@@ -3,10 +3,13 @@ import type { JsonValue, ProtocolErrorCode } from "@earendil-works/pi-protocol";
 /** PiServer 允许跨协议边界传输的操作错误码（从协议错误码中收窄而来）。 */
 export type PiServerOperationErrorCode = Extract<
 	ProtocolErrorCode,
-	"busy" | "session_locked" | "not_found" | "invalid_request"
+	"busy" | "session_locked" | "not_found" | "invalid_request" | "not_implemented"
 >;
 
-/** 后端/运行时错误，可以安全地跨协议边界返回给客户端（不会泄露内部实现细节）。 */
+export const INTERNAL_SERVER_ERROR_MESSAGE = "Internal server error";
+export const NOT_IMPLEMENTED_MESSAGE = "Operation is not implemented";
+
+/** A service/runtime error that can safely cross the protocol boundary. */
 export class PiServerError extends Error {
 	/** 对应的协议错误码。 */
 	readonly code: PiServerOperationErrorCode;
@@ -47,5 +50,20 @@ export class SessionNotFoundError extends PiServerError {
 	constructor(message = "Session was not found", details?: JsonValue) {
 		super("not_found", message, details);
 		this.name = "SessionNotFoundError";
+	}
+}
+
+export class NotImplementedError extends PiServerError {
+	constructor() {
+		super("not_implemented", NOT_IMPLEMENTED_MESSAGE);
+		this.name = "NotImplementedError";
+	}
+}
+
+/** An unsafe failure whose cause is retained for reporting but never serialized. */
+export class InternalServerError extends Error {
+	constructor(cause: unknown) {
+		super(INTERNAL_SERVER_ERROR_MESSAGE, { cause });
+		this.name = "InternalServerError";
 	}
 }
